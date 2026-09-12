@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homesoc"
+# Single source of truth: homesoc/__init__.py's __version__ (see [tool.setuptools.dynamic] below).
+dynamic = ["version"]
+description = "A security operations center for your own home network: device discovery, CVE matching, host posture auditing and a LAN-wide DNS filter in one local Python process."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mario" }]
+requires-python = ">=3.12"
+keywords = [
+    "security",
+    "home-network",
+    "network-scanner",
+    "vulnerability-management",
+    "cve",
+    "kev",
+    "epss",
+    "dns-filter",
+    "adblock",
+    "threat-intelligence",
+    "blue-team",
+    "soc",
+    "self-hosted",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Framework :: Flask",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "Natural Language :: English",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Networking :: Monitoring",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "flask==3.1.3",
+    "requests==2.34.2",
+    "dnslib==0.9.26",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+# Package metadata needs absolute URLs, so these cannot be written as repo-relative links the way
+# README.md and CHANGELOG.md do it. They stay commented out until the repository exists: an
+# unresolved placeholder here would be baked into the built wheel's METADATA as
+# `Project-URL: Homepage, ...` and shown as a dead link on the PyPI sidebar, whereas no
+# Project-URL at all is merely absent. Uncomment and replace <owner>/<repo> when publishing.
+# [project.urls]
+# Homepage = "https://github.com/<owner>/<repo>"
+# Documentation = "https://github.com/<owner>/<repo>/blob/main/docs/WALKTHROUGH.md"
+# Issues = "https://github.com/<owner>/<repo>/issues"
+# Source = "https://github.com/<owner>/<repo>"
+# Changelog = "https://github.com/<owner>/<repo>/blob/main/CHANGELOG.md"
+
+[project.scripts]
+homesoc = "homesoc.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "homesoc.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["homesoc*"]
+
+[tool.setuptools.package-data]
+homesoc = [
+    "scanners/ps/*.ps1",
+    "web/templates/*.html",
+    "web/static/*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: touches the real network/feeds; skipped unless --live is given",
+    "slow: offline but spawns interpreters/subprocesses; deselect with -m 'not slow'",
+]

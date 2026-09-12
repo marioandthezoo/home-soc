@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<!-- Synthetic fixture: a TRUNCATED nmap 7.92 document. The process was killed mid-write, so the
+     last port element is cut off and none of the closing tags were ever emitted. The parser must
+     keep the ports it did manage to read and mark the host partial. MAC, hostname and vendor are
+     placeholders; no real device is described. -->
+<!-- Nmap 7.92 scan initiated Fri Sep  4 16:10:03 2026 as: nmap -sT -sV -&#45;version-light -T3 -&#45;top-ports 100 -n -Pn -&#45;host-timeout 180s -oX - 192.168.1.89 -->
+<nmaprun scanner="nmap" args="nmap -sT -sV -&#45;version-light -T3 -&#45;top-ports 100 -n -Pn -&#45;host-timeout 180s -oX - 192.168.1.89" start="1788563403" startstr="Fri Sep  4 16:10:03 2026" version="7.92" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="100" services="7,9,13,21-23,25-26,37,53,79-81,88,106,110-111,113,119,135,139,143-144,179,199,389,427,443-445,465,513-515,543-544,548,554,587,631,646,873,990,993,995,1025-1029,1110,1433,1720,1723,1755,1900,2000-2001,2049,2121,2717,3000,3128,3306,3389,3986,4899,5000,5009,5051,5060,5101,5190,5357,5432,5631,5666,5800,5900,6000-6001,6646,7070,8000,8008-8009,8080-8081,8443,8888,9100,9999-10000,32768,49152-49157"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1788563403"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.168.1.89" addrtype="ipv4"/>
+<address addr="00:33:44:00:00:0A" addrtype="mac" vendor="Example Storage Systems"/>
+<hostnames>
+<hostname name="nas.lan" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="22"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="ssh" product="OpenSSH" version="7.4" extrainfo="protocol 2.0" method="probed" conf="10"><cpe>cpe:/a:openbsd:openssh:7.4</cpe></service></port>
+<port protocol="tcp" portid="23"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="telnet" method="table" conf="3"/></port>
+<port protocol="tcp" portid="445"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="netbios-ssn" product="Samba smbd" version="4.10.18" extrainfo="workgroup: WORKGROUP" method="probed" conf="10"><cpe>cpe:/a:samba:samba:4.10.18</cpe></service></port>
+<port protocol="tcp" portid="5000"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="Example NAS console DS-1520" method="probed" conf="10"></service></port>
+<port protocol="tcp" portid="5432"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="postgresql" product="PostgreSQL DB" version="9.3" method="probed" conf="10"><cpe>cpe:/a:postgresql:postgresql:9.3</cpe></service></port>
+<port protocol="tcp" portid="8080"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="nginx" versi

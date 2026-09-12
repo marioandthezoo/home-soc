@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block content %}
+{% set s = summary %}
+<script type="application/json" id="initial-summary">{{ s|tojson }}</script>
+<div class="toolbar">
+  <button class="btn btn-primary" data-action="scan" data-kind="quick">Run quick scan</button>
+  <button class="btn" data-action="scan" data-kind="full">Full scan</button>
+  <button class="btn" data-action="scan" data-kind="feeds">Update feeds</button>
+  <span class="muted small">{{ 'scans run through the scheduler' if has_scheduler else 'scans run in a background thread' }}</span>
+</div>
+
+<div class="grid grid-4">
+  <section class="card card-fill">
+    <h2>Security score</h2>
+    <div class="chart chart-gauge" id="chart-gauge"></div>
+    <div class="chart chart-spark" id="chart-trend"></div>
+    <div class="muted small push-down">30-day trend · grade <b>{{ s.grade }}</b> ({{ s.score }}/100)</div>
+  </section>
+  <section class="card card-fill">
+    <h2>Open findings</h2>
+    <div class="chart chart-donut" id="chart-severity"></div>
+    <div class="sev-counts push-down">
+      {% for sv in severities %}<a href="/findings?status=open&severity={{ sv }}">{{ badge(sv, s.counts.open[sv] ~ ' ' ~ sv) }}</a>{% endfor %}
+    </div>
+  </section>
+  <section class="card card-fill">
+    <h2>Devices</h2>
+    <div class="kpi"><b data-bind="devices-online">{{ s.devices.online }}</b><span class="muted">/ <span data-bind="devices-total">{{ s.devices.total }}</span> online</span></div>
+    <div class="kpi-sub">last discovery {{ s.last_scans.get('discovery')|ago }} · last service scan {{ s.last_scans.get('services')|ago }}</div>
+    <p class="push-down"><a href="/devices" class="link">Inventory →</a></p>
+  </section>
+  <section class="card card-fill">
+    <h2>DNS filter · 24 h</h2>
+    <div class="kpi"><b data-bind="dns-total">{{ s.dns.total24h|num }}</b><span class="muted">queries</span></div>
+    <div class="kpi-sub"><span data-bind="dns-blocked">{{ s.dns.blocked24h|num }}</span> blocked (<span data-bind="dns-pct">{{ s.dns.blocked_pct }}</span>%) · <span data-bind="dns-clients">{{ s.dns.clients24h }}</span> clients ·
+      {{ badge('ok' if s.dns.running else 'off', 'running' if s.dns.running else ('enabled, not running' if s.dns.enabled else 'off')) }}</div>
+    <div class="chart chart-bars push-down" id="chart-dns"></div>
+  </section>
+</div>
+
+<div class="grid grid-2">
+  <section class="card card-fill">
+    <div class="card-head">
+      <h2>Fix these first</h2>
+      <a class="link" href="/summary">Full worklist →</a>
+    </div>
+    <ol class="cost-list" id="score-breakdown">
+      {% for b in s.score_breakdown %}
+      <li class="cost">
+        <span class="tl-dot sev-dot-{{ b.severity }}" title="{{ b.severity }}"></span>
+        <a class="cost-title" href="/findings?status=open&q={{ b.finding_id }}" title="{{ b.finding_id }} — {{ b.title }}">{{ b.title }}</a>
+        {% if b.count > 1 %}<span class="cost-count" title="{{ b.count }} findings of this type are open">×{{ b.count }}</span>{% endif %}
+        <span class="cost-gain" title="the score would rise by about {{ b.gain }} once every finding of this type is cleared">+{{ b.gain }}</span>
+      </li>
+      {% else %}
+      <li class="empty">Nothing is costing you points. Either everything found is fixed, acknowledged or
+        suppressed, or no scan has run yet.</li>
+      {% endfor %}
+    </ol>
+    <p class="muted small push-down" id="score-breakdown-note"{% if not s.score_breakdown %} hidden{% endif %}>
+      <b>+N</b> is roughly how far the security score rises once every finding of that type is cleared.</p>
+  </section>
+  <section class="card card-fill">
+    <h2>Feed freshness</h2>
+    <div class="tbl-wrap tbl-scroll">
+    <table class="tbl">
+      <thead><tr><th>Feed</th><th>Status</th><th class="num">Entries</th><th>Updated</th><th>Error</th></tr></thead>
+      <tbody id="feeds-body">
+        {% for f in s.feeds %}
+        <tr>
+          <td class="mono">{{ f.name }}</td>
+          <td>{{ badge(f.status or 'never') }}</td>
+          <td class="num">{{ f.entries|num }}</td>
+          <td title="{{ f.last_updated|ts }}">{{ f.last_updated|ago }}</td>
+          <td class="muted small wrap">{{ f.error or '' }}</td>
+        </tr>
+        {% else %}<tr><td colspan="5" class="empty">No feeds recorded yet. Use <b>Update feeds</b> above to download the
+          blocklists and the CISA KEV catalogue.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+
+<div class="grid grid-2">
+  <section class="card card-fill">
+    <h2>Jobs</h2>
+    <div class="chips" id="jobs-chips">
+      {% for j in s.jobs %}
+      <span class="chip chip-job" title="last run {{ j.last_run|ts }}{% if j.last_error %} — {{ j.last_error }}{% endif %}">
+        <span class="job-status {{ 'ok' if j.last_status == 'ok' else ('error' if j.last_status in ('error', 'failed') else '') }}"></span>
+        <b>{{ j.name }}</b><span>{{ j.last_status or 'never' }} · {{ j.last_run|ago }}</span>
+      </span>
+      {% else %}<span class="muted">No jobs recorded yet — start with <span class="kbd">python -m homesoc run</span>.</span>{% endfor %}
+    </div>
+    <h2 class="h-mt">Last scans</h2>
+    <div class="chips push-down">
+      {% for kind, ts in s.last_scans.items() %}<span class="chip"><b>{{ kind }}</b> {{ ts|ago }}</span>{% else %}<span class="muted">No scans yet.</span>{% endfor %}
+    </div>
+  </section>
+  <section class="card card-fill">
+    <div class="card-head"><h2>Latest events</h2><a class="link" href="/telemetry">All telemetry →</a></div>
+    <ul class="events" id="events-list">
+      {% for e in s.events %}
+      <li>
+        <span class="e-ts" title="{{ e.ts }}">{{ e.ts|ts }}</span>
+        <span class="e-src">{{ e.source }}</span>
+        <span class="e-msg">{{ badge('level-' ~ (e.level or 'info')|lower, e.level) }} {{ e.message }}</span>
+      </li>
+      {% else %}<li class="empty">No events yet. Anything the agent does — a scan, a feed download, a finding
+        changing state — shows up here.</li>{% endfor %}
+    </ul>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <div class="card-head">
+    <h2>Metrics</h2>
+    <label class="muted small">window
+      <select id="metrics-hours">
+        <option value="24">24 h</option>
+        <option value="168" selected>7 d</option>
+        <option value="720">30 d</option>
+      </select>
+    </label>
+  </div>
+  <div class="metrics-grid" id="metrics-grid">
+    {% for name in metric_names %}<div class="metric"><div class="m-name">{{ name }}</div><div class="m-val muted">…</div></div>
+    {% else %}<div class="chart-empty">No metrics recorded yet — they appear once the scheduler runs its first job.</div>{% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Jobs</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Job</th><th>Status</th><th>Last run</th><th class="num">Duration</th><th>Next run</th><th class="num">Runs</th><th class="num">Failures</th><th>Last error</th></tr></thead>
+    <tbody id="jobs-body">
+      {% for j in jobs %}
+      <tr>
+        <td class="mono">{{ j.name }}</td>
+        <td>{{ badge(j.last_status or 'never') }}</td>
+        <td title="{{ j.last_run|ts }}">{{ j.last_run|ago }}</td>
+        <td class="num">{% if j.last_duration_sec is not none %}{{ '%.1f'|format(j.last_duration_sec) }}s{% endif %}</td>
+        <td title="{{ j.next_run|ts }}">{{ j.next_run|ago if j.next_run else '' }}</td>
+        <td class="num">{{ j.runs|num }}</td>
+        <td class="num">{{ j.failures|num }}</td>
+        <td class="muted small wrap">{{ j.last_error or '' }}</td>
+      </tr>
+      {% else %}<tr><td colspan="8" class="empty">No jobs recorded yet.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<div class="grid grid-2">
+  <section class="card">
+    <div class="card-head"><h2>Scan history</h2><a class="link" href="/scans">All scans →</a></div>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Kind</th><th>Status</th><th>Started</th><th class="num">Duration</th><th>Summary</th><th>Error</th></tr></thead>
+      <tbody id="scans-body">
+        {% for s in scans %}
+        <tr>
+          <td class="mono">{{ s.kind }}</td>
+          <td>{{ badge(s.status) }}</td>
+          <td title="{{ s.started_at }}">{{ s.started_at|ts }}</td>
+          <td class="num">{% if s.duration_sec is not none %}{{ s.duration_sec }}s{% endif %}</td>
+          <td class="muted small wrap">{% if s.summary is mapping %}{% for k, v in s.summary.items() %}{{ k }}={{ v }} {% endfor %}{% else %}{{ s.summary or '' }}{% endif %}</td>
+          <td class="small wrap error">{{ s.error or '' }}</td>
+        </tr>
+        {% else %}<tr><td colspan="6" class="empty">No scans yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-head">
+      <h2>Events</h2>
+      <select id="events-level" aria-label="Level filter">
+        <option value="">all levels</option>
+        <option value="error">error</option>
+        <option value="warning">warning</option>
+        <option value="info">info</option>
+        <option value="debug">debug</option>
+      </select>
+    </div>
+    <ul class="events" id="events-body"><li class="muted">Loading…</li></ul>
+  </section>
+</div>
+{% endblock %}

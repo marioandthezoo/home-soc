@@ -1,0 +1,695 @@
+"""End-to-end orchestrator for the Home SOC walkthrough video.
+
+    python video/render.py                 # the whole pipeline
+    python video/render.py --no-capture    # reuse build/shots, recompose
+    python video/render.py --only 06-findings
+    python video/render.py --no-seed --no-narrate --no-capture --force
+
+Pipeline
+--------
+1. ``seed_demo.py``  builds ``video/demo_data/homesoc.db`` (never touches ``data/``)
+2. ``narrate.py``    edge-tts -> ``build/audio/*.mp3`` + ``build/timings.json`` + the SRT
+3. ``capture.py``    Playwright -> ``build/shots/*.png`` + ``build/geometry.json``
+                     + ``build/shots_manifest.json``
+4. ``compose.py``    per scene: frames piped to ffmpeg -> ``build/clips/NN-id.mp4``
+5. concat demuxer    the clips, stream-copied into one video track
+6. audio             per-scene silence-padded WAVs, concatenated, muxed as AAC 192k
+7. verify            ffprobe the result and print the summary
+
+Every scene clip is fingerprinted, so a second run only recomposes what changed.
+Because scenes cross-dissolve into each other, a scene's fingerprint includes the
+one before it: changing scene 3 correctly reworks scene 4's first 400 ms.
+
+The whole pipeline is read-only with respect to the user's real security
+database: only ``video/demo_data`` is ever written to.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+from PIL import Image
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import compose as C  # noqa: E402  (needs HERE on sys.path)
+
+log = logging.getLogger("homesoc.video.render")
+
+BUILD = HERE / "build"
+SHOTS = BUILD / "shots"
+CLIPS = BUILD / "clips"
+AUDIO = BUILD / "audio"
+PADDED = BUILD / "audio_padded"
+OUT_DIR = HERE / "out"
+OUT_MP4 = OUT_DIR / "HomeSOC-walkthrough.mp4"
+OUT_SRT = OUT_DIR / "HomeSOC-walkthrough.srt"
+
+TIMINGS = BUILD / "timings.json"
+GEOMETRY = BUILD / "geometry.json"
+MANIFEST = BUILD / "shots_manifest.json"
+TIMELINE = BUILD / "timeline.json"
+
+SEED_TIMEOUT = 900
+NARRATE_TIMEOUT = 1800
+CAPTURE_TIMEOUT = 2400
+FFMPEG_TIMEOUT = 1800
+
+AUDIO_RATE = 48000
+AUDIO_CH = 2
+
+
+class RenderError(RuntimeError):
+    """A pipeline step failed in a way the operator has to fix."""
+
+
+# --------------------------------------------------------------------------
+# subprocess helpers - every child is waited for or killed in a finally
+# --------------------------------------------------------------------------
+
+
+def run_step(name: str, argv: Sequence[str], timeout: float, cwd: Path | None = None) -> None:
+    """Run a pipeline step, streaming its output, and never leave it running."""
+    print(f"\n=== {name} ===", flush=True)
+    print("    " + " ".join(argv), flush=True)
+    started = time.perf_counter()
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=str(cwd or HERE.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print("    " + line.rstrip(), flush=True)
+        rc = proc.wait(timeout=timeout)
+        if rc != 0:
+            raise RenderError(f"{name} failed with exit code {rc}")
+    except subprocess.TimeoutExpired as exc:
+        raise RenderError(f"{name} timed out after {timeout:.0f}s") from exc
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+    print(f"    done in {time.perf_counter() - started:.1f}s", flush=True)
+
+
+def ffmpeg(args: Sequence[str], what: str, timeout: float = FFMPEG_TIMEOUT) -> None:
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args]
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        out, _ = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            raise RenderError(f"{what}: ffmpeg exited {proc.returncode}\n{(out or '')[-3000:]}")
+    except subprocess.TimeoutExpired as exc:
+        raise RenderError(f"{what}: ffmpeg timed out after {timeout:.0f}s") from exc
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def ffprobe_json(path: Path, timeout: float = 60) -> dict[str, Any]:
+    cmd = [
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_format", "-show_streams", str(path),
+    ]
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            raise RenderError(f"ffprobe failed on {path.name}: {err.strip()}")
+        return json.loads(out)
+    except subprocess.TimeoutExpired as exc:
+        raise RenderError(f"ffprobe timed out on {path.name}") from exc
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def media_seconds(path: Path) -> float:
+    info = ffprobe_json(path)
+    try:
+        return float(info["format"]["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RenderError(f"{path.name} has no readable duration") from exc
+
+
+# --------------------------------------------------------------------------
+# scene bookkeeping
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SceneJob:
+    index: int
+    scene: Any
+    scene_id: str
+    states: list[C.ShotState]
+    narration_seconds: float
+    audio: Path | None
+    extra_tail: float
+    clip: Path
+    stamp: Path
+    last_png: Path
+
+    plan: C.ScenePlan | None = None
+    reused: bool = False
+    elapsed: float = 0.0
+    start: float = 0.0
+    seconds: float = 0.0
+
+
+def load_script() -> Any:
+    try:
+        import script  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RenderError(f"cannot import video/script.py: {type(exc).__name__}: {exc}") from exc
+    if not getattr(script, "SCENES", None):
+        raise RenderError("video/script.py defines no SCENES")
+    return script
+
+
+def load_json(path: Path, what: str, required: bool = True) -> dict[str, Any]:
+    if not path.exists():
+        if required:
+            raise RenderError(f"{what} is missing ({path}). Run the earlier pipeline steps first.")
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RenderError(f"{what} is not valid JSON ({path}): {exc}") from exc
+
+
+def fingerprint(job: SceneJob, previous: str) -> str:
+    """Everything that can change a scene's pixels, in one hash."""
+    h = hashlib.sha256()
+    h.update(previous.encode())
+    h.update(str(HERE.joinpath("compose.py").stat().st_mtime_ns).encode())
+    h.update(f"{job.narration_seconds:.4f}|{job.extra_tail:.3f}".encode())
+    for st in job.states:
+        try:
+            s = st.png.stat()
+            h.update(f"{st.png.name}|{s.st_mtime_ns}|{s.st_size}|{st.scroll}|{st.kind}".encode())
+        except OSError:
+            h.update(f"{st.png.name}|missing".encode())
+    plan = job.plan
+    if plan is not None:
+        h.update(repr((plan.n_frames, plan.caption, plan.moves, plan.clicks, plan.swaps,
+                       plan.highlights, plan.cameras, plan.fixed)).encode())
+    return h.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# audio
+# --------------------------------------------------------------------------
+
+
+def build_audio(jobs: Sequence[SceneJob], out_wav: Path) -> float:
+    """One WAV for the whole film: per scene, LEAD_IN silence + speech + padding.
+
+    Each padded scene is trimmed to exactly the length of its video clip, so the
+    two tracks cannot drift no matter how the frame count rounded.
+    """
+    PADDED.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    for job in jobs:
+        dest = PADDED / f"{job.index:02d}-{job.scene_id}.wav"
+        exact = job.seconds
+        if job.audio is not None and job.audio.exists():
+            ffmpeg(
+                [
+                    "-i", str(job.audio),
+                    "-af", f"adelay={int(round(C.LEAD_IN * 1000))}:all=1,apad",
+                    "-t", f"{exact:.6f}",
+                    "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CH), "-c:a", "pcm_s16le",
+                    str(dest),
+                ],
+                f"pad audio for {job.scene_id}",
+            )
+        else:
+            log.warning("[%s] no narration audio - filling %.2fs with silence", job.scene_id, exact)
+            ffmpeg(
+                [
+                    "-f", "lavfi", "-i",
+                    f"anullsrc=channel_layout={'stereo' if AUDIO_CH == 2 else 'mono'}:"
+                    f"sample_rate={AUDIO_RATE}",
+                    "-t", f"{exact:.6f}", "-c:a", "pcm_s16le", str(dest),
+                ],
+                f"silence for {job.scene_id}",
+            )
+        parts.append(dest)
+
+    listing = PADDED / "concat.txt"
+    listing.write_text(
+        "".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8"
+    )
+    ffmpeg(
+        ["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(out_wav)],
+        "concatenate narration",
+    )
+    return media_seconds(out_wav)
+
+
+# --------------------------------------------------------------------------
+# subtitles
+# --------------------------------------------------------------------------
+
+_SRT_BLOCK = re.compile(
+    r"(\d+)\s*\n(\d\d):(\d\d):(\d\d),(\d\d\d)\s*-->\s*(\d\d):(\d\d):(\d\d),(\d\d\d)\s*\n(.*?)(?=\n\s*\n|\Z)",
+    re.S,
+)
+
+
+def _srt_ts(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def retime_srt(jobs: Sequence[SceneJob], timings: dict[str, Any]) -> str | None:
+    """Shift narrate.py's cues onto the timeline the compositor actually produced.
+
+    narrate.py lays the SRT out on its own arithmetic; rounding each clip to a
+    whole frame moves the real scene starts by a few milliseconds.  timings.json
+    records how many sentences each scene contributed, so the cues can be split
+    back up per scene and shifted by that scene's own delta.
+    """
+    if not OUT_SRT.exists():
+        log.warning("no %s to retime - run narrate.py to get subtitles", OUT_SRT.name)
+        return None
+    text = OUT_SRT.read_text(encoding="utf-8")
+    blocks = _SRT_BLOCK.findall(text)
+    if not blocks:
+        log.warning("%s has no parsable cues; leaving it alone", OUT_SRT.name)
+        return None
+
+    counts = [int((timings.get(j.scene_id) or {}).get("sentences") or 0) for j in jobs]
+    if sum(counts) != len(blocks):
+        log.warning(
+            "SRT has %d cues but timings.json accounts for %d; leaving subtitle "
+            "timings as narrate.py wrote them",
+            len(blocks), sum(counts),
+        )
+        return None
+
+    out: list[str] = []
+    n = 0
+    cursor = 0
+    for job, count in zip(jobs, counts):
+        old_start = float((timings.get(job.scene_id) or {}).get("start") or 0.0)
+        delta = job.start - old_start
+        for _ in range(count):
+            b = blocks[cursor]
+            cursor += 1
+            n += 1
+            t0 = int(b[1]) * 3600 + int(b[2]) * 60 + int(b[3]) + int(b[4]) / 1000
+            t1 = int(b[5]) * 3600 + int(b[6]) * 60 + int(b[7]) + int(b[8]) / 1000
+            body = b[9].strip("\n")
+            out.append(f"{n}\n{_srt_ts(t0 + delta)} --> {_srt_ts(t1 + delta)}\n{body}\n")
+    payload = "\n".join(out)
+    OUT_SRT.write_text(payload, encoding="utf-8")
+    return payload
+
+
+# --------------------------------------------------------------------------
+# the pipeline
+# --------------------------------------------------------------------------
+
+
+def collect_jobs(script: Any, only: set[str] | None) -> list[SceneJob]:
+    timings = load_json(TIMINGS, "build/timings.json")
+    scenes = list(script.SCENES)
+    jobs: list[SceneJob] = []
+    for i, scene in enumerate(scenes, start=1):
+        sid = str(scene.id)
+        row = timings.get(sid) or {}
+        seconds = float(row.get("seconds") or 0.0)
+        if seconds <= 0.0:
+            raise RenderError(
+                f"[{sid}] timings.json has no narration duration - run narrate.py "
+                f"(or pass --no-narrate only when build/timings.json is complete)"
+            )
+        audio = Path(row["audio"]) if row.get("audio") else AUDIO / f"scene_{i:02d}.mp3"
+        if not audio.is_absolute():
+            audio = (HERE / audio).resolve()
+        jobs.append(
+            SceneJob(
+                index=i,
+                scene=scene,
+                scene_id=sid,
+                states=C.load_states(BUILD, sid, scene),
+                narration_seconds=seconds,
+                audio=audio if audio.exists() else None,
+                extra_tail=C.END_ROOM_TONE if i == len(scenes) else 0.0,
+                clip=CLIPS / f"{i:02d}-{sid}.mp4",
+                stamp=CLIPS / f"{i:02d}-{sid}.json",
+                last_png=CLIPS / f"{i:02d}-{sid}.last.png",
+            )
+        )
+    if only:
+        unknown = only - {j.scene_id for j in jobs}
+        if unknown:
+            raise RenderError(
+                f"--only names unknown scene(s): {', '.join(sorted(unknown))}. "
+                f"Known ids: {', '.join(j.scene_id for j in jobs)}"
+            )
+    return jobs
+
+
+def compose_all(
+    jobs: Sequence[SceneJob],
+    geometry: dict[str, Any],
+    only: set[str] | None,
+    force: bool,
+    preset: str,
+    crf: int,
+    probe_every: int,
+) -> None:
+    CLIPS.mkdir(parents=True, exist_ok=True)
+    previous_hash = ""
+    prev_frame: np.ndarray | None = None
+    cursor = C.DEFAULT_CURSOR_START
+    total_frames = sum(
+        max(1, int(round((C.LEAD_IN + j.narration_seconds + C.TAIL + j.extra_tail) * C.FPS)))
+        for j in jobs
+    )
+    print(f"\n=== compose ({len(jobs)} scenes, ~{total_frames} frames) ===", flush=True)
+    done_frames = 0
+    wall = time.perf_counter()
+
+    for job in jobs:
+        job.plan = C.build_plan(
+            job.scene,
+            job.states,
+            job.narration_seconds,
+            geometry.get(job.scene_id, {}),
+            cursor_start=cursor,
+            strict=True,
+            extra_tail=job.extra_tail,
+        )
+        job.seconds = job.plan.n_frames / C.FPS
+        want = fingerprint(job, previous_hash)
+        selected = only is None or job.scene_id in only
+
+        stamped = ""
+        if job.stamp.exists():
+            try:
+                stamped = json.loads(job.stamp.read_text(encoding="utf-8")).get("hash", "")
+            except (OSError, json.JSONDecodeError):
+                stamped = ""
+        # naming a scene in --only means "rebuild this one", always
+        fresh = (
+            not force
+            and only is None
+            and job.clip.exists()
+            and job.last_png.exists()
+            and stamped == want
+        )
+        if only is not None and not selected:
+            # not in --only: keep the existing clip, but it must exist
+            if not job.clip.exists():
+                raise RenderError(
+                    f"--only skipped {job.scene_id} but {job.clip.name} does not exist yet; "
+                    f"run without --only once to build every clip"
+                )
+            fresh = True
+
+        if fresh:
+            job.reused = True
+            if job.last_png.exists():
+                prev_frame = np.asarray(Image.open(job.last_png).convert("RGB"), dtype=np.uint8)
+            else:
+                log.warning(
+                    "[%s] reusing a clip with no stored last frame - the next scene "
+                    "will cut instead of dissolving", job.scene_id,
+                )
+                prev_frame = None
+            # trust the file on disk, not the recomputed plan, so the audio track
+            # is padded to the length the video actually is
+            job.seconds = media_seconds(job.clip)
+            done_frames += int(round(job.seconds * C.FPS))
+            print(
+                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} "
+                f"{int(round(job.seconds * C.FPS)):5d}f {job.seconds:6.2f}s  reused",
+                flush=True,
+            )
+        else:
+            res = C.render_scene(
+                job.plan,
+                job.clip,
+                prev_frame=prev_frame,
+                preset=preset,
+                crf=crf,
+                probe_dir=BUILD / "probe" if probe_every else None,
+                probe_every=probe_every,
+            )
+            job.elapsed = res.elapsed
+            prev_frame = res.last_frame
+            Image.fromarray(prev_frame).save(job.last_png)
+            job.stamp.write_text(
+                json.dumps({"hash": want, "frames": res.frames, "seconds": res.seconds}, indent=2),
+                encoding="utf-8",
+            )
+            done_frames += res.frames
+            pct = 100.0 * done_frames / max(1, total_frames)
+            print(
+                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} "
+                f"{res.frames:5d}f {res.seconds:6.2f}s  {res.elapsed:6.1f}s "
+                f"({res.frames / max(res.elapsed, 1e-6):5.0f} fps)  {pct:5.1f}%  "
+                f"elapsed {time.perf_counter() - wall:6.1f}s",
+                flush=True,
+            )
+        cursor = job.plan.cursor_end
+        previous_hash = want
+
+    # scene start times on the final timeline
+    t = 0.0
+    for job in jobs:
+        job.start = t
+        t += job.seconds
+
+
+def concat_clips(jobs: Sequence[SceneJob], dest: Path) -> None:
+    listing = CLIPS / "concat.txt"
+    listing.write_text(
+        "".join(f"file '{j.clip.as_posix()}'\n" for j in jobs), encoding="utf-8"
+    )
+    ffmpeg(
+        ["-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(dest)],
+        "concatenate scene clips",
+    )
+
+
+def mux(video: Path, audio: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg(
+        [
+            "-i", str(video), "-i", str(audio),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", "-shortest",
+            str(dest),
+        ],
+        "mux narration onto the video",
+    )
+
+
+def verify(dest: Path, jobs: Sequence[SceneJob]) -> list[str]:
+    """ffprobe the deliverable and check it against the contract's quality bar."""
+    info = ffprobe_json(dest)
+    problems: list[str] = []
+    vs = [s for s in info.get("streams", []) if s.get("codec_type") == "video"]
+    aus = [s for s in info.get("streams", []) if s.get("codec_type") == "audio"]
+    if len(vs) != 1:
+        problems.append(f"expected 1 video stream, found {len(vs)}")
+    if len(aus) != 1:
+        problems.append(f"expected 1 audio stream, found {len(aus)}")
+
+    dur = float(info.get("format", {}).get("duration") or 0.0)
+    print("\n=== result ===")
+    print(f"  file      {dest}  ({dest.stat().st_size / 1e6:.1f} MB)")
+    print(f"  duration  {dur:.2f}s  ({dur / 60:.2f} min)")
+    if vs:
+        v = vs[0]
+        print(
+            f"  video     {v.get('codec_name')} {v.get('width')}x{v.get('height')} "
+            f"{v.get('r_frame_rate')} {v.get('pix_fmt')} "
+            f"{float(v.get('duration') or dur):.2f}s"
+        )
+        if v.get("codec_name") != "h264":
+            problems.append(f"video codec is {v.get('codec_name')}, expected h264")
+        if v.get("pix_fmt") != "yuv420p":
+            problems.append(f"pix_fmt is {v.get('pix_fmt')}, expected yuv420p")
+        if (v.get("width"), v.get("height")) != (C.W, C.H):
+            problems.append(f"video is {v.get('width')}x{v.get('height')}, expected {C.W}x{C.H}")
+    if aus:
+        a = aus[0]
+        print(
+            f"  audio     {a.get('codec_name')} {a.get('sample_rate')}Hz "
+            f"{a.get('channels')}ch {float(a.get('duration') or dur):.2f}s"
+        )
+        if a.get("codec_name") != "aac":
+            problems.append(f"audio codec is {a.get('codec_name')}, expected aac")
+    if vs and aus:
+        vd = float(vs[0].get("duration") or dur)
+        ad = float(aus[0].get("duration") or dur)
+        if abs(vd - ad) > 0.5:
+            problems.append(f"video is {vd:.2f}s but audio is {ad:.2f}s (>0.5s apart)")
+
+    expected = sum(j.seconds for j in jobs)
+    if abs(dur - expected) > 0.6:
+        problems.append(f"duration {dur:.2f}s but the scene clips add up to {expected:.2f}s")
+    return problems
+
+
+def write_timeline(jobs: Sequence[SceneJob]) -> None:
+    TIMELINE.write_text(
+        json.dumps(
+            {
+                j.scene_id: {
+                    "index": j.index,
+                    "start": round(j.start, 3),
+                    "seconds": round(j.seconds, 3),
+                    "frames": j.plan.n_frames if j.plan else 0,
+                    "narration": round(j.narration_seconds, 3),
+                    "clip": j.clip.as_posix(),
+                }
+                for j in jobs
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Render the Home SOC walkthrough video end to end.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("--only", metavar="ID[,ID]", help="recompose only these scene ids")
+    ap.add_argument("--no-seed", action="store_true", help="reuse video/demo_data")
+    ap.add_argument("--no-narrate", action="store_true", help="reuse build/audio + timings.json")
+    ap.add_argument("--no-capture", action="store_true", help="reuse build/shots")
+    ap.add_argument("--force", action="store_true", help="recompose every scene clip")
+    ap.add_argument("--preset", default="fast", help="x264 preset")
+    ap.add_argument("--crf", type=int, default=19, help="x264 CRF")
+    ap.add_argument("--probe-every", type=int, default=0, metavar="N",
+                    help="also dump every Nth frame to build/probe as a PNG")
+    ap.add_argument("--list", action="store_true", help="list the scenes and exit")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args(argv)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(message)s",
+    )
+    for exe in ("ffmpeg", "ffprobe"):
+        if shutil.which(exe) is None:
+            print(f"error: {exe} is not on PATH", file=sys.stderr)
+            return 2
+
+    started = time.perf_counter()
+    script = load_script()
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
+
+    if args.list:
+        for i, sc in enumerate(script.SCENES, 1):
+            print(f"  {i:02d}  {sc.id:<22} {len(sc.narration.split()):4d} words  "
+                  f"caption={sc.caption!r}")
+        return 0
+
+    try:
+        py = sys.executable
+        if not args.no_seed:
+            seed = HERE / "seed_demo.py"
+            if seed.exists():
+                run_step("seed demo data", [py, str(seed)], SEED_TIMEOUT)
+            else:
+                log.warning("video/seed_demo.py does not exist yet - skipping the seed step")
+        if not args.no_narrate:
+            run_step("narrate", [py, str(HERE / "narrate.py")], NARRATE_TIMEOUT)
+        if not args.no_capture:
+            cmd = [py, str(HERE / "capture.py")]
+            if only:
+                cmd += ["--only", ",".join(sorted(only))]
+            run_step("capture", cmd, CAPTURE_TIMEOUT)
+
+        timings = load_json(TIMINGS, "build/timings.json")
+        geometry = load_json(GEOMETRY, "build/geometry.json", required=False)
+        if not MANIFEST.exists():
+            log.warning("%s is missing - falling back to globbing build/shots", MANIFEST.name)
+
+        jobs = collect_jobs(script, only)
+        compose_all(jobs, geometry, only, args.force, args.preset, args.crf, args.probe_every)
+
+        BUILD.mkdir(parents=True, exist_ok=True)
+        silent = BUILD / "video_only.mp4"
+        print("\n=== assemble ===", flush=True)
+        concat_clips(jobs, silent)
+        print(f"    video track {media_seconds(silent):.2f}s", flush=True)
+        track = BUILD / "narration.wav"
+        secs = build_audio(jobs, track)
+        print(f"    audio track {secs:.2f}s", flush=True)
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        mux(silent, track, OUT_MP4)
+
+        write_timeline(jobs)
+        srt = retime_srt(jobs, timings)
+        problems = verify(OUT_MP4, jobs)
+        print(f"  srt       {OUT_SRT if srt is not None else '(left as narrate.py wrote it)'}")
+        print(f"  timeline  {TIMELINE}")
+        reused = sum(1 for j in jobs if j.reused)
+        print(f"  scenes    {len(jobs)} ({reused} reused, {len(jobs) - reused} composed)")
+        print(f"  total     {time.perf_counter() - started:.1f}s")
+        if problems:
+            print("\n  PROBLEMS:")
+            for p in problems:
+                print(f"    - {p}")
+            return 1
+        print("\n  OK - every ffprobe check passed.")
+        return 0
+    except (RenderError, C.ComposeError, FileNotFoundError) as exc:
+        print(f"\nerror: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

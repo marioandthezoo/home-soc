@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{{ page_title }} · Home SOC</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-page="{{ page }}" data-refresh="0">
+<main class="main">
+  <div class="card login">
+    {% if not_found %}
+    <h1>Not found</h1>
+    <p>{{ error }}</p>
+    <p><a href="/">Back to the overview</a></p>
+    {% else %}
+    <h1>◉ Home SOC</h1>
+    <p>This dashboard is protected by the token from <span class="mono">config.toml</span> (<span class="mono">[web] token</span>).</p>
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="get" action="/login">
+      <div class="field"><label for="token">token</label><input type="password" id="token" name="token" autocomplete="current-password" autofocus required></div>
+      <button class="btn btn-primary" type="submit">Sign in</button>
+    </form>
+    {% endif %}
+  </div>
+</main>
+</body>
+</html>

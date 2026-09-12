@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block content %}
+{% set h = host %}
+{% set df = h.defender %}
+<div class="toolbar">
+  <button class="btn btn-primary" data-action="scan" data-kind="host">Run posture scan</button>
+  <span class="muted small">{{ h.checks|length }} checks · platform {{ h.platform }}</span>
+</div>
+
+<div class="grid grid-2">
+  <section class="card">
+    <h2>Windows Defender</h2>
+    {% if df.status %}
+    <div class="stat-row">
+      <div class="stat"><div class="v">{{ badge('ok' if df.status.get('AntivirusEnabled', df.status.get('enabled')) else 'fail', 'on' if df.status.get('AntivirusEnabled', df.status.get('enabled')) else 'off') }}</div><div class="l">antivirus</div></div>
+      <div class="stat"><div class="v">{{ badge('ok' if df.status.get('RealTimeProtectionEnabled', df.status.get('realtime')) else 'fail', 'on' if df.status.get('RealTimeProtectionEnabled', df.status.get('realtime')) else 'off') }}</div><div class="l">real-time</div></div>
+      <div class="stat"><div class="v">{{ df.signature_age_days if df.signature_age_days is not none else '?' }}d</div><div class="l">signature age</div></div>
+      <div class="stat"><div class="v small">{{ df.last_quick_scan or 'never' }}</div><div class="l">last quick scan</div></div>
+      <div class="stat"><div class="v small">{{ df.last_full_scan or 'never' }}</div><div class="l">last full scan</div></div>
+    </div>
+    {% else %}<p class="muted">No Defender status recorded yet — run a posture scan.</p>{% endif %}
+    <div class="actions">
+      <button class="btn" data-action="defender" data-op="quick-scan">Quick scan</button>
+      <button class="btn" data-action="defender" data-op="update">Update signatures</button>
+      {% if df.status %}<button class="btn btn-sm" data-action="toggle" data-target="#defender-raw">raw status</button>{% endif %}
+    </div>
+    {% if df.status %}<pre id="defender-raw" hidden>{{ df.status|pretty }}</pre>{% endif %}
+    <h3>Threats · last 30 days</h3>
+    {% if df.threats %}
+    <ul class="check-list">
+      {% for t in df.threats %}<li><span>{{ badge('fail', 'threat') }}</span><span class="wrap"><b>{{ t.get('name') or t.get('ThreatName') or 'threat' }}</b><div class="cv">{{ t.get('detail') or t.get('Resources') or '' }}</div></span><span class="muted small">{{ t.get('seen') or t.get('InitialDetectionTime') or '' }}</span></li>{% endfor %}
+    </ul>
+    {% else %}<p class="muted small">No threats detected.</p>{% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Updates</h2>
+    {% if h.updates.pending %}
+    <ul class="check-list">
+      {% for u in h.updates.pending %}<li><span>{{ badge('warn', 'pending') }}</span><span class="wrap">{{ u.get('title') if u is mapping else u }}{% if u is mapping and u.get('kb') %} <span class="mono muted small">{{ u.get('kb') }}</span>{% endif %}</span><span class="muted small">{{ u.get('severity', '') if u is mapping else '' }}</span></li>{% endfor %}
+    </ul>
+    {% elif h.updates.checks %}
+    <ul class="check-list">
+      {% for c in h.updates.checks %}<li><span class="cid">{{ c.check_id }}</span><span class="cv wrap">{{ c.value or '' }}</span><span>{{ badge(c.status) }}</span></li>{% endfor %}
+    </ul>
+    {% else %}<p class="muted small">No update information yet.</p>{% endif %}
+    {% if h.updates.last_hotfix %}<p class="muted small">last hotfix {{ h.updates.last_hotfix }}</p>{% endif %}
+    <h3>Outdated apps ({{ h.software|length }})</h3>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>App</th><th>Installed</th><th>Available</th><th>Source</th></tr></thead>
+      <tbody>
+        {% for s in h.software[:60] %}<tr><td class="wrap">{{ s.name }}</td><td class="mono">{{ s.version or '' }}</td><td class="mono">{{ s.available }}</td><td>{{ s.source }}</td></tr>
+        {% else %}<tr><td colspan="4" class="empty">Everything is up to date (or winget has not run yet).</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Posture checks</h2>
+  {% if groups %}
+  <div class="grid grid-2">
+    {% for name, checks in groups.items() %}
+    <div>
+      <h3>{{ name }}</h3>
+      <ul class="check-list">
+        {% for c in checks %}
+        <li>
+          <span class="cid">{{ c.check_id }}</span>
+          <span class="wrap"><span class="cv">{{ c.value or '' }}</span>{% if c.expected %}<div class="muted small">expected: {{ c.expected }}</div>{% endif %}</span>
+          <span>{{ badge(c.status) }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}<p class="muted">No posture checks recorded yet — run a posture scan.</p>{% endif %}
+</section>
+
+<div class="grid grid-2">
+  <section class="card">
+    <h2>Persistence (autostarts)</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Kind</th><th>Name</th><th>Command</th><th>Location</th><th>Seen</th></tr></thead>
+      <tbody>
+        {% for p in h.persistence %}
+        <tr>
+          <td class="nowrap">{{ p.kind }}{% if not p.baseline %} {{ badge('new') }}{% endif %}</td>
+          <td class="wrap">{{ p.name }}</td>
+          <td class="mono small wrap">{{ p.command or '' }}</td>
+          <td class="mono small wrap">{{ p.location }}</td>
+          <td class="nowrap">{{ p.last_seen|ago }}</td>
+        </tr>
+        {% else %}<tr><td colspan="5" class="empty">No autostart entries recorded yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Listeners</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Port</th><th>Process / detail</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for l in h.listeners %}
+        <tr><td class="mono">{{ l.get('port') }}{% if l.get('proto') %}/{{ l.get('proto') }}{% endif %}</td><td class="wrap">{{ l.get('process') or l.get('value') or '' }}</td><td>{% if l.get('status') %}{{ badge(l.get('status')) }}{% endif %}</td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No listener information yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

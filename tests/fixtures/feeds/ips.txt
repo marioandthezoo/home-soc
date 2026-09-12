@@ -1,0 +1,14 @@
+; Spamhaus DROP List 2026/09/03 - (c) 2026 The Spamhaus Project
+; https://www.spamhaus.org/drop/drop.txt
+; Last-Modified: Wed, 03 Sep 2026 10:11:12 GMT
+; Expires: Thu, 04 Sep 2026 10:11:12 GMT
+1.10.16.0/20 ; SBL256894
+1.19.0.0/16 ; SBL434604
+2.56.192.0/22 ; SBL459831
+5.134.128.0/19 ; SBL270738
+23.226.208.0/20 ; SBL449504
+185.220.101.44   # plain host from a bare-IP feed
+185.220.101.44/32
+2001:db8::/32 ; ipv6 must be skipped
+999.1.1.1/24 ; invalid octet
+not-an-ip ; SBL000000

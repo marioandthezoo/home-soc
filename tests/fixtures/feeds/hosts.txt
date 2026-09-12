@@ -1,0 +1,34 @@
+# Title: StevenBlack/hosts (sample excerpt for tests)
+#
+# This hosts file is a merged collection of hosts from reputable sources,
+# with a dash of crowd sourcing via GitHub
+#
+# Date: 03 September 2026 12:00:00 (UTC)
+# Number of unique domains: 8
+# ===============================================================
+
+127.0.0.1 localhost
+127.0.0.1 localhost.localdomain
+127.0.0.1 local
+255.255.255.255 broadcasthost
+::1 localhost
+::1 ip6-localhost
+::1 ip6-loopback
+fe80::1%lo0 localhost
+ff00::0 ip6-localnet
+ff02::1 ip6-allnodes
+0.0.0.0 0.0.0.0
+
+# Start StevenBlack
+
+0.0.0.0 ads.example.com
+0.0.0.0	tracker.example.net	# tab separated with an inline comment
+0.0.0.0   Analytics.Example.ORG.
+0.0.0.0 a.doubleclick.example b.doubleclick.example
+127.0.0.1 ads.example.com
+:: ipv6-sink.example.com
+# 0.0.0.0 commented-out.example.com
+bare.example.com
+0.0.0.0 not a domain !!
+0.0.0.0 1.2.3.4
+0.0.0.0 singlelabel

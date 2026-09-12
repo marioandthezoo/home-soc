@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<form class="filters" method="get" action="/vulns" data-submit-on-change>
+  <label><input type="checkbox" name="kev" value="1"{% if filters.kev %} checked{% endif %}> KEV only</label>
+  <label>Min CVSS
+    <select name="min_cvss">
+      {% for v in ['', '4', '7', '9'] %}<option value="{{ v }}"{% if filters.min_cvss == v %} selected{% endif %}>{{ v or 'any' }}</option>{% endfor %}
+    </select>
+  </label>
+  <input type="search" name="q" value="{{ filters.q }}" placeholder="cve, title, ip, product…">
+  <button class="btn" type="submit">Apply</button>
+  <input type="search" placeholder="filter shown rows" data-filter="#vulns-table" aria-label="Filter rows">
+  <span class="muted small" data-filter-count="vulns-table">{{ vulns|length }} shown</span>
+</form>
+
+<section class="card">
+  <div class="tbl-wrap">
+  <table class="tbl" id="vulns-table" data-filterable>
+    <thead><tr><th>CVE</th><th>KEV</th><th class="num">CVSS</th><th class="num">EPSS</th><th>Device</th><th>Service</th><th>Matched on</th><th>First seen</th><th>Links</th></tr></thead>
+    <tbody>
+      {% for v in vulns %}
+      <tr class="expandable">
+        <td class="mono nowrap">{{ v.cve }}</td>
+        <td>{% if v.kev %}{{ badge('kev') }}{% endif %}</td>
+        <td class="num">{% if v.cvss is not none %}{{ sev('critical' if v.cvss >= 9 else 'high' if v.cvss >= 7 else 'medium' if v.cvss >= 4 else 'low') }} {{ v.cvss }}{% endif %}</td>
+        <td class="num">{{ '%.2f'|format(v.epss) if v.epss is not none else '' }}</td>
+        <td class="wrap">{% if v.device_id %}<a href="/devices/{{ v.device_id }}">{{ v.device_name }}</a> <span class="mono muted small">{{ v.device_ip or '' }}</span>{% endif %}</td>
+        <td class="wrap small">{% if v.port %}<span class="mono">{{ v.port }}/{{ v.proto }}</span> {% endif %}{{ v.product or v.service_name or '' }} {{ v.service_version or '' }}</td>
+        <td class="wrap small">{{ v.matched_on }}</td>
+        <td class="nowrap" title="{{ v.first_seen|ts }}">{{ v.first_seen|ago }}</td>
+        <td class="nowrap"><a href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">NVD</a>{% if v.kev %} · <a href="{{ v.kev_url }}" target="_blank" rel="noopener noreferrer">KEV</a>{% endif %}</td>
+      </tr>
+      <tr class="detail-row" hidden>
+        <td colspan="9">
+          <div class="detail">
+            <div><h4>{{ v.title or v.cve }}</h4><p class="small">source {{ v.source }}{% if v.published %} · published {{ v.published }}{% endif %} · last seen {{ v.last_seen|ts }}</p></div>
+            <div><h4>Remediation</h4><p class="small">{{ v.remediation or 'Update the affected software to a fixed version or isolate the device.' }}</p></div>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No vulnerabilities matched yet. They appear after a service scan when KEV/NVD data is available.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endblock %}

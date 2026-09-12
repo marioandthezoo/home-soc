@@ -1,0 +1,17 @@
+# Title: HaGeZi's Pro DNS Blocklist (sample excerpt for tests)
+# Description: Cleans the Internet and protects your privacy!
+# Homepage: https://github.com/hagezi/dns-blocklists
+# Expires: 1 day
+# Last modified: 03 Sep 2026 12:00:00 UTC
+# Syntax: Wildcard Domains
+# Number of entries: 6
+#
+*.ads.example.com
+*.telemetry.example.net
+*.Metrics.Example.ORG
+.dot-prefixed.example
+plain.example.com
+*.ads.example.com
+*.
+*
+*.junk domain.example

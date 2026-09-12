@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/local/share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Synthetic fixture. Structurally faithful to nmap 7.92 -oX output for a connect() scan of a
+     home gateway: service/version/CPE detection on 53/80/443, TLS tunnel on 443, filtered
+     everywhere else. Addresses are RFC 1918 documentation values; no real host is described. -->
+<!-- Nmap 7.92 scan initiated Fri Sep  4 15:43:25 2026 as: nmap -sT -sV -&#45;version-light -T3 -&#45;top-ports 20 -n -Pn -&#45;host-timeout 60s -oX tests/fixtures/nmap/router.xml 192.168.1.254 -->
+<nmaprun scanner="nmap" args="nmap -sT -sV -&#45;version-light -T3 -&#45;top-ports 20 -n -Pn -&#45;host-timeout 60s -oX tests/fixtures/nmap/router.xml 192.168.1.254" start="1788561805" startstr="Fri Sep  4 15:43:25 2026" version="7.92" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="20" services="21-23,25,53,80,110-111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1788561806" endtime="1788561820"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.168.1.254" addrtype="ipv4"/>
+<hostnames>
+<hostname name="gateway.lan" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="21"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="ftp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="22"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="ssh" method="table" conf="3"/></port>
+<port protocol="tcp" portid="23"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="telnet" method="table" conf="3"/></port>
+<port protocol="tcp" portid="25"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="smtp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="53"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="domain" product="Unbound" version="1.18.0" method="probed" conf="10"><cpe>cpe:/a:nlnetlabs:unbound:1.18.0</cpe></service></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="lighttpd" version="1.4.69" method="probed" conf="10"><cpe>cpe:/a:lighttpd:lighttpd:1.4.69</cpe></service></port>
+<port protocol="tcp" portid="110"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="pop3" method="table" conf="3"/></port>
+<port protocol="tcp" portid="111"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="rpcbind" method="table" conf="3"/></port>
+<port protocol="tcp" portid="135"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="msrpc" method="table" conf="3"/></port>
+<port protocol="tcp" portid="139"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="netbios-ssn" method="table" conf="3"/></port>
+<port protocol="tcp" portid="143"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="imap" method="table" conf="3"/></port>
+<port protocol="tcp" portid="443"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="lighttpd" version="1.4.69" tunnel="ssl" method="probed" conf="10"><cpe>cpe:/a:lighttpd:lighttpd:1.4.69</cpe></service></port>
+<port protocol="tcp" portid="445"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="microsoft-ds" method="table" conf="3"/></port>
+<port protocol="tcp" portid="993"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="imaps" method="table" conf="3"/></port>
+<port protocol="tcp" portid="995"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="pop3s" method="table" conf="3"/></port>
+<port protocol="tcp" portid="1723"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="pptp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="3306"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="mysql" method="table" conf="3"/></port>
+<port protocol="tcp" portid="3389"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="ms-wbt-server" method="table" conf="3"/></port>
+<port protocol="tcp" portid="5900"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="vnc" method="table" conf="3"/></port>
+<port protocol="tcp" portid="8080"><state state="filtered" reason="no-response" reason_ttl="0"/><service name="http-proxy" method="table" conf="3"/></port>
+</ports>
+<times srtt="8171" rttvar="6531" to="100000"/>
+</host>
+<runstats><finished time="1788561820" timestr="Fri Sep  4 15:43:40 2026" summary="Nmap done at Fri Sep  4 15:43:40 2026; 1 IP address (1 host up) scanned in 15.49 seconds" elapsed="15.49" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

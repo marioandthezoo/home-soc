@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="sev-counts" aria-label="Open findings by severity">
+  {% for sv in severities %}<a href="/findings?status=open&severity={{ sv }}">{{ badge(sv, counts.open[sv] ~ ' ' ~ sv) }}</a>{% endfor %}
+  <span class="muted small">open · {{ counts.acknowledged.values()|sum }} acknowledged · {{ counts.resolved.values()|sum }} resolved · {{ counts.suppressed.values()|sum }} suppressed</span>
+</div>
+
+<form class="filters" method="get" action="/findings" data-submit-on-change>
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for st in statuses %}<option value="{{ st }}"{% if filters.status == st %} selected{% endif %}>{{ st }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Severity
+    <select name="severity">
+      <option value="">any</option>
+      {% for sv in severities %}<option value="{{ sv }}"{% if filters.severity == sv %} selected{% endif %}>{{ sv }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Category
+    <select name="category">
+      <option value="">any</option>
+      {% for cat in categories %}<option value="{{ cat }}"{% if filters.category == cat %} selected{% endif %}>{{ cat }}</option>{% endfor %}
+    </select>
+  </label>
+  <input type="search" name="q" value="{{ filters.q }}" placeholder="search title, subject, id…">
+  <button class="btn" type="submit">Apply</button>
+  <input type="search" placeholder="filter shown rows" data-filter="#findings-table" aria-label="Filter rows">
+  <span class="muted small" data-filter-count="findings-table">{{ findings|length }} shown</span>
+  <button class="btn btn-sm" type="button" data-action="findings-ack-shown" title="Acknowledge every open finding currently listed (after filtering)">Acknowledge all shown</button>
+</form>
+
+<section class="card">
+  <div class="tbl-wrap">
+  <table class="tbl" id="findings-table" data-filterable>
+    <thead><tr><th>Severity</th><th>Finding</th><th>Subject</th><th>Status</th><th class="num">Seen</th><th>Last seen</th></tr></thead>
+    <tbody>
+      {% for f in findings %}
+      <tr class="expandable" data-id="{{ f.id }}" data-status="{{ f.status }}" data-severity="{{ f.severity }}" data-category="{{ f.category }}">
+        <td>{{ sev(f.severity) }}</td>
+        <td class="wrap"><b>{{ f.title }}</b><br><span class="mono muted small">{{ f.finding_id }}</span> <span class="muted small">· {{ f.category }}</span></td>
+        <td class="mono wrap">{% if f.device_id %}<a href="/devices/{{ f.device_id }}">{{ f.device_name }}</a> <span class="muted">{{ f.device_ip or '' }}</span>{% else %}{{ f.subject }}{% endif %}</td>
+        <td><span class="badge status-badge badge-{{ f.status }}">{{ f.status }}</span></td>
+        <td class="num">{{ f.occurrences }}</td>
+        <td class="nowrap" title="{{ f.last_seen|ts }}">{{ f.last_seen|ago }}</td>
+      </tr>
+      <tr class="detail-row" hidden>
+        <td colspan="6">
+          <div class="detail">
+            <div>
+              <h4>Detail</h4>
+              <p>{{ f.detail or f.rationale or 'No additional detail.' }}</p>
+              {% if f.detail and f.rationale %}<p class="muted small">{{ f.rationale }}</p>{% endif %}
+              <p class="muted small">subject <span class="mono">{{ f.subject }}</span> · source {{ f.source }} · first seen {{ f.first_seen|ts }}{% if f.resolved_at %} · resolved {{ f.resolved_at|ts }}{% endif %}</p>
+              <h4>Evidence</h4>
+              {% if f.evidence_pretty %}<pre>{{ f.evidence_pretty }}</pre>{% else %}<p class="muted small">none</p>{% endif %}
+            </div>
+            <div>
+              <h4>Remediation</h4>
+              {% if f.remediation %}<ol>{% for step in f.remediation %}<li>{{ step }}</li>{% endfor %}</ol>
+              {% else %}<p class="muted small">No remediation steps available (findings catalog not loaded).</p>{% endif %}
+              {% if f.refs %}<h4>References</h4><ul>{% for r in f.refs %}<li>{% if r.startswith('http') %}<a href="{{ r }}" target="_blank" rel="noopener noreferrer">{{ r }}</a>{% else %}{{ r }}{% endif %}</li>{% endfor %}</ul>{% endif %}
+              <div class="actions">
+                {% if f.status != 'acknowledged' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="acknowledged">Acknowledge</button>{% endif %}
+                {% if f.status != 'resolved' %}<button class="btn btn-sm btn-ok" data-action="finding-status" data-id="{{ f.id }}" data-status="resolved">Resolve</button>{% endif %}
+                {% if f.status != 'suppressed' %}<button class="btn btn-sm btn-danger" data-action="finding-status" data-id="{{ f.id }}" data-status="suppressed">Suppress</button>{% endif %}
+                {% if f.status != 'open' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="open">Reopen</button>{% endif %}
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="empty">No findings match. {% if not filters.status and not filters.severity and not filters.q %}Run a scan to populate this list.{% endif %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endblock %}

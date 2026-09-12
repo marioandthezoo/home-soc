@@ -1,0 +1,302 @@
+{
+ "admins": {
+  "current_is_admin_member": true,
+  "current_user": "LAPTOP-HOME\\daily",
+  "error": null,
+  "members": [
+   {
+    "kind": "User",
+    "name": "LAPTOP-HOME\\Administrator",
+    "sid": "S-1-5-21-1111111111-2222222222-3333333333-500",
+    "source": "Local"
+   },
+   {
+    "kind": "User",
+    "name": "LAPTOP-HOME\\daily",
+    "sid": "S-1-5-21-1111111111-2222222222-3333333333-1001",
+    "source": "MicrosoftAccount"
+   }
+  ]
+ },
+ "autologon": {
+  "AutoAdminLogon": "0",
+  "DefaultUserName": "daily",
+  "has_default_password": false
+ },
+ "bitlocker": "ACCESS_DENIED",
+ "builtin_admin": {
+  "enabled": false,
+  "last_logon": "2019-09-28T08:27:04.2705915Z",
+  "name": "Administrator"
+ },
+ "defender": {
+  "AMEngineVersion": "1.1.26080.3",
+  "AMProductVersion": "4.18.26080.3",
+  "AMRunningMode": "Normal",
+  "AMServiceEnabled": true,
+  "AntispywareEnabled": true,
+  "AntispywareSignatureAge": 1,
+  "AntivirusEnabled": true,
+  "AntivirusSignatureAge": 1,
+  "AntivirusSignatureLastUpdated": "2026-09-03T05:54:30.0000000Z",
+  "AntivirusSignatureVersion": "1.459.28.0",
+  "AttackSurfaceReductionRules_Actions": [
+   1
+  ],
+  "AttackSurfaceReductionRules_Ids": [
+   "56a863a9-875e-4185-98a7-b882c64b5ce5"
+  ],
+  "BehaviorMonitorEnabled": true,
+  "CloudBlockLevel": 0,
+  "DisableBehaviorMonitoring": false,
+  "DisableIOAVProtection": false,
+  "DisableRealtimeMonitoring": false,
+  "DisableScriptScanning": false,
+  "EnableControlledFolderAccess": 0,
+  "EnableNetworkProtection": 0,
+  "FullScanAge": 4294967295,
+  "FullScanEndTime": null,
+  "IoavProtectionEnabled": true,
+  "IsTamperProtected": true,
+  "IsVirtualMachine": false,
+  "MAPSReporting": 2,
+  "NISEnabled": true,
+  "NISSignatureAge": 1,
+  "OnAccessProtectionEnabled": true,
+  "PUAProtection": 1,
+  "QuickScanAge": 0,
+  "QuickScanEndTime": "2026-09-04T19:03:51.8060000Z",
+  "RealTimeProtectionEnabled": true,
+  "ScanParameters": 1,
+  "ScanScheduleDay": 0,
+  "SignatureUpdateInterval": 0,
+  "SubmitSamplesConsent": 1,
+  "threats": []
+ },
+ "device_guard": {
+  "CodeIntegrityPolicyEnforcementStatus": 2,
+  "SecurityServicesConfigured": [
+   0
+  ],
+  "SecurityServicesRunning": [
+   0
+  ],
+  "VirtualizationBasedSecurityStatus": 2
+ },
+ "dns": [
+  {
+   "interface": "Wi-Fi",
+   "servers": [
+    "192.168.1.254"
+   ]
+  }
+ ],
+ "elapsed_sec": 28.8,
+ "firewall": [
+  {
+   "default_inbound": "NotConfigured",
+   "default_outbound": "NotConfigured",
+   "enabled": true,
+   "name": "Domain",
+   "notify_on_listen": true
+  },
+  {
+   "default_inbound": "NotConfigured",
+   "default_outbound": "NotConfigured",
+   "enabled": true,
+   "name": "Private",
+   "notify_on_listen": true
+  },
+  {
+   "default_inbound": "NotConfigured",
+   "default_outbound": "NotConfigured",
+   "enabled": true,
+   "name": "Public",
+   "notify_on_listen": true
+  }
+ ],
+ "guest": {
+  "enabled": false,
+  "last_logon": null,
+  "name": "Guest"
+ },
+ "hostname": "LAPTOP-HOME",
+ "hotfix": {
+  "count": 4,
+  "last_description": "Security Update",
+  "last_id": "KB5101650",
+  "last_installed": "2026-07-16"
+ },
+ "is_admin": false,
+ "listeners": [
+  {
+   "address": "0.0.0.0",
+   "pid": 1000,
+   "port": 135,
+   "process": "svchost"
+  },
+  {
+   "address": "192.168.1.105",
+   "pid": 1001,
+   "port": 139,
+   "process": "System"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1002,
+   "port": 445,
+   "process": "System"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1003,
+   "port": 5040,
+   "process": "svchost"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1004,
+   "port": 5357,
+   "process": "svchost"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1005,
+   "port": 7680,
+   "process": "svchost"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1006,
+   "port": 49664,
+   "process": "lsass"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1007,
+   "port": 49665,
+   "process": "wininit"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1008,
+   "port": 49666,
+   "process": "svchost"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1009,
+   "port": 49667,
+   "process": "svchost"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1010,
+   "port": 49668,
+   "process": "spoolsv"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1011,
+   "port": 49671,
+   "process": "services"
+  },
+  {
+   "address": "0.0.0.0",
+   "pid": 1012,
+   "port": 65001,
+   "process": "node"
+  },
+  {
+   "address": "127.0.0.1",
+   "pid": 1013,
+   "port": 8787,
+   "process": "python"
+  },
+  {
+   "address": "127.0.0.1",
+   "pid": 1014,
+   "port": 3000,
+   "process": "node"
+  }
+ ],
+ "llmnr": {
+  "EnableMulticast": null
+ },
+ "lsa": {
+  "LsaCfgFlags": null,
+  "RunAsPPL": 2
+ },
+ "os": {
+  "build": "26200",
+  "caption": "Microsoft Windows 11 Home",
+  "display_version": "25H2",
+  "last_boot": "2026-09-02T13:27:42.5017190Z",
+  "version": "10.0.26200"
+ },
+ "probe_version": 1,
+ "ps_v2": {
+  "registry_v2_engine": true,
+  "state": "ACCESS_DENIED"
+ },
+ "rdp": {
+  "UserAuthentication": 1,
+  "fDenyTSConnections": 1,
+  "service": {
+   "start_type": "Manual",
+   "status": "Stopped"
+  }
+ },
+ "remote_registry": {
+  "start_type": "Disabled",
+  "status": "Stopped"
+ },
+ "screen_lock": {
+  "InactivityTimeoutSecs": null,
+  "ScreenSaveActive": "1",
+  "ScreenSaveTimeOut": null,
+  "ScreenSaverIsSecure": null,
+  "display_off_ac_sec": 0
+ },
+ "secure_boot": "ACCESS_DENIED",
+ "secure_boot_registry": 1,
+ "smart_app_control": {
+  "VerifiedAndReputablePolicyState": 0
+ },
+ "smartscreen": {
+  "SmartScreenEnabled": null,
+  "apps_EnableWebContentEvaluation": null,
+  "policy_EnableSmartScreen": null
+ },
+ "smb": {
+  "EnableSMB1Protocol": false,
+  "EnableSecuritySignature": false,
+  "EncryptData": false,
+  "RequireSecuritySignature": false
+ },
+ "tpm": "ACCESS_DENIED",
+ "tpm_pnp": [
+  {
+   "name": "Trusted Platform Module 2.0",
+   "status": "OK"
+  }
+ ],
+ "uac": {
+  "ConsentPromptBehaviorAdmin": 5,
+  "EnableLUA": 1,
+  "PromptOnSecureDesktop": 1
+ },
+ "wifi": {
+  "auth": "WPA2-Personal",
+  "band": "5 GHz",
+  "cipher": "CCMP",
+  "connected": true,
+  "radio": "802.11ac",
+  "ssid": "HomeNet",
+  "state": "connected"
+ },
+ "winrm": {
+  "start_type": "Manual",
+  "status": "Stopped"
+ }
+}

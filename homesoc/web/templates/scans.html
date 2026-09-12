@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  {% for k in kinds %}<button class="btn{% if k == 'quick' %} btn-primary{% endif %}" data-action="scan" data-kind="{{ k }}">Run {{ k }}</button>{% endfor %}
+  <span class="muted small">{{ 'via scheduler' if has_scheduler else 'background thread (no scheduler attached)' }}</span>
+</div>
+<div class="chips">
+  {% for kind, ts in last.items() %}<span class="chip"><b>{{ kind }}</b> {{ ts|ago }}</span>{% else %}<span class="muted small">No scans recorded yet.</span>{% endfor %}
+</div>
+
+<section class="card">
+  <h2>History</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Kind</th><th>Status</th><th>Started</th><th class="num">Duration</th><th>Summary</th><th>Error</th></tr></thead>
+    <tbody id="scans-body">
+      {% for s in scans %}
+      <tr>
+        <td class="mono">{{ s.kind }}</td>
+        <td>{{ badge(s.status) }}</td>
+        <td title="{{ s.started_at }}">{{ s.started_at|ts }}</td>
+        <td class="num">{% if s.duration_sec is not none %}{{ s.duration_sec }}s{% endif %}</td>
+        <td class="muted small wrap">{% if s.summary is mapping %}{% for k, v in s.summary.items() %}{{ k }}={{ v }} {% endfor %}{% else %}{{ s.summary or '' }}{% endif %}</td>
+        <td class="small wrap error">{{ s.error or '' }}</td>
+      </tr>
+      {% else %}<tr><td colspan="6" class="empty">No scans yet — use the buttons above.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endblock %}

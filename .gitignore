@@ -1,0 +1,46 @@
+# Runtime data (never share these: they contain your network inventory and DNS logs)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config.toml
+.env
+logs/
+*.log
+report.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# OS / editors
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.stackdump
+.vscode/
+.idea/
+*.swp
+
+# Walkthrough video pipeline (generated; see video/CONTRACT.md)
+# video/out/ holds the rendered walkthrough, which is far too large for git —
+# it is published as a release asset instead.
+video/build/
+video/demo_data/
+video/out/

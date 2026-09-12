@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-page="{{ page }}" data-refresh="{{ refresh or 15 }}">
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark">◉</span><span class="brand-name">{{ app_name or 'Home SOC' }}</span></a>
+    <nav class="nav" aria-label="Main">
+      {% for key, href, label in nav %}
+      <a href="{{ href }}" class="nav-link{% if page == key %} active{% endif %}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <div class="sidebar-foot">
+      <div class="statusline"><span class="dot" id="dot-dns"></span> DNS filter: <span id="chip-dns-state" class="muted">{{ 'enabled' if dns_enabled else 'off' }}</span></div>
+      <div class="statusline"><span class="dot{% if has_scheduler %} on{% endif %}"></span> Scheduler: <span class="muted">{{ 'attached' if has_scheduler else 'not attached' }}</span></div>
+      <div class="statusline muted small" id="last-refresh">refresh every {{ refresh or 15 }}s</div>
+      <div class="statusline muted small"><a class="link" href="/feed.rss">activity RSS</a></div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <h1 class="page-title">{% block heading %}{{ page_title }}{% endblock %}</h1>
+      <div class="topbar-stats">
+        <span class="chip" id="chip-score" title="Security score">score <b data-bind="score">–</b> <span data-bind="grade"></span></span>
+        <span class="chip" title="Open findings">open <b data-bind="open-total">–</b></span>
+        <span class="chip" title="Devices online / total"><b data-bind="devices-online">–</b>/<span data-bind="devices-total">–</span> devices</span>
+        <span class="chip" title="DNS queries in the last 24 h">dns <b data-bind="dns-total">–</b> · <span data-bind="dns-blocked">–</span> blocked</span>
+      </div>
+    </header>
+    <div id="toast" class="toast" hidden></div>
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<script src="{{ url_for('static', filename='charts.js') }}" defer></script>
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

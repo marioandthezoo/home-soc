@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<script type="application/json" id="feed-state">{{ {'filters': filters, 'total': total, 'newest': (items[0].ts if items else None), 'shown': items|length}|tojson }}</script>
+
+<div class="chips feed-chips">
+  {% for k in kinds %}
+  <a class="chip chip-kind{% if k.kind in filters.kinds %} chip-on{% endif %}" href="/feed?kinds={{ k.kind }}&window={{ filters.window }}"
+     title="{{ k.label }} in the last 24 hours">
+    <span class="glyph">{{ icon_glyph.get(k.icon, '•') }}</span><b>{{ counts.get(k.kind, 0) }}</b> {{ k.label }}
+  </a>
+  {% endfor %}
+</div>
+
+<section class="card">
+  <form class="filters" method="get" action="/feed" id="feed-filters">
+    <label>Kinds
+      <select name="kinds" multiple size="4" aria-label="Kinds">
+        {% for k in kinds %}<option value="{{ k.kind }}"{% if k.kind in filters.kinds %} selected{% endif %}>{{ k.label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Minimum severity
+      <select name="severity" aria-label="Minimum severity">
+        <option value="">any</option>
+        {% for s in severities %}<option value="{{ s }}"{% if filters.severity == s %} selected{% endif %}>{{ s }} and above</option>{% endfor %}
+      </select>
+    </label>
+    <label>Window
+      <select name="window" aria-label="Time window">
+        {% for value, label, _hours in windows %}<option value="{{ value }}"{% if filters.window == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Search <input type="search" name="q" value="{{ filters.q }}" placeholder="text, domain, device" aria-label="Search"></label>
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn" href="/feed">Reset</a>
+    <button class="btn" type="button" id="feed-pause" data-paused="0">Pause auto-refresh</button>
+    <a class="btn" href="/feed.rss">RSS</a>
+    <span class="muted small" id="feed-status">{{ items|length }} of {{ total }} shown</span>
+  </form>
+</section>
+
+<section class="card">
+  <ol class="timeline" id="feed-timeline">
+    {% for label, group in groups %}
+    <li class="tl-day"><span>{{ label }}</span></li>
+    {% for it in group %}
+    {% set repeats = it.ref.get('count', 0) %}
+    <li class="tl-item sev-{{ it.severity }}" data-ts="{{ it.ts }}" data-kind="{{ it.kind }}" data-title="{{ it.title }}">
+      <span class="tl-glyph" title="{{ it.kind }}">{{ icon_glyph.get(it.icon, '•') }}</span>
+      <span class="tl-dot sev-dot-{{ it.severity }}" title="{{ it.severity }}"></span>
+      <span class="tl-when" title="{{ it.ts }}">{{ it.ts|ago }}</span>
+      <span class="tl-body">
+        <span class="tl-title">{{ it.title }}{% if repeats > 1 %}
+          <span class="tl-x" title="{{ repeats }} identical events between {{ it.ref.get('from')|ts }} and {{ it.ref.get('to')|ts }}">×{{ repeats }}</span>{% endif %}</span>
+        {% if it.detail %}<span class="tl-detail muted small">{{ it.detail }}</span>{% endif %}
+        {% if repeats > 1 %}
+        <button class="btn btn-sm tl-showall" type="button" aria-expanded="false" data-action="toggle" data-label-alt="hide"
+                data-target="#run-{{ loop.index0 }}-{{ it.ts|replace(':', '') }}">show all {{ repeats }}</button>
+        <ol class="tl-runs" id="run-{{ loop.index0 }}-{{ it.ts|replace(':', '') }}" hidden>
+          {% set members = it.ref.get('collapsed', []) %}
+          {% for member in members %}
+          <li>
+            <span class="mono">{{ member.ts|ts }}</span>
+            <span class="muted small">{{ member.ts|ago }}</span>
+            {% if member.link %}<a class="link" href="{{ member.link }}">open →</a>{% endif %}
+          </li>
+          {% endfor %}
+          {% if repeats > members|length %}<li class="muted small">…and {{ repeats - members|length }} more.</li>{% endif %}
+        </ol>
+        {% endif %}
+        {% if it.link %}<a class="tl-link link" href="{{ it.link }}">open →</a>{% endif %}
+      </span>
+    </li>
+    {% endfor %}
+    {% else %}
+    <li class="empty">Nothing here yet. The feed fills up as scans run, devices appear and the DNS filter answers
+      queries — start with <span class="kbd">Run quick scan</span> on the Overview page.</li>
+    {% endfor %}
+  </ol>
+  <div class="form-actions">
+    <button class="btn" id="feed-more" data-offset="{{ filters.offset + items|length }}"{% if items|length >= total %} hidden{% endif %}>Load more</button>
+  </div>
+</section>
+{% endblock %}

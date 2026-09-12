@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% set d = device %}
+{% block heading %}<a href="/devices" class="muted">Devices</a> / {{ d.display_name }}{% endblock %}
+{% block content %}
+<div class="toolbar">
+  {{ badge('online' if d.online else 'offline') }}
+  {% if d.trusted %}{{ badge('trusted') }}{% endif %}
+  {% if d.kind %}{{ badge('kind', d.kind) }}{% endif %}
+  <span class="mono">{{ d.ip or '' }}</span> <span class="mono muted">{{ d.mac }}</span>
+  <span class="muted">{{ d.vendor or 'unknown vendor' }}</span>
+  <button class="btn btn-primary" data-action="device-scan" data-id="{{ d.id }}">Scan this device now</button>
+</div>
+
+<div class="grid grid-2">
+  <section class="card">
+    <h2>Identity</h2>
+    <form class="form-grid" data-post="/api/devices/{{ d.id }}" data-reload data-success="Device updated">
+      <div class="field"><label for="nickname">nickname</label><input type="text" id="nickname" name="nickname" value="{{ d.nickname or '' }}" maxlength="80" placeholder="{{ d.hostname or d.ip or '' }}"></div>
+      <div class="field field-row"><input type="checkbox" id="trusted" name="trusted"{% if d.trusted %} checked{% endif %}><label for="trusted">trusted (new-device alerts become info)</label></div>
+      <div class="field"><label for="notes">notes</label><textarea id="notes" name="notes" maxlength="2000">{{ d.notes or '' }}</textarea></div>
+      <div class="form-actions"><button class="btn btn-primary" type="submit">Save</button></div>
+    </form>
+    <p class="muted small">hostname <span class="mono">{{ d.hostname or '—' }}</span> · first seen {{ d.first_seen|ts }} · last seen {{ d.last_seen|ts }} · last service scan {{ d.last_service_scan|ago }}</p>
+    {% if d.mdns_services %}<p class="muted small">mDNS: {% for m in d.mdns_services %}<span class="mono">{{ m }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+  </section>
+  <section class="card">
+    <h2>Presence · last 7 days</h2>
+    <div class="presence" aria-label="Daily presence">
+      {% for p in d.presence %}<span class="presence-cell{% if p.count %} seen{% endif %}" title="{{ p.date }}: {{ p.count }} sightings"></span>{% endfor %}
+    </div>
+    <p class="muted small">{{ d.sightings|length }} sightings in the last 7 days</p>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Seen</th><th>IP</th><th>Method</th></tr></thead>
+      <tbody>
+        {% for s in d.sightings[:25] %}<tr><td class="nowrap" title="{{ s.seen_at }}">{{ s.seen_at|ts }}</td><td class="mono">{{ s.ip }}</td><td>{{ s.method }}</td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No sightings recorded.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+
+<section class="card">
+  <h2>Services</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Product</th><th>Version</th><th>CPE</th><th>Last seen</th></tr></thead>
+    <tbody>
+      {% for s in d.services %}
+      <tr>
+        <td class="mono">{{ s.port }}/{{ s.proto }}</td>
+        <td>{{ badge('ok' if s.state == 'open' else 'off', s.state) }}</td>
+        <td>{{ s.name or '' }}{% if s.tunnel %} <span class="muted small">({{ s.tunnel }})</span>{% endif %}</td>
+        <td class="wrap">{{ s.product or '' }}{% if s.extrainfo %} <span class="muted small">{{ s.extrainfo }}</span>{% endif %}</td>
+        <td class="mono">{{ s.version or '' }}</td>
+        <td class="mono small wrap">{{ s.cpe or '' }}</td>
+        <td class="nowrap">{{ s.last_seen|ago }}</td>
+      </tr>
+      {% else %}<tr><td colspan="7" class="empty">No services recorded — run a service scan.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<div class="grid grid-2">
+  <section class="card">
+    <h2>Vulnerabilities</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>CVE</th><th>KEV</th><th class="num">CVSS</th><th class="num">EPSS</th><th>Matched on</th></tr></thead>
+      <tbody>
+        {% for v in d.vulns %}
+        <tr>
+          <td class="mono"><a href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">{{ v.cve }}</a></td>
+          <td>{% if v.kev %}{{ badge('kev') }}{% endif %}</td>
+          <td class="num">{{ v.cvss if v.cvss is not none else '' }}</td>
+          <td class="num">{{ '%.2f'|format(v.epss) if v.epss is not none else '' }}</td>
+          <td class="wrap small">{{ v.matched_on }}</td>
+        </tr>
+        {% else %}<tr><td colspan="5" class="empty">No vulnerabilities matched.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  <section class="card">
+    <h2>Findings</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Severity</th><th>Finding</th><th>Status</th><th>Last seen</th></tr></thead>
+      <tbody>
+        {% for f in d.findings %}
+        <tr>
+          <td>{{ sev(f.severity) }}</td>
+          <td class="wrap"><a href="/findings?q={{ f.finding_id }}">{{ f.title }}</a><br><span class="mono muted small">{{ f.finding_id }}</span></td>
+          <td>{{ badge(f.status) }}</td>
+          <td class="nowrap">{{ f.last_seen|ago }}</td>
+        </tr>
+        {% else %}<tr><td colspan="4" class="empty">No findings for this device.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

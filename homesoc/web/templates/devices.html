@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="filters">
+  <span class="chip"><b>{{ counts.online }}</b> online</span>
+  <span class="chip"><b>{{ counts.total }}</b> total</span>
+  <input type="search" placeholder="filter by name, ip, mac, vendor…" data-filter="#devices-table" aria-label="Filter devices">
+  <label>Online
+    <select data-filter="#devices-table" data-filter-key="online"><option value="">any</option><option value="1">online</option><option value="0">offline</option></select>
+  </label>
+  <span class="muted small" data-filter-count="devices-table">{{ devices|length }} shown</span>
+  <button class="btn btn-primary" data-action="scan" data-kind="quick">Discover now</button>
+</div>
+
+<section class="card">
+  <div class="tbl-wrap">
+  <table class="tbl" id="devices-table" data-filterable>
+    <thead><tr><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Kind</th><th>Online</th><th>First seen</th><th>Last seen</th><th class="num">Ports</th><th class="num">Findings</th><th>Trusted</th></tr></thead>
+    <tbody>
+      {% for d in devices %}
+      <tr data-online="{{ 1 if d.online else 0 }}" data-trusted="{{ 1 if d.trusted else 0 }}">
+        <td class="wrap"><a href="/devices/{{ d.id }}"><b>{{ d.display_name }}</b></a>{% if d.nickname and d.hostname %}<br><span class="muted small">{{ d.hostname }}</span>{% endif %}</td>
+        <td class="mono">{{ d.ip or '' }}</td>
+        <td class="mono">{{ d.mac }}</td>
+        <td class="wrap">{{ d.vendor or '' }}</td>
+        <td>{{ d.kind or '' }}</td>
+        <td>{{ badge('online' if d.online else 'offline') }}</td>
+        <td class="nowrap" title="{{ d.first_seen|ts }}">{{ d.first_seen|ago }}</td>
+        <td class="nowrap" title="{{ d.last_seen|ts }}">{{ d.last_seen|ago }}</td>
+        <td class="num">{{ d.open_ports }}</td>
+        <td class="num">{% if d.open_findings %}<a href="/findings?status=open&q={{ d.mac }}">{{ d.open_findings }}</a>{% else %}0{% endif %}</td>
+        <td><button class="btn btn-sm{% if d.trusted %} btn-ok{% endif %}" data-action="device-trusted" data-id="{{ d.id }}" data-trusted="{{ 1 if d.trusted else 0 }}">{{ 'Trusted' if d.trusted else 'Untrusted' }}</button></td>
+      </tr>
+      {% else %}
+      <tr><td colspan="11" class="empty">No devices discovered yet. Run a quick scan to populate the inventory.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endblock %}

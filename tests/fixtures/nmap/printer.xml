@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<?xml-stylesheet href="file:///usr/local/share/nmap/nmap.xsl" type="text/xsl"?>
+<!-- Synthetic fixture. Structurally faithful to nmap 7.92 -oX output for a network printer:
+     a MAC address with a vendor string, a PTR hostname, raw JetDirect on 9100, IPP on 631 with
+     product/version/extrainfo/CPE, and an HTTP admin page on 80 plus a TLS tunnel on 443.
+     MAC and hostname are placeholders; no real device is described. -->
+<!-- Nmap 7.92 scan initiated Fri Sep  4 16:02:11 2026 as: nmap -sT -T3 -&#45;top-ports 25 -n -Pn -&#45;host-timeout 180s -oX - 192.168.1.73 -->
+<nmaprun scanner="nmap" args="nmap -sT -T3 -&#45;top-ports 25 -n -Pn -&#45;host-timeout 180s -oX - 192.168.1.73" start="1788562931" startstr="Fri Sep  4 16:02:11 2026" version="7.92" xmloutputversion="1.05">
+<scaninfo type="connect" protocol="tcp" numservices="25" services="21-23,25,53,80,110-111,135,139,143,443,445,515,631,993,995,1723,3306,3389,5900,8080,8443,9100"/>
+<verbose level="0"/>
+<debugging level="0"/>
+<host starttime="1788562931" endtime="1788562944"><status state="up" reason="user-set" reason_ttl="0"/>
+<address addr="192.168.1.73" addrtype="ipv4"/>
+<address addr="00:22:33:00:00:08" addrtype="mac" vendor="Example Print Systems"/>
+<hostnames>
+<hostname name="printer.lan" type="PTR"/>
+</hostnames>
+<ports><port protocol="tcp" portid="21"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="ftp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="22"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="ssh" method="table" conf="3"/></port>
+<port protocol="tcp" portid="23"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="telnet" method="table" conf="3"/></port>
+<port protocol="tcp" portid="25"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="smtp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="53"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="domain" method="table" conf="3"/></port>
+<port protocol="tcp" portid="80"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="Example Printer http config" method="probed" conf="10"><cpe>cpe:/h:example:printer</cpe></service></port>
+<port protocol="tcp" portid="110"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="pop3" method="table" conf="3"/></port>
+<port protocol="tcp" portid="111"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="rpcbind" method="table" conf="3"/></port>
+<port protocol="tcp" portid="135"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="msrpc" method="table" conf="3"/></port>
+<port protocol="tcp" portid="139"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="netbios-ssn" method="table" conf="3"/></port>
+<port protocol="tcp" portid="143"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="imap" method="table" conf="3"/></port>
+<port protocol="tcp" portid="443"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="http" product="Example Printer http config" tunnel="ssl" method="probed" conf="10"><cpe>cpe:/h:example:printer</cpe></service></port>
+<port protocol="tcp" portid="445"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="microsoft-ds" method="table" conf="3"/></port>
+<port protocol="tcp" portid="515"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="printer" method="table" conf="3"/></port>
+<port protocol="tcp" portid="631"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="ipp" product="CUPS" version="2.3" extrainfo="EX-1200 Series" method="probed" conf="10"><cpe>cpe:/a:apple:cups:2.3</cpe></service></port>
+<port protocol="tcp" portid="993"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="imaps" method="table" conf="3"/></port>
+<port protocol="tcp" portid="995"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="pop3s" method="table" conf="3"/></port>
+<port protocol="tcp" portid="1723"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="pptp" method="table" conf="3"/></port>
+<port protocol="tcp" portid="3306"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="mysql" method="table" conf="3"/></port>
+<port protocol="tcp" portid="3389"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="ms-wbt-server" method="table" conf="3"/></port>
+<port protocol="tcp" portid="5900"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="vnc" method="table" conf="3"/></port>
+<port protocol="tcp" portid="8080"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="http-proxy" method="table" conf="3"/></port>
+<port protocol="tcp" portid="8443"><state state="closed" reason="conn-refused" reason_ttl="0"/><service name="https-alt" method="table" conf="3"/></port>
+<port protocol="tcp" portid="9100"><state state="open" reason="syn-ack" reason_ttl="0"/><service name="jetdirect" method="table" conf="3"/></port>
+</ports>
+<times srtt="4120" rttvar="2011" to="100000"/>
+</host>
+<runstats><finished time="1788562944" timestr="Fri Sep  4 16:02:24 2026" summary="Nmap done at Fri Sep  4 16:02:24 2026; 1 IP address (1 host up) scanned in 13.02 seconds" elapsed="13.02" exit="success"/><hosts up="1" down="0" total="1"/>
+</runstats>
+</nmaprun>

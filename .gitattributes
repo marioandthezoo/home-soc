@@ -1,0 +1,41 @@
+# Normalise line endings: store everything as LF in the repository and let git
+# check it out in whatever the platform expects, unless overridden below.
+* text=auto
+
+# Scripts that are executed by a Windows interpreter must keep CRLF, or cmd.exe
+# and PowerShell mis-parse the last token on each line.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Shell scripts must keep LF, or /bin/sh fails with "bad interpreter: ^M".
+*.sh text eol=lf
+
+# Explicit text types (so a stray BOM or CRLF never sneaks in).
+*.py   text diff=python
+*.md   text
+*.toml text
+*.json text
+*.html text
+*.css  text
+*.js   text
+*.xml  text
+*.srt  text
+*.yml  text
+*.yaml text
+
+# Binary: never diffed, never line-ending converted.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.mp4  binary
+*.mov  binary
+*.webm binary
+*.wav  binary
+*.mp3  binary
+*.db   binary
+*.zip  binary
+*.gz   binary

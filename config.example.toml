@@ -1,0 +1,87 @@
+# Home SOC configuration. Copy to config.toml (python -m homesoc init does this).
+# Every key is listed with its default. Storage timestamps are always UTC ISO-8601.
+
+[general]
+name = "Home SOC"
+timezone = "local"                 # display only; storage is UTC ISO-8601
+log_level = "INFO"
+
+[web]
+host = "127.0.0.1"                 # set 0.0.0.0 to reach the dashboard from other devices (then set token!)
+port = 8787
+token = ""                         # if non-empty, required as ?token= or X-Token header / login cookie
+refresh_seconds = 15
+
+[network]
+cidr = "auto"                      # "auto" = the /24 of the default interface, or e.g. "192.168.1.0/24"
+gateway = "auto"
+exclude = []                       # IPs never to port-scan (fragile devices)
+fragile_vendors = ["Sonos", "Philips", "Hue", "Ring", "Nest", "Ecobee", "Roku", "Epson", "Brother", "Canon", "HP"]
+                                   # devices whose vendor matches are scanned with the gentle profile only
+discovery_ports = [80, 443, 22, 445, 139, 8080, 62078, 7000, 9100, 1900, 5353, 8443, 3389, 23, 21, 53]
+discovery_threads = 128
+discovery_timeout = 0.4
+
+[scan]
+use_nmap = true                    # falls back to the python scanner when nmap is missing
+nmap_top_ports = 100
+nmap_timing = "T3"                 # never faster than T3 on home networks
+version_detection = true
+gentle_top_ports = 25              # for fragile devices
+per_host_timeout_sec = 180
+max_parallel_hosts = 3
+scan_gateway = true
+
+[host]
+posture = true
+persistence_baseline = true        # alert on NEW autostart entries after the first baseline
+files_check = true                 # hash new files in Downloads (last 24h) and look them up (VirusTotal key required)
+files_dirs = ["~/Downloads"]
+
+[vulns]
+kev = true
+nvd_enrich = true                  # per-service NVD 2.0 lookups, rate-limited (5 req / 30 s without key)
+nvd_api_key = ""
+epss = true
+min_cvss_report = 7.0
+
+[feeds]
+enabled = true
+kev_hours = 6
+epss_hours = 24
+oui_hours = 168
+blocklists_hours = 12
+threatintel_hours = 6
+max_download_mb = 64
+
+[dns]
+enabled = false                    # turn on to run the LAN-wide resolver
+listen = "0.0.0.0"
+port = 53
+upstreams = ["1.1.1.2", "9.9.9.9"] # UDP upstreams; 1.1.1.2 = Cloudflare malware-blocking, 9.9.9.9 = Quad9
+doh_upstream = "https://cloudflare-dns.com/dns-query"   # used when udp upstreams fail; "" disables
+block_mode = "null"                # "null" -> 0.0.0.0 / :: with TTL 60 ; "nxdomain"
+cache_max_entries = 20000
+lists = ["oisd_small", "hagezi_pro", "urlhaus", "threatfox", "phishing_army", "openphish"]   # names from feeds registry
+log_queries = true
+log_retention_days = 14
+virustotal_api_key = ""
+virustotal_daily_budget = 400      # free tier is 500/day, 4/min; keep headroom
+urlhaus_auth_key = ""              # optional abuse.ch Auth-Key for URLhaus reputation lookups
+reputation_min_malicious_votes = 2
+reputation_ttl_hours = 72
+
+[notify]
+min_severity = "high"              # notify on new findings at/above this
+ntfy_url = ""                      # e.g. https://ntfy.sh/your-secret-topic
+discord_webhook = ""
+webhook_url = ""                   # generic JSON POST
+windows_toast = true
+digest_hour = 8                    # daily digest local hour (-1 disables)
+
+[schedule]
+discovery_minutes = 10
+services_hours = 24
+host_hours = 6
+exposure_hours = 12
+feeds_hours = 6

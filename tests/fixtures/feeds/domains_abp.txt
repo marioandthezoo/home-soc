@@ -1,0 +1,23 @@
+[Adblock Plus]
+! Title: oisd small (sample excerpt for tests)
+! Description: Blocks ads, malware, trackers - sample only
+! Version: 202609031200
+! Expires: 1 hour
+! Homepage: https://oisd.nl
+||example-ads.com^
+||Tracker.Example.NET^
+||telemetry.example.org^$important
+||static.cdn.example.com|
+@@||allowed.example.com^
+||example.com/path/only^
+||*.wildcarded.example^
+example.org##.ad-banner
+/banner\d+\.gif/
+||example-ads.com^
+||xn--bcher-kva.example^
+||bücher.example^
+||under_score.example.com^
+||dupe-with-crlf.example^
+||a.b.c.d.example.co.uk^
+plain-domain.example.net
+|http://scheme-anchored.example/
