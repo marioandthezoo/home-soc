@@ -1,0 +1,484 @@
+/* lens.css — Home SOC Lens (SPEC addendum B8/B9).
+
+   Three surfaces share this file: the phone viewfinder (`body.lens`, dark always, one-handed
+   portrait, 390x844 is the reference), the two desktop pages (`body.desk`, which inherit
+   style.css's theme variables), and the print sheet (`body.stickers`, sized in millimetres).
+   No external assets, no @import, no inline styles anywhere — CSP is default-src 'self'. */
+
+/* ===================================================================== phone: the shell */
+
+body.lens {
+  /* Scoped, not :root, so the desktop pages keep style.css's light/dark palette. The camera
+     app is dark in every theme: it sits over a live image and is used in dim cupboards. */
+  --bg: #0b0d13;
+  --panel: #141824;
+  --panel-2: #1b2030;
+  --line: #2b3243;
+  --fg: #f3f5fb;
+  --muted: #a8b0c6;
+  --accent: #6b8afd;
+  --accent-fg: #07090f;
+  --ok: #4cc38a;
+  --warn: #ffbe3d;
+  --err: #ff6169;
+  --sev-critical: #ff5a61;
+  --sev-high: #ff8f3f;
+  --sev-medium: #ffc53d;
+  --sev-low: #4cc38a;
+  --sev-info: #7aa2ff;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+  --dock-h: 72px;
+  margin: 0;
+  background: #000;
+  color: var(--fg);
+  font: 16px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+body.lens,
+body.lens .viewfinder { position: fixed; inset: 0; }
+body.lens * { box-sizing: border-box; }
+/* The panels below are display:flex, which outranks the UA's [hidden] rule — without this a
+   "closed" sheet stays on top of the dock and silently eats every tap. */
+[hidden] { display: none !important; }
+
+body.lens .viewfinder { width: 100%; height: 100%; object-fit: cover; background: #000; z-index: 0; }
+body.lens .offscreen { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; left: -9999px; }
+body.lens .scrim {
+  position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background:
+    linear-gradient(to bottom, rgba(0, 0, 0, .72), rgba(0, 0, 0, 0) 22%),
+    linear-gradient(to top, rgba(0, 0, 0, .78), rgba(0, 0, 0, 0) 34%);
+}
+/* No camera stream: paint a calm background instead of a black void. */
+body.lens.no-video { background: radial-gradient(120% 80% at 50% 0%, #1a2133 0%, #0b0d13 70%); }
+body.lens.no-video .scrim { background: none; }
+
+body.lens .sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* ---------------------------------------------------------------- phone: top bar */
+
+body.lens .topbar {
+  position: fixed; z-index: 4; top: 0; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: calc(var(--safe-t) + 12px) 14px 12px;
+}
+body.lens .brand { font-weight: 600; letter-spacing: .02em; text-shadow: 0 1px 3px rgba(0, 0, 0, .8); }
+body.lens .brand-mark { color: var(--accent); }
+body.lens .state {
+  font-size: 13px; color: var(--fg); background: rgba(11, 13, 19, .72);
+  border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px;
+  max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+body.lens .state.is-busy { border-color: var(--accent); }
+body.lens .state.is-bad { border-color: var(--err); color: #ffd7d9; }
+
+/* ---------------------------------------------------------------- phone: reticle */
+
+body.lens .reticle {
+  position: fixed; z-index: 2; left: 50%; top: 40%; transform: translate(-50%, -50%);
+  width: min(66vw, 280px); height: min(66vw, 280px);
+}
+body.lens .corner { position: absolute; width: 34px; height: 34px; border: 3px solid rgba(255, 255, 255, .92); border-radius: 4px; }
+body.lens .corner.tl { top: 0; left: 0; border-right: 0; border-bottom: 0; }
+body.lens .corner.tr { top: 0; right: 0; border-left: 0; border-bottom: 0; }
+body.lens .corner.bl { bottom: 0; left: 0; border-right: 0; border-top: 0; }
+body.lens .corner.br { bottom: 0; right: 0; border-left: 0; border-top: 0; }
+body.lens .reticle.is-hit .corner { border-color: var(--ok); }
+body.lens .reticle-hint {
+  position: fixed; z-index: 3; left: 22px; right: 22px; top: calc(40% + min(33vw, 140px) + 18px);
+  margin: 0; text-align: center; font-size: 14px; color: #e7ebf6;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, .9);
+}
+
+/* ---------------------------------------------------------------- phone: notice */
+
+body.lens .notice {
+  position: fixed; z-index: 5; left: 14px; right: 14px; top: calc(var(--safe-t) + 62px);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 16px 16px 14px; box-shadow: 0 12px 34px rgba(0, 0, 0, .55);
+}
+body.lens .notice-title { margin: 0 0 6px; font-size: 17px; font-weight: 650; }
+body.lens .notice-body { margin: 0; color: var(--muted); font-size: 14.5px; }
+body.lens .notice .btn { margin-top: 12px; }
+body.lens .notice.is-bad { border-color: var(--err); }
+
+body.lens .steps { margin: 10px 0 0; padding-left: 20px; color: var(--muted); font-size: 14px; }
+body.lens .steps li { margin: 4px 0; }
+body.lens .steps code { font-family: var(--mono); font-size: 13px; word-break: break-word; }
+
+/* ---------------------------------------------------------------- phone: buttons + dock */
+
+body.lens .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 46px; padding: 0 16px; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--fg); font: 500 15px/1 var(--sans);
+  cursor: pointer; text-decoration: none; -webkit-tap-highlight-color: transparent;
+}
+body.lens .btn:active { transform: translateY(1px); }
+body.lens .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 650; }
+body.lens .btn-ghost { background: transparent; }
+body.lens .btn-wide { width: 100%; margin-top: 12px; }
+/* 44px is the floor for a touch target, and these are Acknowledge and the sheet Close
+   buttons — the controls a one-handed user in a dim cupboard actually has to hit. */
+body.lens .btn-small { min-height: 44px; padding: 0 12px; font-size: 14px; }
+body.lens .btn.is-bad { border-color: var(--err); color: #ffd7d9; }
+body.lens .btn[disabled] { opacity: .5; }
+
+body.lens .dock {
+  position: fixed; z-index: 6; left: 0; right: 0; bottom: 0;
+  display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px;
+  padding: 8px 12px calc(var(--safe-b) + 10px);
+  background: linear-gradient(to top, rgba(7, 9, 14, .96), rgba(7, 9, 14, .72));
+  border-top: 1px solid rgba(255, 255, 255, .08);
+}
+body.lens .dock-btn {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  min-height: 54px; border-radius: 14px; border: 1px solid var(--line);
+  background: rgba(20, 24, 36, .9); color: var(--fg); font: 500 12.5px/1 var(--sans);
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+body.lens .dock-icon { font-size: 19px; line-height: 1; }
+body.lens .dock-btn.is-on { border-color: var(--accent); color: #cfd9ff; }
+body.lens .dock-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 650; }
+/* A full-screen pane or sheet is modal: leaving the dock focusable underneath it puts three
+   invisible buttons in the tab order, and activating one re-enters a sheet that is open. */
+body.lens.card-open .dock,
+body.lens.pane-open .dock,
+body.lens.sheet-open .dock { display: none; }
+body.lens .pane:focus, body.lens .sheet:focus, body.lens .card:focus { outline: none; }
+
+/* ---------------------------------------------------------------- phone: the card */
+
+body.lens .card {
+  position: fixed; z-index: 7; left: 0; right: 0; bottom: 0;
+  max-height: 80vh; display: flex; flex-direction: column;
+  background: var(--panel); border-top: 1px solid var(--line);
+  border-radius: 20px 20px 0 0; box-shadow: 0 -14px 40px rgba(0, 0, 0, .6);
+  animation: rise .18s ease-out;
+  touch-action: pan-y;
+}
+@keyframes rise { from { transform: translateY(14%); opacity: .4; } to { transform: none; opacity: 1; } }
+/* The card's only labelled way out — the dock is hidden while a card is open — so it carries
+   the 48px target rather than the 21px the grip's own height gave it. The grip stays 5px; the
+   padding grows around it. */
+body.lens .card-handle {
+  flex: 0 0 auto; width: 100%; min-height: 48px; padding: 0; background: none; border: 0; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+body.lens .grip { display: block; width: 44px; height: 5px; border-radius: 3px; background: #4a536b; }
+body.lens .card-body { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 2px 16px calc(var(--safe-b) + 16px); }
+
+body.lens .dev-head { display: flex; align-items: flex-start; gap: 12px; padding-bottom: 12px; }
+body.lens .dev-icon {
+  flex: 0 0 auto; width: 44px; height: 44px; border-radius: 12px; background: var(--panel-2);
+  border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; font-size: 22px;
+}
+body.lens .dev-id { min-width: 0; flex: 1 1 auto; }
+body.lens .dev-name { margin: 0; font-size: 21px; font-weight: 680; letter-spacing: -.01em; overflow-wrap: anywhere; }
+body.lens .dev-meta { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; overflow-wrap: anywhere; }
+body.lens .dev-meta .mono { font-family: var(--mono); }
+body.lens .dev-flags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+body.lens .flag {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; padding: 3px 9px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2); color: var(--fg);
+}
+body.lens .flag .dot { width: 8px; height: 8px; border-radius: 50%; background: #5c6479; }
+body.lens .flag.on .dot { background: var(--ok); }
+body.lens .flag.off .dot { background: #5c6479; }
+body.lens .flag.untrusted { border-color: #6b3f1d; color: #ffd7a8; }
+
+body.lens .headline { margin: 2px 0 12px; font-size: 16px; line-height: 1.4; overflow-wrap: anywhere; }
+
+body.lens .sev-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+body.lens .sev-chip {
+  display: inline-flex; align-items: baseline; gap: 6px; padding: 5px 10px; border-radius: 10px;
+  font-size: 13px; border: 1px solid var(--line); background: var(--panel-2);
+}
+body.lens .sev-chip b { font-size: 15px; }
+/* Colour is never the only signal: every chip and badge also spells the severity out. */
+body.lens .sev-chip.sev-critical { border-color: var(--sev-critical); color: #ffd9db; }
+body.lens .sev-chip.sev-high { border-color: var(--sev-high); color: #ffdcc2; }
+body.lens .sev-chip.sev-medium { border-color: var(--sev-medium); color: #ffeebf; }
+body.lens .sev-chip.sev-low { border-color: var(--sev-low); color: #c9f0dc; }
+body.lens .sev-chip.sev-info { border-color: var(--sev-info); color: #d3e0ff; }
+body.lens .sev-chip.is-clean { border-color: var(--ok); color: #c9f0dc; }
+
+body.lens .sec { border-top: 1px solid var(--line); }
+body.lens .sec[open] { padding-bottom: 10px; }
+body.lens .sec > summary {
+  display: flex; align-items: center; gap: 10px; min-height: 52px; cursor: pointer;
+  list-style: none; font-weight: 600; font-size: 15.5px;
+}
+body.lens .sec > summary::-webkit-details-marker { display: none; }
+body.lens .sec > summary::after {
+  content: "▾"; margin-left: auto; color: var(--muted); font-size: 13px; transition: transform .15s ease;
+}
+body.lens .sec[open] > summary::after { transform: rotate(180deg); }
+body.lens .sec-count {
+  font-size: 12.5px; font-weight: 600; color: var(--muted); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px;
+}
+body.lens .sec-empty { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
+
+body.lens .row {
+  display: flex; gap: 10px; align-items: baseline; padding: 10px 0; border-top: 1px dashed var(--line);
+}
+body.lens .row:first-child { border-top: 0; }
+body.lens .row-main { min-width: 0; flex: 1 1 auto; }
+body.lens .row-title { font-size: 15px; overflow-wrap: anywhere; }
+body.lens .row-sub { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; overflow-wrap: anywhere; }
+
+body.lens .badge {
+  display: inline-block; font-size: 11.5px; font-weight: 650; letter-spacing: .03em; text-transform: uppercase;
+  padding: 3px 7px; border-radius: 6px; border: 1px solid var(--line); color: var(--fg); white-space: nowrap;
+}
+body.lens .badge-critical { border-color: var(--sev-critical); color: #ffd9db; background: rgba(255, 90, 97, .14); }
+body.lens .badge-high { border-color: var(--sev-high); color: #ffdcc2; background: rgba(255, 143, 63, .14); }
+body.lens .badge-medium { border-color: var(--sev-medium); color: #ffeebf; background: rgba(255, 197, 61, .13); }
+body.lens .badge-low { border-color: var(--sev-low); color: #c9f0dc; background: rgba(76, 195, 138, .13); }
+body.lens .badge-info { border-color: var(--sev-info); color: #d3e0ff; background: rgba(122, 162, 255, .13); }
+body.lens .badge-kev { border-color: var(--err); color: #ffd9db; background: rgba(255, 97, 105, .18); }
+
+body.lens .fix { border-top: 1px dashed var(--line); }
+body.lens .fix > summary {
+  list-style: none; cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 8px;
+  font-size: 14px; color: var(--accent);
+}
+body.lens .fix > summary::-webkit-details-marker { display: none; }
+body.lens .fix-steps { margin: 2px 0 12px; padding-left: 22px; font-size: 14.5px; }
+body.lens .fix-steps li { margin: 6px 0; overflow-wrap: anywhere; }
+body.lens .refs { margin: 0 0 10px; padding-left: 22px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+
+/* Talking to — the payoff section, so it gets the weight. */
+body.lens .dns-hero {
+  display: flex; align-items: center; gap: 14px; padding: 12px; margin: 4px 0 12px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 14px;
+}
+body.lens .dns-num { font-size: 30px; font-weight: 720; line-height: 1; letter-spacing: -.02em; }
+body.lens .dns-num.is-hot { color: var(--sev-high); }
+body.lens .dns-hero-text { font-size: 13.5px; color: var(--muted); }
+body.lens .dns-hero-text b { color: var(--fg); font-size: 14.5px; display: block; }
+body.lens .dns-group { margin: 0 0 12px; }
+body.lens .dns-group h4 { margin: 0 0 6px; font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+body.lens .bar-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: center; padding: 5px 0; }
+body.lens .bar-name { font-size: 14px; overflow-wrap: anywhere; font-family: var(--mono); }
+body.lens .bar-count { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+body.lens .bar-track { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--panel-2); overflow: hidden; }
+body.lens .bar-fill { display: block; height: 100%; background: var(--sev-info); border-radius: 3px; }
+body.lens .bar-row.blocked .bar-fill { background: var(--sev-medium); }
+body.lens .bar-row.threat .bar-fill { background: var(--sev-critical); }
+body.lens .dns-note { margin: 0 0 10px; font-size: 13px; color: var(--warn); overflow-wrap: anywhere; }
+
+body.lens .timeline { list-style: none; margin: 0; padding: 0; }
+body.lens .timeline li { display: flex; gap: 10px; padding: 8px 0; border-top: 1px dashed var(--line); font-size: 14px; }
+body.lens .timeline li:first-child { border-top: 0; }
+body.lens .tl-when { color: var(--muted); font-size: 12.5px; white-space: nowrap; min-width: 62px; }
+body.lens .tl-title { overflow-wrap: anywhere; }
+
+body.lens .card-foot {
+  display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 0 4px; border-top: 1px solid var(--line); margin-top: 6px;
+}
+body.lens .card-foot .btn { flex: 1 1 45%; }
+body.lens .foot-note { flex: 1 1 100%; margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
+body.lens .stale-strip {
+  margin: 0 0 12px; padding: 9px 12px; border-radius: 10px; font-size: 13.5px;
+  background: rgba(255, 190, 61, .13); border: 1px solid var(--warn); color: #ffe6ad;
+}
+
+/* ---------------------------------------------------------------- phone: panes + sheets */
+
+body.lens .pane, body.lens .sheet {
+  position: fixed; z-index: 8; left: 0; right: 0; bottom: 0; top: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg); padding: calc(var(--safe-t) + 14px) 16px calc(var(--safe-b) + 14px);
+}
+body.lens .sheet { top: 8vh; border-radius: 20px 20px 0 0; border-top: 1px solid var(--line); }
+body.lens .pane-head { display: flex; align-items: flex-start; gap: 12px; }
+body.lens .pane-title { margin: 0; font-size: 20px; font-weight: 680; line-height: 1.25; padding-top: 3px; }
+body.lens .pane-head .btn { margin-left: auto; }
+body.lens .pane-sub { margin: 6px 0 12px; color: var(--muted); font-size: 14px; }
+body.lens .pane-empty { color: var(--muted); }
+body.lens .search { display: block; margin-bottom: 10px; }
+body.lens .search-input {
+  width: 100%; min-height: 46px; padding: 0 14px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--fg); font: 15px var(--sans);
+}
+body.lens .search-input::placeholder { color: #7b839a; }
+body.lens .code-raw {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: var(--panel-2);
+  border: 1px solid var(--line); font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere;
+}
+
+body.lens .device-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1 1 auto; }
+body.lens .device-item { border-bottom: 1px solid var(--line); }
+body.lens .device-btn {
+  display: flex; align-items: center; gap: 12px; width: 100%; min-height: 62px; padding: 10px 4px;
+  background: none; border: 0; color: var(--fg); text-align: left; cursor: pointer; font: inherit;
+}
+body.lens .device-btn .dev-icon { width: 38px; height: 38px; font-size: 18px; border-radius: 10px; }
+body.lens .device-name { font-size: 15.5px; font-weight: 600; overflow-wrap: anywhere; }
+body.lens .device-why { display: block; margin-top: 2px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+body.lens .device-badges { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+
+@media (prefers-reduced-motion: reduce) {
+  body.lens * { animation: none !important; transition: none !important; }
+  body.lens .spinner { animation: none !important; border-top-color: var(--accent) !important; }
+}
+
+/* ---------------------------------------------------------------- phone: pairing (claim) */
+
+body.lens.claim {
+  position: static; inset: auto; overflow-y: auto;
+  background: radial-gradient(120% 70% at 50% 0%, #1a2133 0%, #0b0d13 62%);
+  min-height: 100vh;
+}
+body.lens .claim-wrap {
+  max-width: 460px; margin: 0 auto;
+  padding: calc(var(--safe-t) + 34px) 20px calc(var(--safe-b) + 28px);
+}
+body.lens .claim-brand { margin: 0 0 18px; font-size: 15px; color: var(--muted); }
+body.lens .claim-brand .brand-mark { margin-right: 4px; }
+body.lens .claim-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+  padding: 22px 20px 20px; box-shadow: 0 16px 40px rgba(0, 0, 0, .45);
+}
+body.lens .claim-title { margin: 0 0 8px; font-size: 23px; line-height: 1.2; font-weight: 700; letter-spacing: -.015em; }
+body.lens .claim-body { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
+body.lens .claim-card .steps { margin-top: 14px; }
+body.lens .claim-card .btn-wide { margin-top: 18px; }
+body.lens .claim-foot { margin: 18px 2px 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+body.lens .claim-foot code { font-family: var(--mono); font-size: 12px; }
+body.lens .spinner {
+  display: block; width: 26px; height: 26px; margin: 0 0 14px;
+  border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%;
+  animation: spin .9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ===================================================================== desktop: pair page */
+
+.pair-main { padding: 22px 26px 40px; max-width: 1180px; }
+.pair-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(300px, .9fr); gap: 16px; align-items: start; }
+.pair-qr-panel { grid-row: span 2; }
+@media (max-width: 900px) { .pair-grid { grid-template-columns: 1fr; } .pair-qr-panel { grid-row: auto; } }
+
+ /* `pair-checks`, not `check-list`: style.css already owns `.check-list li` as a three-column
+    grid, and its descendant selector would also capture the nested remediation steps. */
+.pair-checks { list-style: none; margin: 0; padding: 0; }
+.pair-checks > li.check { display: flex; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.pair-checks > li.check:first-child { border-top: 0; }
+.check-text { min-width: 0; }
+.check-text p { margin: 4px 0 0; }
+.check-pill {
+  flex: 0 0 auto; min-width: 46px; text-align: center; align-self: flex-start;
+  font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
+}
+.check-pill-ok { border-color: var(--ok); color: var(--ok); }
+.check-pill-warn { border-color: var(--warn); color: var(--warn); }
+.check-pill-fail { border-color: var(--err); color: var(--err); }
+.warn-strip {
+  margin: 14px 0 0; padding: 10px 12px; border-radius: 8px; font-size: 13.5px;
+  border: 1px solid var(--warn); background: rgba(255, 178, 36, .1);
+}
+.qr-wrap {
+  background: #fff; padding: 14px; border-radius: 12px; width: max-content; max-width: 100%;
+  margin: 4px 0 12px;
+}
+.qr-wrap .qr, .qr-wrap svg { display: block; width: 260px; height: 260px; shape-rendering: crispEdges; }
+.pair-url { margin: 0 0 10px; font-size: 12.5px; overflow-wrap: anywhere; color: var(--muted); }
+.pair-steps { color: inherit; }
+.fingerprint { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 0 0 10px; font-size: 14px; }
+.fp-group { padding: 3px 7px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line); }
+/* Present for copy-paste, absent to the eye: the gap between groups is the separator. */
+.fp-sep { font-size: 0; opacity: 0; width: 0; display: inline-block; }
+.plain-list { list-style: none; margin: 0; padding: 0; }
+.plain-list li { padding: 3px 0; }
+
+/* ===================================================================== stickers (screen) */
+
+body.stickers { background: var(--bg); }
+.sticker-controls { margin: 0 26px 20px; }
+.sticker-form { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; }
+.sticker-form .field { display: flex; flex-direction: column; gap: 4px; }
+.sticker-form .field-check { flex-direction: row; align-items: center; gap: 8px; }
+.sticker-form select { min-height: 34px; }
+body.stickers .no-print > .topbar { padding: 18px 26px; }
+
+.page {
+  background: #fff; color: #000; margin: 0 auto 18px; box-shadow: 0 2px 14px rgba(0, 0, 0, .35);
+  overflow: hidden;
+}
+.label-grid { display: grid; justify-content: start; align-content: start; }
+.label {
+  display: flex; align-items: center; gap: 2mm; overflow: hidden; padding: 1.5mm;
+  break-inside: avoid; page-break-inside: avoid;
+}
+.label-qr { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; }
+.label-qr svg { display: block; width: 100%; height: 100%; shape-rendering: crispEdges; }
+.label-missing { font: 9px var(--sans); color: #888; }
+.label-text { min-width: 0; display: flex; flex-direction: column; gap: .6mm; }
+.label-name {
+  font: 600 10.5pt/1.15 var(--sans); color: #000;
+  overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere;
+}
+.label-mark { font: 7pt/1 var(--sans); color: #555; letter-spacing: .02em; }
+
+/* Avery 5160: 66.675 x 25.4 mm, 3 x 10 on US Letter, 12.7 mm top margin, 4.76 mm sides. */
+.sheet-avery .page { width: 215.9mm; height: 279.4mm; padding: 12.7mm 4.76mm; }
+.sheet-avery .label-grid { grid-template-columns: repeat(3, 66.675mm); grid-auto-rows: 25.4mm; column-gap: 3.175mm; row-gap: 0; }
+.sheet-avery .label-qr { width: 21mm; height: 21mm; }
+.sheet-avery .label-name { -webkit-line-clamp: 2; }
+
+/* 40 mm square labels, 4 x 6 on A4 with 10 mm margins and a 3 mm gutter. */
+.sheet-40mm .page { width: 210mm; height: 297mm; padding: 10mm; }
+.sheet-40mm .label-grid { grid-template-columns: repeat(4, 40mm); grid-auto-rows: 40mm; gap: 3mm; }
+.sheet-40mm .label { flex-direction: column; gap: 1mm; justify-content: center; }
+.sheet-40mm .label-qr { width: 26mm; height: 26mm; }
+.sheet-40mm .label-text { align-items: center; text-align: center; width: 100%; }
+.sheet-40mm .label-name { font-size: 8.5pt; -webkit-line-clamp: 2; }
+.sheet-40mm .label-mark { font-size: 6pt; }
+
+@media print {
+  @page { size: auto; margin: 0; }
+  html, body.stickers { background: #fff; margin: 0; padding: 0; }
+  .no-print { display: none !important; }
+  .page { box-shadow: none; margin: 0; page-break-after: always; break-after: page; }
+  .page:last-of-type { page-break-after: auto; break-after: auto; }
+  .label-name { color: #000; }
+}
+
+/* ---------------------------------------------------------------- phone: degraded viewfinder */
+
+/* Shown whenever the camera or the scanner is unavailable, and *not* dismissible: the #notice
+   above it can be closed (its own button sends the user to the picker), so it cannot be the only
+   thing carrying the explanation. B8: never leave the user staring at a camera that silently does
+   nothing — or, worse, at a black rectangle after closing the picker. */
+body.lens .fallback {
+  /* Anchored above the dock, not centred: the #notice is top-anchored and can be four lines
+     tall, and two stacked explanations must never overlap on a 375px screen. */
+  position: fixed; z-index: 3; left: 16px; right: 16px;
+  bottom: calc(var(--dock-h) + var(--safe-b) + 18px);
+  display: flex; justify-content: center;
+}
+body.lens .fallback-inner {
+  width: 100%; max-width: 420px; text-align: center;
+  background: rgba(11, 13, 19, .82); border: 1px solid var(--line); border-radius: 16px;
+  padding: 18px 16px;
+}
+body.lens .fallback-title { margin: 0 0 6px; font-size: 17px; font-weight: 650; }
+body.lens .fallback-body { margin: 0; color: var(--muted); font-size: 14.5px; }
+body.lens .fallback-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+body.lens .fallback-row .btn { flex: 1 1 45%; }
+
+/* The acknowledge control for a finding with no fix steps, which has no <details> to live in. */
+body.lens .row-actions { display: flex; gap: 8px; padding: 0 0 10px 0; }
+
+body.lens #undo-ignore { flex: 0 0 auto; }

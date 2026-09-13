@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192" role="img" aria-label="Home SOC Lens">
+  <rect width="192" height="192" rx="42" ry="42" fill="#0b0d13"/>
+  <g fill="none" stroke="#f3f5fb" stroke-width="9" stroke-linecap="butt">
+    <path d="M33 66 L33 33 L66 33"/>
+    <path d="M126 33 L159 33 L159 66"/>
+    <path d="M159 126 L159 159 L126 159"/>
+    <path d="M66 159 L33 159 L33 126"/>
+  </g>
+  <circle cx="96" cy="96" r="55" fill="none" stroke="#6b8afd" stroke-width="10"/>
+  <circle cx="96" cy="96" r="14" fill="#f3f5fb"/>
+</svg>

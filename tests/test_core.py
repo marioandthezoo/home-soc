@@ -159,7 +159,8 @@ def test_schema_has_every_table(conn: sqlite3.Connection) -> None:
     assert set(db.TABLES) <= names
     assert db.schema_version(conn) == db.SCHEMA_VERSION
     db.init_schema(conn)  # idempotent
-    assert db.query(conn, "SELECT COUNT(*) AS n FROM schema_migrations")[0]["n"] == 1
+    # One row per applied migration, and calling init_schema again adds none.
+    assert db.query(conn, "SELECT COUNT(*) AS n FROM schema_migrations")[0]["n"] == len(db.MIGRATIONS)
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 

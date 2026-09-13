@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d13">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Lens · {{ app_name or 'Home SOC' }}</title>
+<link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='lens-icon.svg') }}">
+<link rel="apple-touch-icon" href="{{ url_for('static', filename='lens-icon-192.png') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
+</head>
+<body class="lens" data-page="lens" data-mode="{{ mode }}"
+      data-tag-learning="{{ 1 if lens.tag_learning else 0 }}"
+      data-allow-actions="{{ 1 if lens.allow_actions else 0 }}">
+
+<video id="cam" class="viewfinder" playsinline autoplay muted disablepictureinpicture></video>
+<canvas id="grab" class="offscreen" width="480" height="640" aria-hidden="true"></canvas>
+<div id="scrim" class="scrim"></div>
+
+<header class="topbar">
+  <span class="brand"><span class="brand-mark" aria-hidden="true">◉</span> Lens</span>
+  <span id="scan-state" class="state" role="status" aria-live="polite">starting camera…</span>
+  <!-- Appears only after a code is ignored, so a mis-tap on the permanent
+       "Not a device" button is recoverable without clearing site data. -->
+  <button id="undo-ignore" class="btn btn-ghost btn-small" type="button" hidden>Undo ignore</button>
+</header>
+
+<div id="reticle" class="reticle" aria-hidden="true">
+  <span class="corner tl"></span><span class="corner tr"></span>
+  <span class="corner bl"></span><span class="corner br"></span>
+</div>
+<p id="reticle-hint" class="reticle-hint">Point at a barcode, a QR sticker, or the label on the back of the device.</p>
+
+<!-- Why the viewfinder is doing nothing, when it is. Permanent (unlike #notice, which the
+     user can dismiss) so closing a sheet can never leave a black rectangle with no explanation. -->
+<div id="fallback" class="fallback" hidden role="status">
+  <div id="fallback-body" class="fallback-inner"></div>
+</div>
+
+<div id="notice" class="notice" hidden role="status" aria-live="polite">
+  <h2 id="notice-title" class="notice-title">&nbsp;</h2>
+  <p id="notice-body" class="notice-body">&nbsp;</p>
+  <ol id="notice-steps" class="steps" hidden></ol>
+  <button id="notice-action" class="btn btn-ghost" type="button" hidden>Try again</button>
+</div>
+
+<!-- The card, the picker and the unknown-code sheet are all filled in by lens.js with
+     textContent only; nothing from the database is ever parsed as markup. -->
+<main id="card" class="card" hidden aria-label="Device details" tabindex="-1">
+  <button id="card-handle" class="card-handle" type="button" aria-label="Close device details"><span class="grip"></span></button>
+  <div id="card-body" class="card-body"></div>
+</main>
+
+<section id="picker" class="pane" hidden role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="picker-title">
+  <div class="pane-head">
+    <h2 id="picker-title" class="pane-title">Devices</h2>
+    <button id="picker-close" class="btn btn-ghost btn-small" type="button">Close</button>
+  </div>
+  <p id="picker-sub" class="pane-sub">Everything Home SOC can see on the network.</p>
+  <label class="search" for="picker-search"><span class="sr-only">Filter devices</span>
+    <input id="picker-search" class="search-input" type="search" inputmode="search"
+           autocomplete="off" placeholder="Filter by name, IP or vendor">
+  </label>
+  <ul id="picker-list" class="device-list"></ul>
+  <p id="picker-empty" class="pane-empty" hidden>No devices yet. Run a discovery scan from the dashboard.</p>
+</section>
+
+<section id="unknown" class="sheet" hidden role="dialog" aria-modal="true" tabindex="-1" aria-label="Unrecognised code">
+  <div class="pane-head">
+    <h2 class="pane-title">Which device is this?</h2>
+    <button id="unknown-close" class="btn btn-ghost btn-small" type="button">Close</button>
+  </div>
+  <p class="pane-sub">Lens has not seen this code before. Tap the device it is stuck to and every later scan is instant.</p>
+  <p class="code-raw"><span class="sr-only">Decoded value</span><code id="unknown-code">&nbsp;</code></p>
+  <ul id="unknown-list" class="device-list"></ul>
+  <button id="unknown-ignore" class="btn btn-ghost btn-wide" type="button">Not a device — ignore this code</button>
+</section>
+
+<nav class="dock" aria-label="Lens">
+  <button id="tab-scan" class="dock-btn is-on" type="button" aria-pressed="true">
+    <span class="dock-icon" aria-hidden="true">⌖</span><span class="dock-label">Scan</span>
+  </button>
+  <button id="btn-pick" class="dock-btn dock-primary" type="button">
+    <span class="dock-icon" aria-hidden="true">☰</span><span class="dock-label">Pick manually</span>
+  </button>
+  <button id="tab-devices" class="dock-btn" type="button" aria-pressed="false">
+    <span class="dock-icon" aria-hidden="true">▣</span><span class="dock-label">Devices</span>
+  </button>
+</nav>
+
+<script src="{{ url_for('static', filename='lens.js') }}" defer></script>
+</body>
+</html>

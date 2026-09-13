@@ -159,6 +159,8 @@ _NMAP_DL = "https://nmap.org/download.html"
 _NPCAP = "https://npcap.com/"
 _CF_DNS = "https://developers.cloudflare.com/1.1.1.1/setup/"
 _QUAD9 = "https://quad9.net/"
+_TAILSCALE_SERVE = "https://tailscale.com/kb/1312/serve"
+_SECURE_CONTEXTS = "https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts"
 
 # --- reusable click paths ------------------------------------------------------------------------
 _OPEN_WINSEC = "Open Start, type 'Windows Security' and press Enter."
@@ -1208,8 +1210,35 @@ _SPECS: list[FindingSpec] = [
             "Open config.toml and set web.token to a long random string (PowerShell: -join ((48..57)+(97..122) | Get-Random -Count 32 | ForEach-Object {{[char]$_}})).",
             "Or set web.host back to \"127.0.0.1\" if you only use the dashboard on this PC.",
             "Restart Home SOC; open http://<this-pc>:8787/login?token=<your token> on other devices.",
+            # Lens deliberately binds to the LAN, so "go back to 127.0.0.1" is not advice a Lens
+            # user can follow; setting web.token is, and it is the fix that covers both.
+            "If you use Lens on your phone, keep web.host on the LAN address and set web.token: your phone signs in "
+            "with its own paired Lens token (python -m homesoc lens pair), not with this one.",
         ],
         [], "soc", False,
+    ),
+    _spec(
+        "SOC-LENS-001", "medium", "Lens is reachable on the LAN over plain HTTP",
+        # The consequence depends on lens.require_https, so this says which is which rather than
+        # asserting the worse one. With the shipped default (true) nothing crosses the network
+        # at all — Lens refuses every plain-HTTP request from anything but this PC — and claiming
+        # otherwise would contradict this entry's own last fix step.
+        "Lens is bound to the LAN and Home SOC is not serving TLS. While lens.require_https is true (the "
+        "default) Lens refuses every plain-HTTP request from anything but this PC, so the phone cannot pair "
+        "or show anything: Lens is simply unusable until you start with --tls. If you turn require_https off "
+        "to get past that, the pairing code, the phone's long-lived token and everything Lens shows — your "
+        "device list, open ports, vulnerabilities and the domains each device talks to — cross the Wi-Fi in "
+        "clear text where anyone on it can read and reuse them. Phone browsers also refuse camera access on a "
+        "plain-HTTP page, so scanning never works either way. Either way the fix is the same: serve it over TLS.",
+        [
+            "Install the certificate builder once:  pip install cryptography   (Home SOC runs fine without it; only TLS needs it).",
+            "Create a certificate that covers this PC and its LAN address:  python -m homesoc lens cert --regenerate --hosts <this-pc>,192.168.1.10",
+            "Start Home SOC with TLS:  python -m homesoc serve --tls --host 0.0.0.0 --port 8443   (the startup log prints the certificate fingerprint).",
+            "On the phone open https://<this-pc>:8443/lens, compare the fingerprint with the one in the log, and accept it once.",
+            "Easier alternative with a certificate the phone already trusts: run Home SOC behind Tailscale Serve (see docs/LENS_SETUP.md), then no warning appears at all.",
+            "Leave lens.require_https = true in config.toml — it is the only thing stopping the pairing code and the phone's token from crossing the network in clear text; set lens.enabled = false if you are not using Lens.",
+        ],
+        [_TAILSCALE_SERVE, _SECURE_CONTEXTS], "soc", False,
     ),
     _spec(
         "SOC-SYS-004", "medium", "Scheduled job '{job}' keeps failing ({failures} times)",

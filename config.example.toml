@@ -85,3 +85,11 @@ services_hours = 24
 host_hours = 6
 exposure_hours = 12
 feeds_hours = 6
+
+[lens]                             # point your phone at a device (see docs/LENS_SETUP.md)
+enabled = false                    # master switch; when false /lens and /api/lens/* return 404
+require_https = true               # refuse to serve Lens over plain HTTP (except from localhost)
+tag_learning = true                # allow unknown codes to be bound to a device from the phone
+allow_actions = false              # when true, a paired phone may trigger a rescan / acknowledge a finding
+token_ttl_days = 90                # paired-phone tokens expire after this; 0 = never
+max_tokens = 10                    # how many phones may be paired at once

@@ -419,6 +419,17 @@ def soc_health_drafts(cfg: Config, conn: sqlite3.Connection, scheduler: Schedule
         drafts.append(FindingDraft("SOC-SYS-001", "host", {"hint": "install nmap or set scan.use_nmap=false", "method": "python"}))
     if cfg.web.exposed and not cfg.web.token:
         drafts.append(FindingDraft("SOC-SYS-003", "host", {"host": cfg.web.host, "port": cfg.web.port}))
+    # SPEC addendum B10: Lens on the LAN without TLS. This complements SOC-SYS-003 rather
+    # than repeating it — that one is about there being no password, this one about the
+    # whole conversation (and the paired-phone token) crossing the Wi-Fi in clear text.
+    if cfg.lens.insecure_on_lan(cfg.web, tls=tls_last_used(conn)):
+        drafts.append(FindingDraft("SOC-LENS-001", "host", {
+            "host": cfg.web.host, "port": cfg.web.port, "tls": False,
+            # Recorded because it decides which half of the finding's description applies:
+            # true means Lens refuses to serve phones at all, false means it serves them in clear.
+            "require_https": bool(cfg.lens.require_https),
+            "hint": "python -m homesoc lens cert --regenerate, then run with --tls",
+        }))
     if scheduler is not None:
         for job in scheduler.failing_jobs():
             drafts.append(FindingDraft("SOC-SYS-004", f"job:{job['name']}", {
@@ -601,6 +612,11 @@ def housekeeping(cfg: Config, conn: sqlite3.Connection) -> dict[str, int]:
             purged["finding_events"] = int(cur.rowcount)
     except sqlite3.Error:
         logger.exception("housekeeping: purge failed")
+    try:
+        # Lens pairing rate-limit counters nobody is counting any more (SPEC addendum B4).
+        purged["lens_claim_counters"] = db.lens_purge_claim_counters(conn)
+    except sqlite3.Error:
+        logger.exception("housekeeping: purge of Lens rate-limit counters failed")
     try:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error as exc:
@@ -861,31 +877,210 @@ class Runtime:
         db.record_event(self.conn, "info", "cli", "Home SOC stopped")
 
 
-def _serve_forever(rt: Runtime, host: str, port: int) -> int:
+def _serve_forever(rt: Runtime, host: str, port: int, *, tls: bool = False) -> int:
     create_app = _lazy("create_app")
     if create_app is None:
         emit("The web package is not available; cannot start the dashboard.")
         return EXIT_ERROR
+    ssl_context: tuple[str, str] | None = None
+    if tls:
+        try:
+            cert, key = ensure_lens_cert(rt.cfg, host=host)
+        except Exception as exc:  # TlsUnavailable, OSError, or a missing web package
+            emit(str(exc))
+            return EXIT_ERROR
+        ssl_context = (str(cert), str(key))
+        fingerprint = lens_cert_fingerprint(cert)
+        logger.info("HTTPS enabled with %s (SHA-256 %s)", cert, fingerprint or "unknown")
+        emit(f"Certificate: {cert}")
+        emit(f"  SHA-256 fingerprint: {fingerprint or 'unavailable'}")
+        emit("  Self-signed: the phone warns once, then remembers. Check the fingerprint matches.")
+    record_tls_state(rt.conn, tls)
+    record_bind_state(rt.conn, host, port)
     app = create_app(rt.cfg, rt.conn, scheduler=rt.scheduler, dns_server=rt.dns_server)
     if rt.cfg.web.exposed and not rt.cfg.web.token:
         logger.warning("dashboard bound to %s without web.token - anyone on the LAN can use it", host)
-    emit(f"Dashboard: {dashboard_url(rt.cfg, host, port)}  (Ctrl-C to stop)")
+    emit(f"Dashboard: {dashboard_url(rt.cfg, host, port, tls=tls)}  (Ctrl-C to stop)")
     try:
-        app.run(host=host, port=port, threaded=True, use_reloader=False, debug=False)
+        app.run(host=host, port=port, threaded=True, use_reloader=False, debug=False,
+                ssl_context=ssl_context)
     except OSError as exc:
         logger.error("cannot bind dashboard on %s:%d: %s", host, port, exc)
         return EXIT_ERROR
     return EXIT_OK
 
 
-def dashboard_url(cfg: Config, host: str | None = None, port: int | None = None) -> str:
+def dashboard_url(cfg: Config, host: str | None = None, port: int | None = None, *,
+                  tls: bool = False) -> str:
     """The one link the user needs: /login?token=... when a token is set, so the browser gets the
     cookie once and the token never has to be typed."""
     host = host or cfg.web.host
     port = port or cfg.web.port
     shown = util.default_interface_ip() if host in ("0.0.0.0", "::") else host
-    base = f"http://{shown}:{port}"
+    base = f"{'https' if tls else 'http'}://{shown}:{port}"
     return f"{base}/login?token={cfg.web.token}" if cfg.web.token else f"{base}/"
+
+
+# ------------------------------------------------------------------- lens
+#
+# Transport and pairing helpers shared by `serve --tls`, `run --tls` and the `lens`
+# commands. The certificate and QR code live in the web package (homesoc.web.tls and
+# homesoc.web.qr); the tokens live in homesoc.db as lens_* helpers.
+
+#: Addresses that mean "every interface" to a socket and nothing to a certificate or a URL.
+WILDCARD_HOSTS: tuple[str, ...] = ("0.0.0.0", "::", "[::]")
+
+
+def _web_module(name: str) -> Any:
+    """Import ``homesoc.web.<name>`` on demand, or None with one clear log line."""
+    try:
+        return importlib.import_module(f"homesoc.web.{name}")
+    except Exception as exc:
+        logger.warning("homesoc.web.%s is not available (%s: %s)", name, type(exc).__name__, exc)
+        return None
+
+
+def lens_hosts(cfg: Config, host: str | None = None) -> list[str]:
+    """Every name and address the phone might use to reach this machine.
+
+    These become the certificate's subjectAltNames, so a browser accepts the URL whether
+    the owner typed the LAN address, the hostname or ``localhost``.
+    """
+    hosts: list[str] = []
+    for candidate in (host or cfg.web.host, util.default_interface_ip(), util.local_hostname()):
+        value = str(candidate or "").strip()
+        if value and value not in WILDCARD_HOSTS and value not in hosts:
+            hosts.append(value)
+    name = util.local_hostname()
+    if name and f"{name}.local" not in hosts:
+        hosts.append(f"{name}.local")
+    return hosts
+
+
+def lens_display_host(cfg: Config, host: str | None = None) -> str:
+    """The address to put in a link: the bind address, or this machine's LAN address for 0.0.0.0."""
+    value = str(host or cfg.web.host or "").strip()
+    return util.default_interface_ip() if value in WILDCARD_HOSTS or not value else value
+
+
+def ensure_lens_cert(cfg: Config, *, host: str | None = None, force: bool = False,
+                     hosts: list[str] | None = None) -> tuple[Path, Path]:
+    """Certificate and key for ``--tls``, generated on first use.
+
+    Raises with an actionable message when the web package or ``cryptography`` is absent —
+    the caller prints it verbatim.
+    """
+    tls = _web_module("tls")
+    if tls is None:
+        raise RuntimeError("homesoc.web.tls is not available in this install; reinstall Home SOC.")
+    return tls.ensure_cert(hosts if hosts is not None else lens_hosts(cfg, host), force=force)
+
+
+def lens_cert_fingerprint(cert: Path | str) -> str:
+    """SHA-256 fingerprint of a certificate, or "" when it cannot be read."""
+    tls = _web_module("tls")
+    if tls is None:
+        return ""
+    try:
+        return str(tls.cert_fingerprint_sha256(cert))
+    except (OSError, ValueError) as exc:
+        logger.warning("cannot fingerprint %s: %s", cert, exc)
+        return ""
+
+
+def lens_pair_url(cfg: Config, code: str, *, host: str | None = None, port: int | None = None,
+                  scheme: str = "https") -> str:
+    """``https://<lan-host>:<port>/lens/claim#c=<code>`` (SPEC B4).
+
+    The code sits in the fragment, which browsers never send to the server and no proxy or
+    log ever sees; the claim page reads it with JavaScript and POSTs it.
+    """
+    return (f"{scheme}://{lens_display_host(cfg, host)}:{int(port or cfg.web.port)}"
+            f"/lens/claim#c={code}")
+
+
+#: Settings key recording whether the dashboard was last started with ``--tls``. A scan
+#: run from a second terminal has no other way to know, and "never started with TLS" is
+#: the safe reading when the key is absent.
+TLS_SETTING = "lens.tls"
+
+#: Settings key recording the address the dashboard was last actually bound to, as
+#: ``host:port``. ``serve --host/--port`` override ``config.toml``, so config alone cannot
+#: answer "can a phone reach this?" — see :func:`homesoc.web.app.effective_bind`. Absence
+#: means "fall back to config", which is how this behaved before the key existed.
+BIND_SETTING = "lens.bind"
+
+
+def record_tls_state(conn: sqlite3.Connection, enabled: bool) -> None:
+    try:
+        db.set_setting(conn, TLS_SETTING, bool(enabled))
+    except sqlite3.Error:
+        logger.debug("could not record the TLS state", exc_info=True)
+
+
+def record_bind_state(conn: sqlite3.Connection, host: str, port: int) -> None:
+    """Remember where the server is really listening, for /lens/pair's preflight."""
+    try:
+        db.set_setting(conn, BIND_SETTING, f"{host}:{int(port)}")
+    except (sqlite3.Error, TypeError, ValueError):
+        logger.debug("could not record the bind address", exc_info=True)
+
+
+def tls_last_used(conn: sqlite3.Connection) -> bool:
+    try:
+        return str(db.get_setting(conn, TLS_SETTING, "") or "").lower() == "true"
+    except sqlite3.Error:
+        return False
+
+
+def recorded_bind(conn: sqlite3.Connection | None, cfg: Config) -> tuple[str, int]:
+    """Where the server is really listening: the recorded bind, else config.
+
+    The CLI half of :func:`homesoc.web.app.effective_bind`, and it has to agree with it.
+    ``serve --tls --host 0.0.0.0 --port 8443`` is the invocation SPEC B3 documents, and it
+    overrides ``config.toml`` for the life of that process — so reading ``web.host`` alone
+    made ``lens pair`` refuse ("web.host is 127.0.0.1") against a server the phone can
+    already reach, while ``/lens/pair`` in the browser minted a code quite happily.
+    Absence of the key means "fall back to config", which is how this read before it existed.
+    """
+    host = str(cfg.web.host or "127.0.0.1")
+    port = int(cfg.web.port or 8787)
+    if conn is None:
+        return host, port
+    try:
+        raw = str(db.get_setting(conn, BIND_SETTING, "") or "")
+    except sqlite3.Error:
+        return host, port
+    if raw and ":" in raw:
+        bound_host, _, bound_port = raw.rpartition(":")
+        if bound_host:
+            host = bound_host
+        if bound_port.isdigit():
+            port = int(bound_port)
+    return host, port
+
+
+def qr_ascii(payload: str, *, invert: bool = False, quiet_zone: int = 2) -> str | None:
+    """The payload as a terminal QR code, or None when the encoder is unavailable.
+
+    Block characters are used when the console can encode them and ``#`` when it cannot
+    (a stock Windows console is code page 850); a code made of replacement characters
+    would be unscannable, which is worse than a plain warning.
+    """
+    qr = _web_module("qr")
+    if qr is None:
+        return None
+    dark, light = ("  ", "██") if invert else ("██", "  ")
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        "".join((dark, light)).encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        dark, light = ("  ", "##") if invert else ("##", "  ")
+    try:
+        return str(qr.encode(payload).to_ascii(quiet_zone=quiet_zone, dark=dark, light=light))
+    except Exception as exc:
+        logger.warning("could not render the pairing QR: %s", exc)
+        return None
 
 
 def _install_signal_handlers() -> None:
@@ -999,7 +1194,7 @@ def cmd_serve(ctx: Context) -> int:
     rt.start(with_scheduler=True, with_dns=False, manual_only=True)
     _install_signal_handlers()
     try:
-        return _serve_forever(rt, cfg.web.host, cfg.web.port)
+        return _serve_forever(rt, cfg.web.host, cfg.web.port, tls=bool(getattr(ctx.args, "tls", False)))
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -1032,7 +1227,8 @@ def cmd_run(ctx: Context) -> int:
     db.record_event(ctx.conn, "info", "cli", "Home SOC started", {"version": __version__, "platform": util.platform_name()})
     rt.start()
     try:
-        return _serve_forever(rt, ctx.cfg.web.host, ctx.cfg.web.port)
+        return _serve_forever(rt, ctx.cfg.web.host, ctx.cfg.web.port,
+                              tls=bool(getattr(ctx.args, "tls", False)))
     except KeyboardInterrupt:
         return EXIT_OK
     finally:
@@ -1262,6 +1458,165 @@ def cmd_defender(ctx: Context) -> int:
     return EXIT_OK if ok else EXIT_ERROR
 
 
+# ------------------------------------------------------------ lens commands
+
+
+def cmd_lens(ctx: Context) -> int:
+    """Dispatch ``lens pair|tokens|revoke|cert`` (SPEC addendum B3)."""
+    handlers: dict[str, Callable[[Context], int]] = {
+        "pair": cmd_lens_pair,
+        "tokens": cmd_lens_tokens,
+        "revoke": cmd_lens_revoke,
+        "cert": cmd_lens_cert,
+    }
+    action = str(getattr(ctx.args, "lens_command", "") or "")
+    handler = handlers.get(action)
+    if handler is None:  # argparse enforces this; belt and braces
+        emit("usage: python -m homesoc lens {pair|tokens|revoke|cert}")
+        return EXIT_USAGE
+    return handler(ctx)
+
+
+def cmd_lens_pair(ctx: Context) -> int:
+    """Print the pairing URL, the QR code and the certificate fingerprint.
+
+    Refuses before it can produce something that works, and says exactly what to change:
+    a pairing code is only useful if Lens is switched on and reachable from the phone.
+    """
+    cfg = ctx.cfg
+    if not cfg.lens.enabled:
+        emit("Lens is switched off, so a pairing code would not work.")
+        emit("  Turn it on:  set [lens] enabled = true in " + str(paths.config_path()))
+        emit("               (or use the Settings page), then run this again.")
+        return EXIT_ERROR
+
+    bound_host, bound_port = recorded_bind(ctx.conn, cfg)
+    host = getattr(ctx.args, "host", None) or bound_host
+    port = int(getattr(ctx.args, "port", None) or bound_port)
+    problems: list[str] = []
+    if host in ("127.0.0.1", "localhost", "::1"):
+        problems.append(
+            f"web.host is {host}, which only this machine can reach. Set web.host = \"0.0.0.0\" "
+            "(and keep web.token set) so the phone can connect."
+        )
+
+    tls = _web_module("tls")
+    cert_path = None
+    fingerprint = ""
+    if tls is None:
+        problems.append("homesoc.web.tls is missing from this install; reinstall Home SOC.")
+    else:
+        try:
+            cert_path, _key = ensure_lens_cert(cfg, host=host)
+            fingerprint = lens_cert_fingerprint(cert_path)
+        except Exception as exc:
+            problems.append(str(exc))
+    if problems:
+        emit("Lens cannot be paired yet:")
+        for problem in problems:
+            emit("")
+            for line in str(problem).splitlines():
+                emit("  " + line)
+        return EXIT_ERROR
+
+    code = db.lens_new_pairing_code(ctx.conn)
+    url = lens_pair_url(cfg, code, host=host, port=port)
+    emit(f"Pairing code: {code}   (single use, valid {db.LENS_PAIRING_TTL_SECONDS // 60} minutes)")
+    emit(f"Open on the phone: {url}")
+    emit("")
+    rendered = qr_ascii(url, invert=bool(getattr(ctx.args, "invert", False)))
+    if rendered:
+        emit(rendered)
+    else:
+        emit("(the QR encoder is unavailable; type the link above instead)")
+    emit("")
+    emit(f"Certificate SHA-256: {fingerprint or 'unavailable'}")
+    emit("The phone will warn that the certificate is not trusted. That is expected for a")
+    emit("self-signed certificate: check the fingerprint above matches the one the browser")
+    emit("shows, then continue. docs/LENS_SETUP.md also covers the Tailscale route, which")
+    emit("needs no warning at all.")
+    if not cfg.lens.allow_actions:
+        emit("")
+        emit("The paired phone will be read-only (lens.allow_actions is false).")
+    emit("")
+    emit(f"Serve it with: python -m homesoc run --tls   (listening on {host}:{port})")
+    return EXIT_OK
+
+
+def cmd_lens_tokens(ctx: Context) -> int:
+    rows = db.lens_list_tokens(ctx.conn)
+    if not rows:
+        emit("no phones paired (run: python -m homesoc lens pair)")
+        return EXIT_OK
+    emit(f"{'id':>4} {'label':20} {'scopes':10} {'state':9} {'created':12} {'last seen':12} last ip")
+    for row in rows:
+        if row["revoked_at"]:
+            state = "revoked"
+        elif not row["active"]:
+            state = "expired"
+        else:
+            state = "active"
+        emit(f"{int(row['id']):>4} {str(row['label'])[:20]:20} {str(row['scopes']):10} {state:9} "
+             f"{util.human_age(row['created_at']):12} {util.human_age(row['last_seen_at']):12} "
+             f"{row['last_ip'] or '-'}")
+    active = sum(1 for r in rows if r["active"])
+    emit("")
+    emit(f"{active} active of a maximum of {ctx.cfg.lens.token_ceiling} (lens.max_tokens)")
+    return EXIT_OK
+
+
+def cmd_lens_revoke(ctx: Context) -> int:
+    if getattr(ctx.args, "all", False):
+        count = db.lens_revoke_all_tokens(ctx.conn)
+        db.lens_clear_pairing_codes(ctx.conn)
+        emit(f"revoked {count} token(s); every paired phone must pair again")
+        return EXIT_OK
+    token_id = getattr(ctx.args, "id", None)
+    if token_id is None:
+        emit("usage: python -m homesoc lens revoke <id> | --all   (ids from: lens tokens)")
+        return EXIT_USAGE
+    if db.lens_revoke_token(ctx.conn, int(token_id)):
+        emit(f"token {int(token_id)} revoked")
+        return EXIT_OK
+    emit(f"no active token with id {int(token_id)} (see: python -m homesoc lens tokens)")
+    return EXIT_ERROR
+
+
+def cmd_lens_cert(ctx: Context) -> int:
+    tls = _web_module("tls")
+    if tls is None:
+        emit("homesoc.web.tls is not available in this install; reinstall Home SOC.")
+        return EXIT_ERROR
+    hosts = [h.strip() for h in str(getattr(ctx.args, "hosts", "") or "").split(",") if h.strip()]
+    if getattr(ctx.args, "regenerate", False):
+        try:
+            cert, key = ensure_lens_cert(ctx.cfg, force=True, hosts=hosts or lens_hosts(ctx.cfg))
+        except Exception as exc:
+            for line in str(exc).splitlines():
+                emit(line)
+            return EXIT_ERROR
+        emit(f"wrote {cert}")
+        emit(f"wrote {key}   (keep this file to yourself)")
+    elif hosts:
+        emit("--hosts only applies together with --regenerate; showing the current certificate.")
+    info = tls.describe()
+    emit(f"certificate: {info['path']}")
+    if not info["exists"]:
+        for line in str(info["note"]).splitlines():
+            emit("  " + line)
+        return EXIT_ERROR
+    emit(f"  fingerprint (SHA-256): {info.get('fingerprint') or 'unavailable'}")
+    if "subject" in info:
+        emit(f"  subject:  {info['subject']}")
+        emit(f"  covers:   {', '.join(info['sans']) or '(none!)'}")
+        emit(f"  valid:    {info['not_before']} .. {info['not_after']}  ({info['days_left']} days left)")
+    if info["note"]:
+        emit("")
+        for line in str(info["note"]).splitlines():
+            emit("  " + line)
+    return EXIT_OK
+
+
 def cmd_dns_test(ctx: Context) -> int:
     domain = ctx.args.domain.strip().rstrip(".").lower()
     policy_cls = _lazy("Policy")
@@ -1302,6 +1657,7 @@ COMMANDS: dict[str, Callable[[Context], int]] = {
     "feed": cmd_feed,
     "defender": cmd_defender,
     "dns-test": cmd_dns_test,
+    "lens": cmd_lens,
 }
 
 
@@ -1335,11 +1691,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", help="dashboard only")
     p.add_argument("--host", metavar="H")
     p.add_argument("--port", metavar="P", type=int)
+    p.add_argument("--tls", action="store_true",
+                   help="serve over HTTPS with the self-signed Lens certificate (needed for the phone camera)")
 
     p = sub.add_parser("dns", help="DNS resolver only (foreground)")
     p.add_argument("--port", metavar="P", type=int)
 
-    sub.add_parser("run", help="dashboard + scheduler + resolver (normal mode)")
+    p = sub.add_parser("run", help="dashboard + scheduler + resolver (normal mode)")
+    p.add_argument("--tls", action="store_true", help="serve over HTTPS (see: lens cert)")
+
     sub.add_parser("status", help="score, counts, last scans, feeds, jobs")
 
     p = sub.add_parser("findings", help="list findings")
@@ -1376,6 +1736,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("dns-test", help="show the policy decision and upstream answer for a domain")
     p.add_argument("domain")
+
+    # Lens (SPEC addendum B3). A sub-group rather than four top-level commands, so
+    # `homesoc lens` alone prints the four things you can do with it.
+    p = sub.add_parser("lens", help="pair a phone with Lens, list or revoke tokens, manage the certificate")
+    lens_sub = p.add_subparsers(dest="lens_command", metavar="action")
+    lens_sub.required = True
+
+    q = lens_sub.add_parser("pair", help="print the pairing URL and QR code for a phone")
+    q.add_argument("--host", metavar="H", help="address to put in the link (default: web.host)")
+    q.add_argument("--port", metavar="P", type=int, help="port to put in the link (default: web.port)")
+    q.add_argument("--invert", action="store_true",
+                   help="swap dark and light modules (for a terminal with a dark background)")
+
+    lens_sub.add_parser("tokens", help="list paired phones")
+
+    q = lens_sub.add_parser("revoke", help="revoke one paired phone, or all of them")
+    q.add_argument("id", nargs="?", type=int, help="token id from 'lens tokens'")
+    q.add_argument("--all", action="store_true", help="revoke every paired phone")
+
+    q = lens_sub.add_parser("cert", help="show or regenerate the HTTPS certificate")
+    q.add_argument("--regenerate", action="store_true", help="replace the certificate even if it is still valid")
+    q.add_argument("--hosts", metavar="a,b", help="names/addresses to cover (default: this machine's)")
     return parser
 
 
@@ -1416,5 +1798,11 @@ __all__ = [
     "list_findings_safe", "fallback_counts", "fallback_score", "current_score", "grade", "GRADE_BANDS",
     "score_breakdown_lines", "cmd_baseline",
     "BASELINE_LIST_LIMIT", "SCORE_BREAKDOWN_LIMIT",
+    # Lens (SPEC addendum B3)
+    "WILDCARD_HOSTS", "TLS_SETTING", "BIND_SETTING", "recorded_bind", "lens_hosts", "lens_display_host",
+    "ensure_lens_cert",
+    "lens_cert_fingerprint", "lens_pair_url", "qr_ascii", "record_tls_state", "tls_last_used",
+    "record_bind_state",
+    "cmd_lens", "cmd_lens_pair", "cmd_lens_tokens", "cmd_lens_revoke", "cmd_lens_cert",
     "Runtime", "Context", "build_parser", "main",
 ]

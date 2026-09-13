@@ -10,17 +10,22 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import json
 import logging
 import socket
 import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 from xml.etree import ElementTree as ET
 
-from flask import Flask, Response, abort, g, jsonify, make_response, redirect, render_template, request
+from flask import (Flask, Response, abort, g, jsonify, make_response, redirect, render_template,
+                   request, send_from_directory)
 from markupsafe import Markup, escape
 
+from homesoc import db
 from homesoc.web import api
 from homesoc.web import feed as feedmod
 from homesoc.web import summary as summarymod
@@ -52,6 +57,27 @@ NAV: list[tuple[str, str, str]] = [
     ("settings", "/settings", "Settings"),
 ]
 
+# Lens (SPEC addendum B). Paths that authenticate themselves rather than through the dashboard
+# token: the two phone pages are shells with no device data in them (everything they show is
+# fetched with X-Lens-Token afterwards), and /api/lens/* checks that header itself. /lens/pair
+# and /lens/stickers are deliberately absent — they show real inventory, so they stay behind the
+# dashboard token like every other page.
+LENS_SHELL_PATHS: frozenset[str] = frozenset({"/lens", "/lens/claim", "/lens-sw.js"})
+LENS_API_PREFIX = "/api/lens/"
+LENS_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "require_https": True,
+    "tag_learning": True,
+    "allow_actions": False,
+    "token_ttl_days": 90,
+    "max_tokens": 10,
+}
+# Label geometry for /lens/stickers (SPEC B9). Millimetres, because that is what @page understands.
+STICKER_FORMATS: dict[str, dict[str, Any]] = {
+    "avery": {"label": "Avery 5160 (2.625 × 1 in)", "cols": 3, "rows": 10, "page": "letter"},
+    "40mm": {"label": "40 mm square", "cols": 4, "rows": 6, "page": "a4"},
+}
+
 
 def create_app(cfg: Any, conn: sqlite3.Connection, scheduler: Any = None, dns_server: Any = None) -> Flask:
     app = Flask(__name__)
@@ -60,12 +86,54 @@ def create_app(cfg: Any, conn: sqlite3.Connection, scheduler: Any = None, dns_se
     app.config["HOMESOC_TRUSTED_HOSTS"] = trusted_hosts(str(api.cfg_get(cfg, "web.host", "127.0.0.1") or "127.0.0.1"))
     app.extensions["homesoc"] = api.WebContext(cfg=cfg, conn=conn, scheduler=scheduler, dns_server=dns_server, token=token)
     app.register_blueprint(api.bp)
+    _expire_pairing_codes_when_lens_is_off(cfg, conn)
+    _register_lens_blueprints(app)
     _register_security(app)
     _register_template_helpers(app)
     _register_pages(app)
+    _register_lens_pages(app)
     _register_feed_routes(app)
     _register_errors(app)
     return app
+
+
+def _expire_pairing_codes_when_lens_is_off(cfg: Any, conn: sqlite3.Connection) -> None:
+    """SPEC B10: outstanding pairing codes die when ``lens.enabled`` goes false.
+
+    ``config.set_override`` has the same hook, but nothing in the product calls it for a
+    ``lens.*`` key — none of them are in the dashboard's EDITABLE_SETTINGS allowlist, so the
+    only way to turn Lens off is editing config.toml and restarting. Doing it here as well means
+    the control actually runs on the path the owner really takes, instead of being exercised
+    only by its own tests: whichever way Lens is switched off, a code left on a screen is dead
+    by the time anything could serve it.
+    """
+    if api._bool(api.cfg_get(cfg, "lens.enabled", False)):
+        return
+    try:
+        cleared = int(db.lens_clear_pairing_codes(conn) or 0)
+    except (AttributeError, sqlite3.Error):  # pre-Lens database, or core db without the helper
+        return
+    if cleared:
+        logger.info("lens is disabled: invalidated %d outstanding pairing code(s)", cleared)
+
+
+def _register_lens_blueprints(app: Flask) -> None:
+    """Attach the Lens API blueprints when their packages are installed.
+
+    ``homesoc.web.lens``/``lens_auth`` are owned by other packages and may not exist (Lens is an
+    optional addendum), so this is a best-effort import: Home SOC must start either way.
+    """
+    for name in ("homesoc.web.lens_auth", "homesoc.web.lens"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        except Exception:  # pragma: no cover - a broken optional module must not kill the app
+            logger.exception("could not import %s", name)
+            continue
+        blueprint = getattr(module, "bp", None)
+        if blueprint is not None and getattr(blueprint, "name", "") not in app.blueprints:
+            app.register_blueprint(blueprint)
 
 
 # --------------------------------------------------------------------------- security
@@ -127,18 +195,91 @@ def _token_ok(expected: str, *, allow_query: bool = False) -> bool:
     return bool(got) and hmac.compare_digest(got.encode(), expected.encode())
 
 
+#: What a phone consumes. ``/lens/pair`` and ``/lens/stickers`` are deliberately not here:
+#: they are desktop pages behind the dashboard token, and the pairing page's whole job is to
+#: explain the HTTPS problem — refusing to serve it would hide the instructions for fixing it.
+LENS_PHONE_PATHS: frozenset[str] = LENS_SHELL_PATHS
+
+#: The refusal a phone sees. Written out rather than templated because it must survive a
+#: half-installed build, and it borrows lens.css (a same-origin stylesheet, so CSP is happy
+#: and no style attribute is needed) to look like the app the reader was expecting.
+_HTTPS_REQUIRED_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d13">
+<title>Lens needs HTTPS</title>
+<link rel="stylesheet" href="/static/lens.css">
+</head><body class="lens no-video">
+<div class="scrim"></div>
+<header class="topbar"><span class="brand"><span class="brand-mark">&#9678;</span> Lens</span>
+<span class="state is-bad">needs HTTPS</span></header>
+<div class="notice is-bad">
+  <h1 class="notice-title">Lens needs HTTPS</h1>
+  <p class="notice-body">Home SOC is serving this address over plain HTTP, so Lens is switched
+  off here. Phone browsers only grant camera access to a secure origin, and a pairing token
+  travelling in clear text over the network would not stay a secret for long.</p>
+  <ol class="steps">
+    <li>On the computer running Home SOC, stop it.</li>
+    <li>Start it again with <code>python -m homesoc serve --tls --host 0.0.0.0 --port 8443</code>.</li>
+    <li>Open <code>/lens/pair</code> there and scan the new code with this phone.</li>
+    <li>Or follow the Tailscale route in <code>docs/LENS_SETUP.md</code>, which needs no
+    certificate warning at all.</li>
+  </ol>
+  <p class="notice-body">Setting <code>[lens] require_https = false</code> lifts this refusal,
+  but it does not make plain HTTP safe: this phone's token, and everything Lens shows, would then
+  cross the Wi-Fi in clear text for anyone on it to read and reuse — and the camera still will not
+  start without a secure origin. Pairing a new phone is refused over plain HTTP either way.</p>
+</div>
+</body></html>
+"""
+
+
+def _lens_https_refusal(cfg: Any, path: str) -> Response | None:
+    """SPEC B10: Lens over plain HTTP from anywhere but this machine is refused.
+
+    ``request.is_secure`` is the transport the client really used; the peer address is the
+    security-meaningful exemption (a ``Host: localhost`` header is attacker-supplied, a
+    loopback peer is not). A loopback browser on plain HTTP is already a secure context as
+    far as ``getUserMedia`` is concerned, so nothing is lost by letting it through.
+    """
+    if request.is_secure:
+        return None
+    if not (path in LENS_PHONE_PATHS or path.startswith(LENS_API_PREFIX)):
+        return None
+    if not lens_enabled(cfg) or not api._bool(api.cfg_get(cfg, "lens.require_https", True)):
+        return None
+    if _is_loopback(str(request.remote_addr or "")):
+        return None
+    logger.warning("refused plain-HTTP Lens request for %s from a non-loopback address", path)
+    if path.startswith(LENS_API_PREFIX):
+        return jsonify({  # type: ignore[return-value]
+            "ok": False, "code": "https_required",
+            "error": "Lens refuses to work over plain HTTP. Restart Home SOC with --tls. Setting "
+                     "lens.require_https = false lifts this refusal but sends this phone's token "
+                     "and everything Lens shows across the network in clear text, and the camera "
+                     "still will not start.",
+        }), 403
+    resp = make_response(_HTTPS_REQUIRED_HTML, 403)
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
+    return resp
+
+
 def _register_security(app: Flask) -> None:
     @app.before_request
     def _auth_and_csrf() -> Response | None:
         c: api.WebContext = app.extensions["homesoc"]
         path = request.path
+        refusal = _lens_https_refusal(c.cfg, path)
+        if refusal is not None:
+            return refusal
         allowed_hosts: frozenset[str] = app.config.get("HOMESOC_TRUSTED_HOSTS") or frozenset()
         if allowed_hosts and _host_header_name().lower() not in allowed_hosts:
             logger.warning("refused request with unexpected Host header %r", request.host)
             return jsonify({"ok": False, "error": "bad host header"}), 400  # type: ignore[return-value]
         # SPEC-GAP: static assets and the login page are reachable without the token so the
         # login page can be styled; everything else is rejected with 401.
-        if c.token and not (path == "/login" or path.startswith("/static/")):
+        if c.token and not (path == "/login" or path.startswith("/static/") or _lens_self_authenticating(c.cfg, path)):
             query_token = request.args.get("token")
             if query_token and request.method == "GET" and hmac.compare_digest(query_token.encode(), c.token.encode()):
                 # ?token= is only meant for /login; turn it into the cookie and strip it from the
@@ -164,7 +305,12 @@ def _register_security(app: Flask) -> None:
         resp.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"
-        if request.path.startswith("/api/"):
+        path = request.path
+        if path.startswith("/api/"):
+            resp.headers["Cache-Control"] = "no-store"
+        elif path in ("/lens/pair", "/lens/stickers"):
+            # A pairing code and the printed sticker tokens are both one-shot secrets; keeping
+            # them out of the browser (and the service worker) cache is free.
             resp.headers["Cache-Control"] = "no-store"
         return resp
 
@@ -394,6 +540,563 @@ def _register_pages(app: Flask) -> None:
         for it in items:
             sections.setdefault(it["section"], []).append(it)
         return _page("settings.html", "settings", "Settings", sections=sections)
+
+
+# --------------------------------------------------------------------------- lens (addendum B)
+
+
+@dataclass(frozen=True)
+class Check:
+    """One row of the /lens/pair preflight (SPEC B4.1): what was tested, and how to fix it."""
+
+    key: str
+    title: str
+    level: str  # "ok" | "warn" | "fail"
+    detail: str
+    fix: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.level == "ok"
+
+
+def lens_config(cfg: Any) -> dict[str, Any]:
+    """The ``[lens]`` section with SPEC B3 defaults, read structurally like every other section."""
+    out: dict[str, Any] = {}
+    for key, default in LENS_DEFAULTS.items():
+        value = api.cfg_get(cfg, f"lens.{key}", default)
+        out[key] = api._bool(value) if isinstance(default, bool) else value
+    for key in ("token_ttl_days", "max_tokens"):
+        try:
+            out[key] = int(out[key])
+        except (TypeError, ValueError):
+            out[key] = LENS_DEFAULTS[key]
+    return out
+
+
+def lens_enabled(cfg: Any) -> bool:
+    return bool(api._bool(api.cfg_get(cfg, "lens.enabled", False)))
+
+
+def _lens_self_authenticating(cfg: Any, path: str) -> bool:
+    if not lens_enabled(cfg):
+        return False  # master switch off: these paths 404 anyway, so never widen auth for them
+    return path in LENS_SHELL_PATHS or path.startswith(LENS_API_PREFIX)
+
+
+def _require_lens() -> dict[str, Any]:
+    """Every Lens page is a 404 while ``lens.enabled`` is false (SPEC B3/B10)."""
+    c: api.WebContext = g.homesoc
+    if not lens_enabled(c.cfg):
+        abort(404)
+    return lens_config(c.cfg)
+
+
+def _lens_helper(candidates: tuple[tuple[str, str], ...]) -> Any | None:
+    """First importable callable from ``candidates``.
+
+    The Lens transport (``homesoc.web.tls``/``lens_auth``) and identification
+    (``homesoc.web.lens``) modules are owned by other packages and are optional, so the pages
+    degrade to an explanation rather than a traceback when they are not installed.
+    """
+    for module_name, attr in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        except Exception:  # pragma: no cover - broken optional module
+            logger.exception("could not import %s", module_name)
+            continue
+        fn = getattr(module, attr, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+_QR_RENDERERS: tuple[tuple[str, str], ...] = (("homesoc.web.qr", "to_svg"), ("homesoc.web.qr", "svg"))
+_QR_ENCODERS: tuple[tuple[str, str], ...] = (
+    ("homesoc.web.qr", "encode"),
+    ("homesoc.web.qr", "matrix"),
+    ("homesoc.web.qr", "make"),
+)
+_PAIRING_MINTERS: tuple[tuple[str, str], ...] = (
+    ("homesoc.web.lens_auth", "mint_pairing_code"),
+    ("homesoc.web.lens_auth", "new_pairing_code"),
+    ("homesoc.web.lens_auth", "create_pairing_code"),
+    ("homesoc.web.lens", "mint_pairing_code"),
+    ("homesoc.web.lens", "new_pairing_code"),
+)
+_STICKER_MINTERS: tuple[tuple[str, str], ...] = (("homesoc.web.lens", "mint_sticker_codes"),)
+
+
+def qr_svg(payload: str, *, css_class: str = "qr") -> Markup | None:
+    """Inline SVG for ``payload`` from the hand-rolled encoder, or None when it is unavailable.
+
+    Only markup that actually starts with ``<svg`` is trusted into the page; anything else is
+    dropped rather than interpolated, so a future renderer change cannot become an injection.
+    """
+    render = _lens_helper(_QR_RENDERERS)
+    if render is None:
+        return None
+    svg: Any = None
+    for args in ((payload,), None):
+        try:
+            if args is None:
+                encode = _lens_helper(_QR_ENCODERS)
+                if encode is None:
+                    return None
+                svg = render(encode(payload))
+            else:
+                svg = render(*args)
+            break
+        except TypeError:
+            continue
+        except Exception:  # pragma: no cover - encoder failure must not break the page
+            logger.exception("QR rendering failed")
+            return None
+    text = str(svg or "").strip()
+    if not text.startswith("<svg"):
+        return None
+    if css_class and 'class="' not in text.split(">", 1)[0]:
+        text = text.replace("<svg", f'<svg class="{escape(css_class)}"', 1)
+    return Markup(text)
+
+
+def _as_pairing(value: Any) -> dict[str, Any] | None:
+    """Normalise whatever the pairing minter returns into ``{code, expires_at}``."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return {"code": value, "expires_at": None}
+    if isinstance(value, dict):
+        code = value.get("code") or value.get("pairing_code")
+        return {"code": str(code), "expires_at": value.get("expires_at")} if code else None
+    if isinstance(value, (tuple, list)) and value:
+        return {"code": str(value[0]), "expires_at": value[1] if len(value) > 1 else None}
+    code = getattr(value, "code", None)
+    return {"code": str(code), "expires_at": getattr(value, "expires_at", None)} if code else None
+
+
+def mint_pairing_code(conn: sqlite3.Connection, cfg: Any) -> dict[str, Any] | None:
+    fn = _lens_helper(_PAIRING_MINTERS)
+    if fn is None:
+        return None
+    for args in ((conn,), (conn, cfg)):
+        try:
+            return _as_pairing(fn(*args))
+        except TypeError:
+            continue
+        except Exception:
+            logger.exception("could not mint a Lens pairing code")
+            return None
+    return None
+
+
+def mint_sticker_codes(conn: sqlite3.Connection, device_ids: list[int]) -> dict[int, str]:
+    """Idempotent sticker tokens per device (SPEC B9); empty when the Lens package is absent."""
+    fn = _lens_helper(_STICKER_MINTERS)
+    if fn is None or not device_ids:
+        return {}
+    try:
+        minted = fn(conn, device_ids)
+    except Exception:
+        logger.exception("could not mint Lens sticker codes")
+        return {}
+    out: dict[int, str] = {}
+    for key, value in dict(minted or {}).items():
+        try:
+            out[int(key)] = str(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def cert_state() -> dict[str, Any]:
+    """What ``homesoc.web.tls`` can tell us about the certificate, without ever raising."""
+    try:
+        tls = importlib.import_module("homesoc.web.tls")
+    except ImportError:
+        return {"status": "no-module", "error": "the Lens TLS helper is not installed"}
+    except Exception as exc:  # pragma: no cover - broken optional module
+        return {"status": "error", "error": str(exc)}
+    try:
+        cert, _key = tls.cert_paths()
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    try:
+        if not cert.exists():
+            return {"status": "missing", "path": str(cert)}
+        info = dict(tls.cert_info(cert) or {})
+        info["status"] = "ok"
+        info["path"] = str(cert)
+        return info
+    except Exception as exc:
+        # TlsUnavailable (no `cryptography`) lands here with the message the user needs.
+        return {"status": "unavailable", "error": str(exc), "path": str(cert)}
+
+
+#: Settings key written by ``cli.record_bind_state`` at every start: ``host:port``.
+BIND_SETTING = "lens.bind"
+
+
+def effective_bind(cfg: Any, conn: sqlite3.Connection | None) -> tuple[str, int]:
+    """Where the server is *actually* listening, which is not always what config says.
+
+    ``serve --host 0.0.0.0 --port 8443`` — the invocation SPEC B3 documents — overrides
+    ``config.toml`` for the life of the process, so a preflight that reads ``web.host``
+    alone tells a user to edit config and restart a server that is already reachable
+    (and, the other way round, mints a pairing URL for an address nothing answers on).
+
+    The recorded bind is the only trustworthy source: the serving process wrote it itself.
+    The ``Host`` header deliberately is *not* consulted — it is attacker-influencable, and
+    ``trusted_hosts`` already accepts this machine's LAN address on a loopback-only socket,
+    so believing it would report "reachable from your phone" when nothing is listening there.
+    """
+    host = str(api.cfg_get(cfg, "web.host", "127.0.0.1") or "127.0.0.1")
+    port = int(api.cfg_get(cfg, "web.port", 8787) or 8787)
+    if conn is not None:
+        try:
+            raw = str(db.get_setting(conn, BIND_SETTING, "") or "")
+        except sqlite3.Error:
+            raw = ""
+        if raw and ":" in raw:
+            bound_host, _, bound_port = raw.rpartition(":")
+            if bound_host:
+                host = bound_host
+            if bound_port.isdigit():
+                port = int(bound_port)
+    return host, port
+
+
+def _lan_host(cfg: Any, conn: sqlite3.Connection | None = None) -> str:
+    """The address a phone should dial. The bind host when it is a real one, else this PC's."""
+    host, _port = effective_bind(cfg, conn)
+    if host not in ("0.0.0.0", "::", "[::]", "127.0.0.1", "localhost", "::1"):
+        return host
+    try:
+        from homesoc import util  # type: ignore
+
+        found = str(util.default_interface_ip() or "")
+    except Exception:
+        found = ""
+    if not found or found.startswith("127."):
+        try:
+            found = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            found = ""
+    return found or "127.0.0.1"
+
+
+#: Bind addresses that mean "every interface". A socket listens on them; nothing dials them.
+WILDCARD_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
+
+def _is_loopback(host: str) -> bool:
+    return host.lower() in ("127.0.0.1", "localhost", "::1", "[::1]") or host.startswith("127.")
+
+
+def _is_dialable(host: str) -> bool:
+    """Can a phone actually put this in its address bar and reach Home SOC?
+
+    Loopback reaches only this PC, and a wildcard bind is not an address at all — a QR code
+    containing ``https://0.0.0.0:8443/...`` is a dead link, which is exactly what the pairing
+    screen used to mint whenever the owner followed SPEC B3's own ``--host 0.0.0.0``.
+    """
+    return bool(host) and not _is_loopback(host) and host.lower() not in WILDCARD_HOSTS
+
+
+def lens_preflight(cfg: Any, conn: sqlite3.Connection, lens: dict[str, Any]) -> list[Check]:
+    """SPEC B4.1: refuse to hand out a pairing code until the phone can actually use it."""
+    checks: list[Check] = []
+    # The address the server is really on, not just the one config asks for: `serve --host`
+    # wins over config.toml for the life of the process (see app.effective_bind).
+    bind, _bind_port = effective_bind(cfg, conn)
+    lan = _lan_host(cfg, conn)
+    if _is_loopback(bind):
+        checks.append(
+            Check(
+                "host",
+                "Reachable from your phone",
+                "fail",
+                f"Home SOC is bound to {bind}, which only this computer can reach.",
+                [
+                    'Set [web] host = "0.0.0.0" in config.toml (or Settings → web.host).',
+                    "Restart Home SOC so the new binding takes effect "
+                    "(or start it once with: python -m homesoc serve --tls --host 0.0.0.0 --port 8443).",
+                    "Run scripts/enable-lens.ps1 as administrator to open the port on the Private firewall profile.",
+                ],
+            )
+        )
+    else:
+        checks.append(Check("host", "Reachable from your phone", "ok", f"Listening on {bind}; phones should use {lan}.", []))
+
+    cert = cert_state()
+    status = cert.get("status")
+    if status == "ok":
+        days = cert.get("days_left")
+        detail = f"Self-signed certificate in place, fingerprint below." + (f" Expires in {days} days." if isinstance(days, int) else "")
+        level = "warn" if isinstance(days, int) and days < 14 else "ok"
+        fix = ["python -m homesoc lens cert --regenerate"] if level == "warn" else []
+        checks.append(Check("cert", "HTTPS certificate", level, detail, fix))
+    elif status == "missing":
+        checks.append(
+            Check("cert", "HTTPS certificate", "fail", "No certificate has been generated yet.", [f"python -m homesoc lens cert --regenerate --hosts {lan}", "Restart with: python -m homesoc serve --tls --host 0.0.0.0 --port 8443"])
+        )
+    else:
+        checks.append(
+            Check(
+                "cert",
+                "HTTPS certificate",
+                "fail",
+                str(cert.get("error") or "The certificate helper is unavailable."),
+                ["pip install cryptography", "python -m homesoc lens cert --regenerate", "Or put Home SOC behind Tailscale Serve — see docs/LENS_SETUP.md."],
+            )
+        )
+
+    sans = [str(s) for s in (cert.get("sans") or [])]
+    if status == "ok" and sans and lan not in sans:
+        checks.append(
+            Check("sans", "Certificate covers this address", "warn", f"The certificate does not list {lan}; the phone will warn every visit.", [f"python -m homesoc lens cert --regenerate --hosts {lan}"])
+        )
+
+    if request.is_secure:
+        checks.append(Check("https", "Served over HTTPS", "ok", "This page arrived over HTTPS, so the phone camera will be allowed to start.", []))
+    elif not _is_loopback(bind):
+        # Blocking whatever `require_https` says. That flag decides whether Lens will *serve* an
+        # already-paired phone over plain HTTP; it has no business deciding whether Home SOC will
+        # *issue a credential* over one. Minting here would put an 8-character pairing code and
+        # the 90-day bearer token it buys onto the Wi-Fi in clear text, where copying them is the
+        # whole attack — and the camera would not start either way.
+        detail = ("This page arrived over plain HTTP while Home SOC is listening on the network. The pairing "
+                  "code and the phone's long-lived token would cross the network in clear text and can simply "
+                  "be copied by anyone on the same Wi-Fi. Chrome would also refuse the camera on this origin.")
+        if not lens["require_https"]:
+            detail += (" lens.require_https is false, which lifts the refusal to serve a phone that is already "
+                       "paired; it does not make it safe to hand out a new token here.")
+        checks.append(
+            Check(
+                "https",
+                "Served over HTTPS",
+                "fail",
+                detail,
+                ["Stop Home SOC.", "Start it again with: python -m homesoc serve --tls --host 0.0.0.0 --port 8443", "Re-open this page at https://" + lan + ":8443/lens/pair"],
+            )
+        )
+    else:
+        # Loopback plain HTTP: a secure context as far as the browser is concerned, and nothing
+        # leaves this machine — but the phone still cannot reach it, which the host check says.
+        checks.append(Check("https", "Served over HTTPS", "warn", "This page is plain HTTP on the loopback address. Nothing leaves this computer, but a phone cannot reach it either.", ['Serve with --tls and open this page at the LAN address.']))
+
+    paired = _paired_count(conn)
+    if paired is None:
+        checks.append(Check("tokens", "Paired phones", "warn", "The lens_tokens table does not exist yet, so pairing cannot be recorded.", ["Restart Home SOC once so the database migration runs."]))
+    elif paired >= lens["max_tokens"]:
+        checks.append(Check("tokens", "Paired phones", "fail", f"{paired} of {lens['max_tokens']} slots are in use.", ["python -m homesoc lens tokens", "python -m homesoc lens revoke <id>"]))
+    else:
+        checks.append(Check("tokens", "Paired phones", "ok", f"{paired} of {lens['max_tokens']} slots in use.", []))
+    return checks
+
+
+def _paired_count(conn: sqlite3.Connection) -> int | None:
+    try:
+        return int(api.scalar(conn, "SELECT count(*) FROM lens_tokens WHERE revoked_at IS NULL"))
+    except sqlite3.Error:
+        return None
+
+
+def _tagged_device_ids(conn: sqlite3.Connection, kinds: tuple[str, ...] = ()) -> set[int] | None:
+    """Device ids that already carry a tag, optionally only of the given kinds."""
+    sql = "SELECT DISTINCT device_id FROM lens_tags WHERE device_id IS NOT NULL"
+    params: tuple[Any, ...] = ()
+    if kinds:
+        sql += " AND kind IN (%s)" % ",".join("?" for _ in kinds)
+        params = tuple(kinds)
+    try:
+        found = api.rows(conn, sql, params)
+    except sqlite3.Error:
+        return None
+    return {int(r["device_id"]) for r in found if r.get("device_id") is not None}
+
+
+def _register_lens_pages(app: Flask) -> None:
+    @app.get("/lens")
+    def lens_page():
+        lens = _require_lens()
+        c: api.WebContext = g.homesoc
+        return render_template(
+            "lens.html",
+            page="lens",
+            page_title="Lens",
+            app_name=str(api.cfg_get(c.cfg, "general.name", "Home SOC")),
+            lens=lens,
+            mode="scan",
+        )
+
+    @app.get("/lens/claim")
+    def lens_claim_page():
+        lens = _require_lens()
+        c: api.WebContext = g.homesoc
+        return render_template(
+            "lens_claim.html",
+            page="lens-claim",
+            page_title="Pair this phone",
+            app_name=str(api.cfg_get(c.cfg, "general.name", "Home SOC")),
+            lens=lens,
+            mode="claim",
+        )
+
+    @app.get("/lens-sw.js")
+    def lens_service_worker():
+        """Served from the root so the worker may claim the ``/lens`` scope.
+
+        A worker at /static/sw.js is scoped to /static/ and could never control /lens, and
+        widening that with Service-Worker-Allowed would let it control every static asset.
+        """
+        _require_lens()
+        worker = _service_worker_source(app.static_folder or "static")
+        if worker is None:  # pragma: no cover - only when static/sw.js is missing
+            resp = make_response(send_from_directory(app.static_folder or "static", "sw.js", mimetype="text/javascript"))
+        else:
+            resp = make_response(worker)
+            resp.headers["Content-Type"] = "text/javascript; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    @app.get("/lens/pair")
+    def lens_pair_page():
+        lens = _require_lens()
+        c: api.WebContext = g.homesoc
+        checks = lens_preflight(c.cfg, c.conn, lens)
+        blocked = [chk for chk in checks if chk.level == "fail"]
+        _bind, port = effective_bind(c.cfg, c.conn)
+        # Never the bind host verbatim: it is routinely 0.0.0.0 (SPEC B3's own serve line) or
+        # loopback, and neither is something a phone can dial. _lan_host resolves both to this
+        # PC's LAN address, which is what the preflight above already tells the owner to use.
+        lan = _lan_host(c.cfg, c.conn)
+        scheme = "https" if (request.is_secure or lens["require_https"]) else "http"
+        reached_over_lan = bool(request.host) and _is_dialable(_host_header_name())
+        if reached_over_lan:
+            # The owner reached this page over the LAN, so that address demonstrably works.
+            base = f"{scheme}://{request.host}"
+        else:
+            base = f"{scheme}://{lan}:{port}"
+        # Belt and braces over the preflight's blocking HTTPS check: a pairing code is a
+        # credential, and one is never minted into a plain-HTTP URL that leaves this machine —
+        # whatever lens.require_https says. require_https stays an escape hatch for serving a
+        # phone that is already paired, never for issuing the token in the first place.
+        claim_host = _host_header_name() if reached_over_lan else lan
+        insecure_claim = scheme == "http" and not _is_loopback(claim_host)
+        pairing = None if (blocked or insecure_claim) else mint_pairing_code(c.conn, c.cfg)
+        claim_url = f"{base}/lens/claim#c={pairing['code']}" if pairing else ""
+        cert = cert_state()
+        return render_template(
+            "lens_pair.html",
+            page="lens-pair",
+            page_title="Pair a phone",
+            app_name=str(api.cfg_get(c.cfg, "general.name", "Home SOC")),
+            lens=lens,
+            checks=checks,
+            blocked=blocked,
+            pairing=pairing,
+            claim_url=claim_url,
+            qr=qr_svg(claim_url) if claim_url else None,
+            fingerprint=_fingerprint_groups(cert.get("fingerprint")),
+            cert=cert,
+            base=base,
+            ttl_days=lens["token_ttl_days"],
+        )
+
+    @app.get("/lens/stickers")
+    def lens_stickers_page():
+        lens = _require_lens()
+        c: api.WebContext = g.homesoc
+        size = request.args.get("size") if request.args.get("size") in STICKER_FORMATS else "avery"
+        which = "all" if request.args.get("which") == "all" else "untagged"
+        show_names = request.args.get("names", "1") != "0"
+        devices = api.devices_list(c.conn)
+        # SPEC B9: the default sheet is "all devices without a tag" — any tag, learned or
+        # sticker. Minting happens after this filter, so once a device has been on a sheet it
+        # drops off the default the next time; that is why the template's empty state points
+        # at "All devices", which reprints the very same codes (minting is idempotent).
+        tagged = _tagged_device_ids(c.conn)
+        if which == "untagged" and tagged is not None:
+            devices = [d for d in devices if int(d["id"]) not in tagged]
+        devices = devices[:120]
+        codes = mint_sticker_codes(c.conn, [int(d["id"]) for d in devices])
+        labels = [
+            {"device": d, "code": codes.get(int(d["id"]), ""), "qr": qr_svg(codes[int(d["id"])], css_class="qr") if codes.get(int(d["id"])) else None}
+            for d in devices
+        ]
+        fmt = STICKER_FORMATS[str(size)]
+        per_page = int(fmt["cols"]) * int(fmt["rows"])
+        pages = [labels[i : i + per_page] for i in range(0, len(labels), per_page)] or [[]]
+        return render_template(
+            "lens_stickers.html",
+            page="lens-stickers",
+            page_title="Sticker sheet",
+            app_name=str(api.cfg_get(c.cfg, "general.name", "Home SOC")),
+            lens=lens,
+            size=size,
+            formats=STICKER_FORMATS,
+            which=which,
+            show_names=show_names,
+            labels=labels,
+            pages=pages,
+            minting=bool(codes) or not devices,
+        )
+
+
+#: Files whose contents decide whether a cached Lens shell is stale.
+_SHELL_SOURCES: tuple[str, ...] = ("sw.js", "lens.js", "lens.css", "manifest.webmanifest")
+_SHELL_WORKER: dict[str, str] = {}
+
+
+def shell_version(static_folder: str) -> str:
+    """Short fingerprint of the Lens shell assets, used as the service worker's cache name.
+
+    The worker caches ``lens.js``/``lens.css`` cache-first. With a hard-coded cache name nothing
+    ever invalidated them, and since ``/lens-sw.js`` was byte-identical across an upgrade no new
+    worker installed either — so the first open after a Lens change served the new HTML against
+    the previous script. Deriving the name from the files themselves makes an upgraded asset a
+    different worker, which is a different cache, which is a fresh fetch. No build step, no
+    version query strings to keep in sync.
+    """
+    digest = hashlib.sha256()
+    root = Path(static_folder)
+    for name in _SHELL_SOURCES:
+        try:
+            digest.update(name.encode("utf-8"))
+            digest.update((root / name).read_bytes())
+        except OSError:  # a missing shell file must not stop Lens serving the worker
+            digest.update(b"?")
+    try:
+        digest.update((Path(__file__).parent / "templates" / "lens.html").read_bytes())
+    except OSError:
+        digest.update(b"?")
+    return digest.hexdigest()[:12]
+
+
+def _service_worker_source(static_folder: str) -> str | None:
+    """``static/sw.js`` with its cache name stamped, or ``None`` when it cannot be read."""
+    cached = _SHELL_WORKER.get(static_folder)
+    if cached is not None:
+        return cached
+    try:
+        source = (Path(static_folder) / "sw.js").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    stamped = source.replace("__SHELL_VERSION__", shell_version(static_folder))
+    _SHELL_WORKER[static_folder] = stamped
+    return stamped
+
+
+def _fingerprint_groups(value: Any) -> list[str]:
+    """SHA-256 fingerprint split into readable groups of four bytes for the pairing screen."""
+    text = str(value or "").replace(" ", "").upper()
+    if not text:
+        return []
+    parts = text.split(":") if ":" in text else [text[i : i + 2] for i in range(0, len(text), 2)]
+    return [":".join(parts[i : i + 4]) for i in range(0, len(parts), 4)]
 
 
 # ------------------------------------------------------------------ feed / summary plumbing

@@ -56,6 +56,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]
+# SPEC addendum B3: Lens serves the phone camera viewer over HTTPS, and a browser only
+# grants getUserMedia in a secure context. Generating the self-signed certificate needs
+# `cryptography`; nothing else does, so it stays out of the core dependency list and
+# homesoc.web.tls imports it lazily with an actionable message when it is missing.
+lens = ["cryptography>=42"]
 
 # Package metadata needs absolute URLs, so these cannot be written as repo-relative links the way
 # README.md and CHANGELOG.md do it. They stay commented out until the repository exists: an

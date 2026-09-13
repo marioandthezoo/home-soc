@@ -955,11 +955,29 @@ BLOCKED_DOMAINS: tuple[tuple[str, str], ...] = (
     ("firebaselogging-pa.googleapis.com", "hagezi_pro"),
 )
 
+# The untrusted camera's own traffic. Lens (SPEC addendum B) is demoed by pointing a phone at
+# this device, and "Talking to" is the section that makes the x-ray idea land — so the one device
+# the demo is built around must not have an empty one. These rows are additive: they are NOT drawn
+# from DNS_TOTAL_QUERIES, so every share, block rate and narrated figure elsewhere is unchanged.
+# Reserved .example TLD (RFC 2606) throughout, so nobody real is being accused.
+CAMERA_ALLOWED_DOMAINS: tuple[str, ...] = (
+    "device-gateway.ipcam-vendor.example",
+    "ntp.ipcam-vendor.example",
+    "fw-update.ipcam-vendor.example",
+)
+CAMERA_BLOCKED_DOMAINS: tuple[tuple[str, str], ...] = (
+    ("telemetry-collect.ipcam-vendor.example", "hagezi_pro"),
+    ("stats.device-analytics.example", "oisd_small"),
+)
+#: The beacon that makes the point: an outdated camera quietly talking to a sinkholed host.
+CAMERA_THREAT_DOMAIN = "cam-relay-node.example"
+
 # Reserved .example TLD (RFC 2606): can never be registered, so nobody real is being accused.
 MALICIOUS_DOMAINS: tuple[tuple[str, str, str], ...] = (
     # (domain, client, why)
     ("secure-appleid-verify.example", "192.168.1.32", "phishing kit reported by 12 engines"),
     ("cdn-update-delivery.example", "192.168.1.35", "malware distribution host (ThreatFox)"),
+    (CAMERA_THREAT_DOMAIN, CAMERA_IP, "botnet relay node (URLhaus)"),
 )
 
 DENY_OVERRIDE_DOMAIN = "log-config.samsungqbe.com"
@@ -1661,6 +1679,29 @@ def seed_dns(conn: sqlite3.Connection, counts: Counts) -> None:
                      "block", "reputation", round(RNG.uniform(0.1, 0.5), 2)))
     for step in range(18):
         rows.append((iso_ago(hours=0.6 + step * 1.3), "192.168.1.35", MALICIOUS_DOMAINS[1][0], "A",
+                     "block", "reputation", round(RNG.uniform(0.1, 0.5), 2)))
+
+    # --- the untrusted camera (Lens demo subject, SPEC addendum B) -------------------------
+    # Additive, so no other client's share moves. A cheap camera behaves exactly like this:
+    # a steady NTP/keep-alive heartbeat to its vendor, a telemetry endpoint the block lists
+    # already know about, and — the reason anyone cares — a beacon to a sinkholed relay.
+    for hours_back in range(24):
+        for _ in range(RNG.randint(2, 5)):
+            rows.append((
+                iso_ago(hours=hours_back, minutes=RNG.uniform(0, 60)), CAMERA_IP,
+                RNG.choice(CAMERA_ALLOWED_DOMAINS), RNG.choice(("A", "A", "AAAA")),
+                "cache" if RNG.random() < 0.3 else "allow", "default",
+                round(RNG.uniform(0.2, 40.0), 2),
+            ))
+    for hours_back in range(0, 24, 2):
+        domain, source = CAMERA_BLOCKED_DOMAINS[(hours_back // 2) % len(CAMERA_BLOCKED_DOMAINS)]
+        for hit in range(RNG.randint(4, 9)):
+            rows.append((
+                iso_ago(hours=hours_back, minutes=hit * RNG.uniform(0.2, 0.9)), CAMERA_IP, domain,
+                "A", "block", f"list:{source}", round(RNG.uniform(0.1, 0.6), 2),
+            ))
+    for step in range(14):
+        rows.append((iso_ago(hours=0.3 + step * 1.7), CAMERA_IP, CAMERA_THREAT_DOMAIN, "A",
                      "block", "reputation", round(RNG.uniform(0.1, 0.5), 2)))
 
     # --- the newest minutes -----------------------------------------------------------------

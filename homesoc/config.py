@@ -116,6 +116,14 @@ services_hours = 24
 host_hours = 6
 exposure_hours = 12
 feeds_hours = 6
+
+[lens]                             # point your phone at a device (see docs/LENS_SETUP.md)
+enabled = false                    # master switch; when false /lens and /api/lens/* return 404
+require_https = true               # refuse to serve Lens over plain HTTP (except from localhost)
+tag_learning = true                # allow unknown codes to be bound to a device from the phone
+allow_actions = false              # when true, a paired phone may trigger a rescan / acknowledge a finding
+token_ttl_days = 90                # paired-phone tokens expire after this; 0 = never
+max_tokens = 10                    # how many phones may be paired at once
 '''
 
 # Parsed once at import: DEFAULTS is the single source of truth for keys and types.
@@ -250,6 +258,33 @@ class Schedule:
 
 
 @dataclass(frozen=True)
+class Lens:
+    """SPEC addendum B3. Off by default: Lens widens the attack surface from loopback
+    to the whole LAN, so turning it on is a decision the owner makes deliberately."""
+
+    enabled: bool = False
+    require_https: bool = True
+    tag_learning: bool = True
+    allow_actions: bool = False
+    token_ttl_days: int = 90
+    max_tokens: int = 10
+
+    @property
+    def ttl_days(self) -> int:
+        """Token lifetime, floored at 0 (= never expires); a negative value is a typo, not a policy."""
+        return max(0, self.token_ttl_days)
+
+    @property
+    def token_ceiling(self) -> int:
+        """How many phones may be paired; at least one, or pairing could never succeed."""
+        return max(1, self.max_tokens)
+
+    def insecure_on_lan(self, web: "Web", *, tls: bool = False) -> bool:
+        """The SOC-LENS-001 condition: enabled, reachable off this machine, and no TLS."""
+        return bool(self.enabled) and web.exposed and not tls
+
+
+@dataclass(frozen=True)
 class Config:
     general: General = field(default_factory=General)
     web: Web = field(default_factory=Web)
@@ -261,6 +296,7 @@ class Config:
     dns: Dns = field(default_factory=Dns)
     notify: Notify = field(default_factory=Notify)
     schedule: Schedule = field(default_factory=Schedule)
+    lens: Lens = field(default_factory=Lens)
     source_path: str | None = None
 
     def get(self, dotted: str) -> Any:
@@ -290,6 +326,7 @@ SECTION_TYPES: dict[str, type] = {
     "dns": Dns,
     "notify": Notify,
     "schedule": Schedule,
+    "lens": Lens,
 }
 SECTIONS: tuple[str, ...] = tuple(SECTION_TYPES)
 
@@ -497,6 +534,12 @@ def set_override(conn: sqlite3.Connection, key: str, value: str) -> None:
         stored = str(normalized)
     db.set_setting(conn, key, stored)
     logger.info("config override %s set%s", key, "" if key in SECRET_KEYS else f" to {stored!r}")
+    if key == "lens.enabled" and normalized is False:
+        # SPEC addendum B10: outstanding pairing codes are invalidated the moment Lens is
+        # switched off, so a code left on a screen cannot pair a phone after the fact.
+        cleared = db.lens_clear_pairing_codes(conn)
+        if cleared:
+            logger.info("lens disabled: invalidated %d outstanding pairing code(s)", cleared)
 
 
 def clear_override(conn: sqlite3.Connection, key: str) -> None:
@@ -535,6 +578,7 @@ __all__ = [
     "Dns",
     "Notify",
     "Schedule",
+    "Lens",
     "load",
     "build",
     "with_overrides",

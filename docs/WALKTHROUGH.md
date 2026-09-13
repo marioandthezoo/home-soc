@@ -736,6 +736,52 @@ a **Test notifications** button, a support-bundle download, and exports of findi
 vulns. Secrets (webhook URLs, API keys) are write-only: once stored they are never echoed back by the
 API and never appear in an error message.
 
+### Lens (`/lens`) — the same data, standing in front of the device
+
+Everything above assumes you are sitting at the computer. **Lens** is the version of the dashboard
+you use while walking around the house: a phone-sized app Home SOC serves itself, which identifies a
+physical device through the phone camera and draws what Home SOC knows about it over the live image.
+
+It is off by default and takes a deliberate setup — a certificate, a LAN binding, a paired phone —
+all of which is in [docs/LENS_SETUP.md](LENS_SETUP.md). What it looks like once it is running:
+
+You point the phone at the camera on the shelf. Lens decodes the sticker on its back — either the
+barcode the manufacturer printed there (which you taught it once, with a single tap) or a QR Home
+SOC printed for you — and the card rises over the bottom of the screen. On the demo network, that is
+device 18, and the card opens with one sentence:
+
+> Six problems, one of them critical: this camera accepts Telnet logins, which send the password
+> across the network in clear text, it has punched a hole through the router to itself using UPnP,
+> so the internet can reach it, it streams its camera video to anyone who asks, and three more.
+
+Underneath it, the same sections as the device page, in the order that matters when you are standing
+there with a screwdriver:
+
+| Section | What the demo camera shows |
+|---|---|
+| **Problems** | 6 findings, worst first — 1 critical, 1 high, 2 medium, 1 low, 1 info — each expanding into numbered fix steps. This device alone costs the home score 44 points. |
+| **Exposed** | `23/tcp Telnet`, tagged **critical**, with the gloss underneath: *"remote control with no encryption at all — anyone on the network can read the password. Running BusyBox telnetd 1.20.2."* Then `554/tcp RTSP camera stream` (*"live video, which cameras very often serve with no password"*), and two HTTP interfaces. No bare port numbers anywhere. |
+| **Vulnerabilities** | `CVE-2017-9833 — Boa 0.94.14rc21 directory traversal in the web server`, and beneath it `CVSS 7.5 · 4.2% chance of exploitation in the next 30 days — worth fixing soon. · via http on port 80`. EPSS as a sentence, not a decimal. |
+| **Talking to** | *96 of 178 lookups blocked* in 24 hours — a 54% block rate — and the reason it matters, in red: `cam-relay-node.example`, 14 times, *reputation*. |
+| **History** | The last 20 events for this device. |
+
+The footer says what the phone is allowed to do — by default, nothing: *"This phone is paired
+read-only."*
+
+Two things make this practical rather than a demo. First, **identification is by code, never by
+sight**: a barcode the manufacturer already printed, a QR sticker Home SOC generates for things with
+no readable label, or a **Pick manually** button that ranks devices by how likely you are to be
+standing in front of them (*"camera, online, not marked trusted, first seen this week"*). Second,
+**unknown codes are learned, not rejected** — the first scan asks which device it is, you tap once,
+and every scan after that is instant. Most devices never need a sticker.
+
+The honest limits, in one paragraph: Chrome on Android is the target, because automatic scanning
+needs the `BarcodeDetector` API; every other browser, including everything on iOS, falls back to the
+picker rather than the camera, which Lens says on screen instead of leaving you staring at a dead
+viewfinder. There is no OCR — Lens cannot read a model number off a label. And the certificate is
+self-signed, so the phone warns once and you compare a fingerprint. [docs/LENS_SETUP.md](LENS_SETUP.md)
+covers all of it, including the Tailscale route and what to do when the phone cannot reach the host.
+
 ---
 
 ## 6. Turning on the network-wide DNS filter

@@ -12,6 +12,7 @@ import importlib
 import json
 import logging
 import platform
+import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -173,7 +174,7 @@ def loads(value: Any, default: Any = None) -> Any:
         return default
 
 
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
 
 
 def _core_db() -> Any | None:
@@ -183,13 +184,31 @@ def _core_db() -> Any | None:
         return None
 
 
+def _conn_lock() -> Any:
+    """The one lock that guards the shared connection.
+
+    Must be the SAME object core uses, not a second lock of our own: a private lock here would
+    happily let a dashboard read interleave with a scanner write on the one connection every
+    thread shares. Falls back to the local RLock only when core is genuinely absent.
+    """
+    dbmod = _core_db()
+    lock = getattr(dbmod, "_WRITE_LOCK", None) if dbmod is not None else None
+    return lock if lock is not None else _write_lock
+
+
 def rows(conn: sqlite3.Connection, sql: str, params: tuple | list = ()) -> list[dict]:
     """Run a SELECT and return plain dicts. A missing table just means that package has
-    not run yet, so log it and render the page empty instead of failing."""
+    not run yet, so log it and render the page empty instead of failing.
+
+    The whole execute/description/fetchall sequence holds the connection lock. sqlite3 keeps
+    statement state on the connection, so an interleaving reader does not just block — it reads
+    another thread's cursor and gets InterfaceError, or silently gets no row at all.
+    """
     try:
-        cur = conn.execute(sql, params)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        with _conn_lock():
+            cur = conn.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
     except sqlite3.OperationalError as exc:
         logger.warning("query failed (%s): %s", exc, " ".join(sql.split())[:90])
         return []
@@ -1674,3 +1693,376 @@ def api_export():
     body = json.dumps(export_data(ctx(), full), indent=2, default=str)
     name = "homesoc-support-bundle.json" if full else "homesoc-export.json"
     return Response(body, mimetype="application/json", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# --------------------------------------------------------------------------- lens (SPEC addendum B6/B7)
+#
+# Lens is the only part of the dashboard meant to be reached from a phone on the LAN, so every
+# route here is stricter than the rest of this file: the whole surface disappears (404) when
+# ``lens.enabled`` is false, identification is POST so no code or device data can land in a URL or
+# an access log, acting requires both the ``act`` scope and ``lens.allow_actions``, and every
+# response carries ``Cache-Control: no-store``.
+
+LENS_ACTIONS: tuple[str, ...] = ("rescan", "acknowledge", "set_trusted")
+LENS_SCOPE_READ = "read"
+LENS_SCOPE_ACT = "act"
+_LOOPBACK: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+# Mirrors app.COOKIE_NAME; importing app here would be circular.
+DASHBOARD_COOKIE = "homesoc_token"
+
+
+def _lens_module() -> Any | None:
+    try:
+        return importlib.import_module("homesoc.web.lens")
+    except ImportError:  # pragma: no cover - lens ships with this package
+        logger.warning("homesoc.web.lens is not importable; Lens routes are disabled")
+        return None
+
+
+def lens_enabled(c: WebContext) -> bool:
+    return _bool(cfg_get(c.cfg, "lens.enabled", False))
+
+
+def _record_event(conn: sqlite3.Connection, level: str, source: str, message: str, data: dict | None = None) -> None:
+    dbmod = _core_db()
+    if dbmod is not None and hasattr(dbmod, "record_event"):
+        try:
+            dbmod.record_event(conn, level, source, message, data)
+            return
+        except Exception:
+            logger.exception("could not record event %r", message)
+    write(  # SPEC-GAP: core db not importable -> the same row, written here
+        conn,
+        "INSERT INTO events(ts, level, source, message, data) VALUES(?,?,?,?,?)",
+        (now_iso(), level.lower(), source, message, json.dumps(data, default=str) if data else None),
+    )
+
+
+def _json_no_store(payload: dict | list, code: int = 200) -> tuple[Response, int]:
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp, code
+
+
+def _client_ip() -> str:
+    return str(request.remote_addr or "unknown")[:45]
+
+
+def _is_loopback(addr: str) -> bool:
+    return addr in _LOOPBACK or addr.startswith("127.")
+
+
+def _dashboard_session() -> bool:
+    """True when this request is the owner at the desktop rather than a paired phone.
+
+    ``app._auth_and_csrf`` deliberately exempts ``/api/lens/*`` from the dashboard token because
+    Lens authenticates itself, so this re-checks the dashboard credential rather than assuming it
+    was checked upstream. With no ``web.token`` configured the dashboard has no credential at all,
+    and the only requests we are willing to treat as the owner's are the ones from this machine —
+    a LAN client must present a Lens token.
+    """
+    c = ctx()
+    if not c.token:
+        return _is_loopback(_client_ip())
+    presented = request.headers.get("X-Token") or request.cookies.get(DASHBOARD_COOKIE) or ""
+    return bool(presented) and secrets.compare_digest(presented.encode(), c.token.encode())
+
+
+def lens_principal() -> tuple[dict | None, tuple[Response, int] | None]:
+    """``(principal, error_response)`` -- exactly one of the two is ever set."""
+    c = ctx()
+    if not lens_enabled(c):
+        return None, _json_no_store({"ok": False, "error": "not found"}, 404)
+    lens = _lens_module()
+    if lens is None:
+        return None, _json_no_store({"ok": False, "error": "lens is unavailable on this install"}, 503)
+    presented = request.headers.get("X-Lens-Token")
+    if presented:
+        info = lens.verify_token(c.conn, presented, ip=_client_ip())
+        if info is None:
+            return None, _json_no_store(
+                {"ok": False, "code": "unpaired",
+                 "error": "This phone is not paired, or its access was revoked. "
+                          "Open the dashboard and pair it again."},
+                401,
+            )
+        return {
+            "kind": "lens",
+            "label": str(info.get("label") or "paired phone"),
+            "scopes": list(info.get("scopes") or [LENS_SCOPE_READ]),
+            "token_id": info.get("id"),
+        }, None
+    if _dashboard_session():
+        return {"kind": "dashboard", "label": "dashboard",
+                "scopes": [LENS_SCOPE_READ, LENS_SCOPE_ACT], "token_id": None}, None
+    return None, _json_no_store(
+        {"ok": False, "code": "no_token",
+         "error": "Lens needs a paired phone. Send the X-Lens-Token header you received when pairing."},
+        401,
+    )
+
+
+def lens_can_act(c: WebContext, principal: dict) -> bool:
+    return _bool(cfg_get(c.cfg, "lens.allow_actions", False)) and LENS_SCOPE_ACT in (principal.get("scopes") or [])
+
+
+def _lens_act_denial(c: WebContext, principal: dict) -> tuple[Response, int] | None:
+    """The 403 a read-only principal gets for a mutating route, or ``None`` when it may act."""
+    if not _bool(cfg_get(c.cfg, "lens.allow_actions", False)):
+        return _json_no_store(
+            {"ok": False, "code": "actions_disabled",
+             "error": "Lens is read-only. Set lens.allow_actions = true in config.toml to allow actions."},
+            403,
+        )
+    if LENS_SCOPE_ACT not in (principal.get("scopes") or []):
+        return _json_no_store(
+            {"ok": False, "code": "missing_scope", "error": "This phone was paired read-only."}, 403
+        )
+    return None
+
+
+def _lens_act_guard() -> tuple[dict | None, tuple[Response, int] | None]:
+    principal, error = lens_principal()
+    if error is not None:
+        return None, error
+    denial = _lens_act_denial(ctx(), principal)
+    if denial is not None:
+        return None, denial
+    return principal, None
+
+
+def lens_actions_for(c: WebContext, principal: dict) -> dict:
+    allowed = lens_can_act(c, principal)
+    return {"can_rescan": allowed, "can_acknowledge": allowed, "can_set_trusted": allowed}
+
+
+def lens_payload(c: WebContext, principal: dict, device_id: int, hours: int = 24) -> dict | None:
+    lens = _lens_module()
+    if lens is None:
+        return None
+    payload = lens.lens_device(
+        c.conn,
+        device_id,
+        hours=hours,
+        dns_enabled=_bool(cfg_get(c.cfg, "dns.enabled", False)),
+        actions=lens_actions_for(c, principal),
+    )
+    return payload or None
+
+
+@bp.post("/lens/claim")
+def api_lens_claim():
+    """Exchange a single-use pairing code for a long-lived, scoped token (B4).
+
+    Rate-limited per source IP; a refusal is recorded so a burst of guesses shows up in the feed.
+    """
+    c = ctx()
+    if not lens_enabled(c):
+        return _json_no_store({"ok": False, "error": "not found"}, 404)
+    lens = _lens_module()
+    if lens is None:
+        return _json_no_store({"ok": False, "error": "lens is unavailable on this install"}, 503)
+    ip = _client_ip()
+    allowed, retry_after = lens.claim_allowed(c.conn, ip)  # writes its own events row when it trips
+    if not allowed:
+        minutes = max(1, int(retry_after or 3600) // 60)
+        return _json_no_store(
+            {"ok": False, "code": "rate_limited", "retry_after": int(retry_after or 3600),
+             "error": f"Too many pairing attempts. Try again in about {minutes} minutes."},
+            429,
+        )
+    body = _payload()
+    result = lens.claim(
+        c.conn,
+        body.get("code"),
+        ip=ip,
+        label=(str(body.get("label") or "")[:60]) or None,
+        ttl_days=int(cfg_get(c.cfg, "lens.token_ttl_days", 90) or 0),
+        max_tokens=int(cfg_get(c.cfg, "lens.max_tokens", 10) or 10),
+        allow_actions=_bool(cfg_get(c.cfg, "lens.allow_actions", False)),
+    )
+    if not result.get("ok"):
+        _record_event(c.conn, "warning", "lens", "a Lens pairing attempt was refused",
+                      {"ip": ip, "reason": result.get("error")})
+        return _json_no_store(result, 400)
+    lens.claim_reset(c.conn, ip)  # a successful pairing clears that address's attempt counter
+    return _json_no_store(
+        {"ok": True, "token": result.get("token"), "label": result.get("label"),
+         "scopes": result.get("scopes"), "expires_at": result.get("expires_at")}
+    )
+
+
+@bp.post("/lens/identify")
+def api_lens_identify():
+    """POST, never GET: a decoded code must not end up in a URL, a log or the phone's history."""
+    principal, error = lens_principal()
+    if error is not None:
+        return error
+    c = ctx()
+    lens = _lens_module()
+    body = _payload()
+    code = body.get("code")
+    hint = body.get("hint") if isinstance(body.get("hint"), dict) else None
+    if code is not None and lens.normalise_code(code) is None:
+        return _json_no_store({"ok": False, "error": "that code is not something Lens can store"}, 400)
+    match = lens.identify(c.conn, code=code, hint=hint)
+    out = dict(match.as_dict())
+    out["ok"] = True
+    out["learnable"] = bool(
+        _bool(cfg_get(c.cfg, "lens.tag_learning", True)) and code and match.device_id is None and match.via != "ignored"
+    )
+    if match.confidence == "exact" and match.device_id is not None:
+        out["device"] = lens_payload(c, principal, int(match.device_id), _int_arg("hours", 24, 1, 24 * 30))
+    return _json_no_store(out)
+
+
+@bp.post("/lens/learn")
+def api_lens_learn():
+    """Bind an unknown code to a device -- the one tap that makes every later scan instant."""
+    principal, error = lens_principal()
+    if error is not None:
+        return error
+    c = ctx()
+    if not _bool(cfg_get(c.cfg, "lens.tag_learning", True)):
+        return _json_no_store(
+            {"ok": False, "code": "learning_off",
+             "error": "Learning new codes is switched off (lens.tag_learning)."},
+            403,
+        )
+    lens = _lens_module()
+    body = _payload()
+    raw_device = body.get("device_id")
+    device_id: int | None
+    if raw_device in (None, "", "null"):
+        device_id = None  # "Not a device / ignore this code" (B8)
+    else:
+        try:
+            device_id = int(raw_device)
+        except (TypeError, ValueError):
+            return _json_no_store({"ok": False, "error": "device_id must be a number, or null to ignore the code"}, 400)
+    kind = "ignored" if device_id is None else str(body.get("kind") or "learned")
+    if kind not in ("learned", "sticker", "ignored"):
+        return _json_no_store({"ok": False, "error": "kind must be learned, sticker or ignored"}, 400)
+    try:
+        tag_id = lens.learn_tag(
+            c.conn, body.get("code"), device_id, kind=kind,
+            label=body.get("label"), created_by=str(principal.get("label") or "lens")[:40],
+        )
+    except ValueError as exc:
+        return _json_no_store({"ok": False, "error": str(exc)}, 404 if "no such" in str(exc) else 400)
+    return _json_no_store({"ok": True, "tag_id": tag_id, "device_id": device_id, "kind": kind})
+
+
+@bp.delete("/lens/tag/<path:code>")
+def api_lens_forget(code: str):
+    """Unlearn a code.
+
+    This is a destructive inventory change, not a read: deleting a sticker tag kills a label
+    that is physically stuck to a device, and the next sheet then prints a *different* QR for
+    it. So it needs the same permission every other mutating Lens route needs — B10's "without
+    the ``act`` scope Lens is strictly read-only" has to mean this route too, or a read-only
+    phone (or anyone who picks one up) can silently destroy every printed sticker mapping.
+    The owner at the desktop is exempt: docs/LENS_SETUP.md sends them here to fix a mis-learned
+    code, and that is a dashboard-authenticated request, not a paired phone.
+    """
+    principal, error = lens_principal()
+    if error is not None:
+        return error
+    c = ctx()
+    if principal.get("kind") != "dashboard":
+        denial = _lens_act_denial(c, principal)
+        if denial is not None:
+            return denial
+    lens = _lens_module()
+    if not lens.forget_tag(c.conn, code):
+        return _json_no_store({"ok": False, "error": "no such tag"}, 404)
+    return _json_no_store({"ok": True, "forgotten": True})
+
+
+@bp.get("/lens/devices")
+def api_lens_devices():
+    """The ranked picker list -- what Lens shows with no code, or when the guess was wrong."""
+    _, error = lens_principal()
+    if error is not None:
+        return error
+    lens = _lens_module()
+    hint = {k: v for k, v in (("kind", request.args.get("kind")), ("q", request.args.get("q"))) if v}
+    return _json_no_store(
+        {"ok": True, "devices": lens.rank_candidates(ctx().conn, hint=hint or None, limit=_int_arg("limit", 50, 1, 200))}
+    )
+
+
+@bp.get("/lens/device/<int:device_id>")
+def api_lens_device(device_id: int):
+    principal, error = lens_principal()
+    if error is not None:
+        return error
+    payload = lens_payload(ctx(), principal, device_id, _int_arg("hours", 24, 1, 24 * 30))
+    if payload is None:
+        return _json_no_store({"ok": False, "error": "no such device"}, 404)
+    return _json_no_store(payload)
+
+
+@bp.post("/lens/action")
+def api_lens_action():
+    """rescan / acknowledge / set_trusted -- needs the ``act`` scope and ``lens.allow_actions``."""
+    principal, error = _lens_act_guard()
+    if error is not None:
+        return error
+    c = ctx()
+    body = _payload()
+    action = str(body.get("action") or "")
+    if action not in LENS_ACTIONS:
+        return _json_no_store({"ok": False, "error": "action must be one of " + ", ".join(LENS_ACTIONS)}, 400)
+    try:
+        device_id = int(body.get("device_id"))
+    except (TypeError, ValueError):
+        return _json_no_store({"ok": False, "error": "device_id must be a number"}, 400)
+    if one(c.conn, "SELECT id FROM devices WHERE id=?", (device_id,)) is None:
+        return _json_no_store({"ok": False, "error": "no such device"}, 404)
+    payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+    _record_event(c.conn, "info", "lens", f"{action} requested from Lens",
+                  {"device_id": device_id, "by": principal.get("label")})
+
+    if action == "rescan":
+        result = trigger_device_scan(c, device_id)  # the existing scheduler path, never a new one
+        return _json_no_store(result, 202 if result.get("ok") else 409)
+    if action == "set_trusted":
+        trusted = _bool(payload.get("trusted", True))
+        update_device(c.conn, device_id, {"trusted": trusted})
+        return _json_no_store({"ok": True, "device_id": device_id, "trusted": trusted})
+    try:
+        row_id = int(payload.get("row_id"))
+    except (TypeError, ValueError):
+        return _json_no_store({"ok": False, "error": "payload.row_id must be the finding's row id"}, 400)
+    owner = one(c.conn, "SELECT device_id FROM findings WHERE id=?", (row_id,))
+    if owner is None or int(owner.get("device_id") or 0) != device_id:
+        return _json_no_store({"ok": False, "error": "no such finding on this device"}, 404)
+    if not set_finding_status(c.conn, row_id, "acknowledged", "acknowledged from Lens"):
+        return _json_no_store({"ok": False, "error": "no such finding"}, 404)
+    return _json_no_store({"ok": True, "row_id": row_id, "status": "acknowledged"})
+
+
+@bp.get("/lens/health")
+def api_lens_health():
+    principal, error = lens_principal()
+    if error is not None:
+        return error
+    c = ctx()
+    try:
+        version = str(getattr(importlib.import_module("homesoc"), "__version__", "") or "")
+    except ImportError:  # pragma: no cover
+        version = ""
+    return _json_no_store(
+        {
+            "ok": True,
+            "https": bool(request.is_secure),
+            "version": version,
+            "dns_enabled": _bool(cfg_get(c.cfg, "dns.enabled", False)),
+            "devices": int(scalar(c.conn, "SELECT count(*) FROM devices")),
+            "paired_as": principal.get("label"),
+            "scopes": principal.get("scopes"),
+            "can_act": lens_can_act(c, principal),
+            "tag_learning": _bool(cfg_get(c.cfg, "lens.tag_learning", True)),
+        }
+    )

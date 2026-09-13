@@ -168,12 +168,30 @@ def _sev(value: Any, default: str = "info") -> str:
 
 
 @dataclass(frozen=True)
+class DeviceFilter:
+    """Restrict the feed to one device, *in SQL*.
+
+    Filtering the merged stream in Python instead cannot work: every source is bounded by its
+    own ``LIMIT cap``, so on a busy network the cap is spent on other devices' rows and the one
+    being asked about is starved out of its own history. Only the three sources whose rows carry
+    a device identity can honour this; the rest (scans, blocklist updates, notifications, system
+    events) are network-wide and are simply skipped, which is exactly what a caller filtering in
+    Python was already dropping.
+    """
+
+    device_id: int
+    ip: str = ""
+    mac: str = ""
+
+
+@dataclass(frozen=True)
 class _Query:
     since: str | None
     until: str | None
     kinds: frozenset[str] | None
     cap: int
     severities: frozenset[str] | None = None
+    device: DeviceFilter | None = None
 
     def wants(self, *kinds: str) -> bool:
         return self.kinds is None or any(k in self.kinds for k in kinds)
@@ -197,6 +215,9 @@ def _findings_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
     if not q.wants(*(k for k, _ in _FINDING_EVENTS.values())):
         return []
     where, params = q.window("e.at")
+    if q.device is not None:
+        where += " AND f.device_id=?"
+        params = params + [q.device.device_id]
     if q.kinds is not None:
         # Push the kind filter into SQL. Without it the LIMIT below is spent on event rows that
         # the caller filtered out, so a filtered page returns a handful of rows instead of a full one.
@@ -282,6 +303,9 @@ def _devices_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
     out: list[FeedItem] = []
     if q.wants("device_new"):
         where, params = q.window("first_seen")
+        if q.device is not None:
+            where += " AND id=?"
+            params = params + [q.device.device_id]
         for r in api.rows(
             conn,
             "SELECT id, ip, mac, vendor, COALESCE(nickname, hostname, ip, mac) AS name, first_seen "
@@ -307,6 +331,9 @@ def _devices_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             )
     if q.wants("device_offline"):
         where, params = q.window("last_seen")
+        if q.device is not None:
+            where += " AND id=?"
+            params = params + [q.device.device_id]
         for r in api.rows(
             conn,
             "SELECT id, ip, COALESCE(nickname, hostname, ip, mac) AS name, last_seen "
@@ -345,8 +372,8 @@ def _scan_summary_words(summary: Any) -> str:
 
 
 def _scans_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
-    if not q.wants("scan"):
-        return []
+    if not q.wants("scan") or q.device is not None:
+        return []  # a scan is network-wide; it belongs to no single device
     where, params = q.window("COALESCE(finished_at, started_at)")
     data = api.rows(
         conn,
@@ -382,8 +409,8 @@ def _scans_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
 
 
 def _feed_update_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
-    if not q.wants("feed_update"):
-        return []
+    if not q.wants("feed_update") or q.device is not None:
+        return []  # blocklist updates are network-wide
     where, params = q.window("ts")
     data = api.rows(
         conn,
@@ -415,8 +442,14 @@ def _feed_update_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
 
 def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
     out: list[FeedItem] = []
+    if q.device is not None and not q.device.ip:
+        return []  # DNS rows are keyed on the client address; with none there is nothing to match
+    client_where = " AND client=?" if q.device is not None else ""
+    client_param: list[Any] = [q.device.ip] if q.device is not None else []
     if q.wants("dns_threat"):
         where, params = q.window("ts")
+        where += client_where
+        params = params + client_param
         for r in api.rows(
             conn,
             # Addendum A2.1 describes these reasons as `threat:...` / `reputation:...`, but
@@ -446,6 +479,8 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             )
     if q.wants("dns_block"):
         where, params = q.window("ts")
+        where += client_where
+        params = params + client_param
         # Grouped in SQL by (client, qname, hour) to bound the row count, then re-grouped in
         # Python by registrable domain, which SQLite cannot compute.
         grouped = api.rows(
@@ -497,7 +532,9 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
 
 def _events_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
     """Defender detections and everything else that logged a warning or an error."""
-    if not q.wants("av_threat", "system"):
+    if not q.wants("av_threat", "system") or q.device is not None:
+        # events rows carry no device identity (their ref is {event_id, source, level}), so a
+        # device-filtered feed can never match one
         return []
     where, params = q.window("ts")
     # Push the source split into SQL for the same reason as in _findings_source: asking for only
@@ -536,8 +573,8 @@ def _events_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
 
 
 def _notifications_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
-    if not q.wants("notification"):
-        return []
+    if not q.wants("notification") or q.device is not None:
+        return []  # a notification is about the home, not about one device
     where, params = q.window("ts")
     data = api.rows(
         conn,
@@ -704,6 +741,7 @@ def build_feed(
     limit: int = 200,
     offset: int = 0,
     collapse: bool = True,
+    device: DeviceFilter | None = None,
 ) -> tuple[list[FeedItem], int]:
     """Merge every source into one ``ts``-descending stream.
 
@@ -711,6 +749,9 @@ def build_feed(
     which each source bounds at ``limit + offset + 1`` rows — enough to paginate correctly and to
     say "N more", without ever scanning a whole table. The extra row is the sentinel that keeps
     "Load more" visible when a single source fills the whole page.
+
+    ``device`` narrows every source that can express it to one device *in SQL*, so a device's own
+    history is never starved out by the rest of the network's traffic inside the cap.
 
     ``collapse`` (the default) folds runs of the same ``(kind, title)`` into one row each — see
     :func:`collapse_runs`. It happens before ``offset``/``limit`` are applied, so pages stay
@@ -723,7 +764,7 @@ def build_feed(
     sev_set = frozenset(s for s in (severities or ()) if s in SEVERITY_RANK) or None
     needle = (q or "").strip().lower()[:200] or None
     query = _Query(since=_bare(since), until=_until_bound(until), kinds=kind_set,
-                   cap=limit + offset + 1, severities=sev_set)
+                   cap=limit + offset + 1, severities=sev_set, device=device)
 
     items: list[FeedItem] = []
     for source in _SOURCES:

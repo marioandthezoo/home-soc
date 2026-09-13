@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0d13">
+<title>Pair this phone · {{ app_name or 'Home SOC' }}</title>
+<link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='lens-icon.svg') }}">
+<link rel="apple-touch-icon" href="{{ url_for('static', filename='lens-icon-192.png') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
+</head>
+<body class="lens claim" data-page="lens-claim" data-mode="{{ mode }}">
+
+<!-- The pairing code arrives in the URL fragment (#c=…), which browsers never send to the
+     server, so it stays out of the access log, the history sync and any referrer. lens.js
+     reads it, POSTs it once to /api/lens/claim, stores the token in localStorage and moves on. -->
+<main class="claim-wrap">
+  <p class="brand claim-brand"><span class="brand-mark" aria-hidden="true">◉</span> {{ app_name or 'Home SOC' }} Lens</p>
+
+  <div id="claim-card" class="claim-card" role="status" aria-live="polite">
+    <span id="claim-spinner" class="spinner" aria-hidden="true"></span>
+    <h1 id="claim-title" class="claim-title">Pairing this phone…</h1>
+    <p id="claim-body" class="claim-body">Exchanging the pairing code for a token.</p>
+    <ol id="claim-steps" class="steps" hidden></ol>
+    <a id="claim-go" class="btn btn-primary btn-wide" href="/lens" hidden>Open Lens</a>
+    <button id="claim-retry" class="btn btn-ghost btn-wide" type="button" hidden>Try again</button>
+  </div>
+
+  <p class="claim-foot muted small">
+    The token is stored on this phone only. Revoke it any time from the dashboard with
+    <code>python -m homesoc lens revoke</code>.
+  </p>
+</main>
+
+<script src="{{ url_for('static', filename='lens.js') }}" defer></script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
+</head>
+<body class="desk stickers sheet-{{ size }}" data-page="lens-stickers" data-refresh="0">
+
+<div class="no-print">
+  <header class="topbar">
+    <h1 class="page-title">Sticker sheet</h1>
+    <div class="topbar-stats">
+      <a class="chip" href="/lens/pair">Pair a phone</a>
+      <a class="chip" href="/devices">Devices</a>
+      <a class="chip" href="/">Dashboard</a>
+    </div>
+  </header>
+
+  <section class="card panel sticker-controls">
+    <form method="get" action="/lens/stickers" class="sticker-form">
+      <div class="field">
+        <label for="size">Label size</label>
+        <select id="size" name="size">
+          {% for key, fmt in formats.items() %}
+          <option value="{{ key }}"{% if key == size %} selected{% endif %}>{{ fmt.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field">
+        <label for="which">Devices</label>
+        <select id="which" name="which">
+          <option value="untagged"{% if which == 'untagged' %} selected{% endif %}>Only devices that still need a sticker</option>
+          <option value="all"{% if which == 'all' %} selected{% endif %}>All devices</option>
+        </select>
+      </div>
+      <div class="field field-check">
+        <input type="checkbox" id="names" name="names" value="1"{% if show_names %} checked{% endif %}>
+        <label for="names">Print the nickname under each code</label>
+      </div>
+      <button class="btn btn-primary" type="submit">Update sheet</button>
+      <button class="btn" id="btn-print" type="button">Print…</button>
+    </form>
+    <p class="muted small">
+      Each code is an opaque random token — it carries no MAC address, IP, hostname or device name, so a
+      photograph of a sticker tells a visitor nothing about the network. Reprinting is safe: the same device keeps
+      the same code, and stickers already stuck to things keep working.
+    </p>
+    {% if not labels %}
+    <p class="warn-strip">Nothing to print. {% if which == 'untagged' %}Every device already has a code the camera can read — switch to <b>All devices</b> to reprint.{% else %}No devices have been discovered yet.{% endif %}</p>
+    {% elif not minting %}
+    <p class="warn-strip">The Lens identification package is not installed in this build, so no codes could be minted.
+      The layout below is a preview with empty labels.</p>
+    {% endif %}
+  </section>
+</div>
+
+{% for page_labels in pages %}
+<div class="page">
+  <div class="label-grid">
+    {% for item in page_labels %}
+    <div class="label">
+      <div class="label-qr">{% if item.qr %}{{ item.qr }}{% else %}<span class="label-missing">no code</span>{% endif %}</div>
+      <div class="label-text">
+        {% if show_names %}<b class="label-name">{{ item.device.display_name }}</b>{% endif %}
+        <span class="label-mark">Home SOC Lens</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+
+<script src="{{ url_for('static', filename='lens.js') }}" defer></script>
+</body>
+</html>

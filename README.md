@@ -31,6 +31,8 @@ account to create, no cloud, no telemetry, and no admin rights are needed for th
   listening ports, Wi-Fi encryption and your router's exposure to the internet.
 - **Filters DNS for the whole LAN** (optional) — an embedded resolver on port 53 that blocks ads and trackers and
   sinkholes known-malicious domains, with a live query log, per-domain allow/deny overrides and VirusTotal reputation.
+- **Shows you a device by pointing a phone at it** (optional) — **Lens**, a phone web app served by Home SOC itself:
+  point the camera at a device, and its open ports, CVEs, findings and DNS activity appear over the live image.
 
 Everything it observes lands in one activity feed and one remediation summary, so you can answer both "what happened on
 my network?" and "what is still broken?" without knowing where to look.
@@ -206,6 +208,38 @@ devices instead.
 The full walkthrough — router-by-router, per-device fallback, IPv6, what to do when it breaks — is in
 [docs/NETWORK_DNS_SETUP.md](docs/NETWORK_DNS_SETUP.md).
 
+## Lens — point your phone at a device
+
+**Lens** is a phone-sized web app Home SOC serves itself at `/lens`. You point your phone's camera at something in the
+house; Lens works out which device on your network it is and draws what Home SOC knows about it over the live camera
+image — open ports with a plain-English gloss, matched CVEs, findings with numbered fix steps, and the domains that
+device has been talking to. It is the Devices page, except you are standing in front of the thing while you read it.
+
+Identification is by **machine-readable code**, not by what a device looks like. The first time Lens sees a code it does
+not know — usually the barcode the manufacturer already printed on the device — it shows a ranked list and you tap once;
+from then on that code resolves instantly. Home SOC prints QR stickers for whatever is left (a smart plug behind the
+sofa), and a **Pick manually** button always works. There is no OCR and no image recognition.
+
+The short version:
+
+1. `python -m pip install cryptography` — the one optional dependency, needed only to make a certificate.
+2. In `config.toml`: `[web] host = "0.0.0.0"`, `port = 8443`, keep the token; `[lens] enabled = true`. Restart.
+3. `python -m homesoc lens cert --regenerate`, then run with TLS: `python -m homesoc run --tls`.
+4. Elevated PowerShell, once: `powershell -ExecutionPolicy Bypass -File scripts\enable-lens.ps1 -Port 8443`.
+5. Open `/lens/pair` on the computer and scan the QR with the phone.
+
+Three honest limits before you spend an evening on it. **Chrome on Android is the target** — scanning needs the
+`BarcodeDetector` API, so other browsers (including everything on iOS) fall back to the device picker rather than the
+camera. **The certificate is self-signed**, so the phone warns once and you have to compare a fingerprint; there is no
+CA to install, and Chrome will not register the offline service worker on an untrusted certificate. And **Lens is off by
+default** — turning it on moves the dashboard from loopback to your LAN, which is a real decision, so it is a config
+file edit rather than a checkbox. A paired phone is read-only unless you say otherwise, has its own revocable token
+rather than the dashboard password, and the sticker QRs encode an opaque random string — never a MAC, IP, hostname or
+device name.
+
+All of it, including the Tailscale alternative, the sticker sheet and troubleshooting, is in
+[docs/LENS_SETUP.md](docs/LENS_SETUP.md).
+
 ## Notifications
 
 Home SOC batches new findings into one message per scan (never fifty toasts at once) and can send a daily digest.
@@ -259,9 +293,9 @@ Global options, valid before any command:
 | `init` | Create the data dir, `config.toml`, the database schema, and fetch the first feeds. | `--no-feeds` — skip the first feed download. |
 | `update` | Update definition feeds. | `--feeds a,b` — comma-separated feed names (default: all enabled). `--force` — ignore ETag/age and re-download. |
 | `scan` | Run scans now. | `--quick` — discovery + quick service scan + vulns + wifi. `--full` — every step (the default when `--quick` is absent). `--only a,b` — comma-separated steps: `discovery,services,vulns,host,exposure,wifi,files`. |
-| `serve` | Dashboard only (jobs run only when you press a button). | `--host H`, `--port P`. |
+| `serve` | Dashboard only (jobs run only when you press a button). | `--host H`, `--port P`, `--tls` — serve over HTTPS with the Lens certificate. |
 | `dns` | DNS resolver only, in the foreground. | `--port P`. |
-| `run` | Dashboard + scheduler + resolver. This is normal mode, and what `run.bat` / `run.sh` call. | — |
+| `run` | Dashboard + scheduler + resolver. This is normal mode, and what `run.bat` / `run.sh` call. | `--tls` — serve over HTTPS (see `lens cert`). |
 | `status` | Score, finding counts, device counts, last scans, feed table and job table. | — |
 | `findings` | List findings as a table. | `--status {open,acknowledged,resolved,suppressed}`, `--severity {critical,high,medium,low,info}`, `--limit N` (default 500). |
 | `baseline` | Accept the devices you already own: tick **Trusted** on every known device and close their "new device" findings (`NET-DEV-001`). Re-running it is a no-op. | `--trust-all` — explicit synonym for the default. `--dry-run` — print what would change and write nothing. |
@@ -270,6 +304,7 @@ Global options, valid before any command:
 | `feed` | Plain-text activity feed for the terminal. | `--limit N` (default 50), `--kinds a,b`, `--since AGE` — `30m`, `24h`, `7d`, `2w` or an ISO timestamp. |
 | `defender` | Windows Defender actions. | `--quick-scan` or `--update` (exactly one is required). |
 | `dns-test DOMAIN` | Show the policy decision and the upstream answer for one domain. | — |
+| `lens` | Pair a phone with [Lens](#lens--point-your-phone-at-a-device), list or revoke its tokens, manage the HTTPS certificate. | `pair [--host H] [--port P] [--invert]`, `tokens`, `revoke <id> \| --all`, `cert [--regenerate] [--hosts a,b]`. |
 
 A few things worth trying on day one:
 
@@ -297,6 +332,7 @@ change in the Settings page are stored in the database and take precedence over 
 | `[dns]` | The resolver: on/off, listen address and port, upstream resolvers and DoH fallback, block mode, cache size, which blocklists to load, query logging and retention, VirusTotal/URLhaus keys and reputation thresholds. |
 | `[notify]` | Minimum severity to notify on, the ntfy/Discord/webhook/toast channels and the daily digest hour. |
 | `[schedule]` | How often each job runs: discovery, services, host posture, exposure and feeds. |
+| `[lens]` | The phone camera viewer: on/off, whether plain HTTP is refused, whether unknown codes can be learned, whether a paired phone may act as well as read, token lifetime and how many phones may be paired. Not editable from the Settings page — see [docs/LENS_SETUP.md](docs/LENS_SETUP.md). |
 
 ## Safety and legal
 
@@ -392,8 +428,10 @@ Home_SOC/
     findings/                  the 88-rule catalog, the lifecycle engine and the score
     notify/                    ntfy, Discord, webhook and Windows toast
     dnsfilter/                 the resolver: policy, upstreams, cache, reputation, query log
-    web/                       Flask app, JSON API, feed and summary builders, templates, static
-  scripts/                     install.ps1  install.sh  enable-lan-dns.ps1  make-autostart.ps1
+    web/                       Flask app, JSON API, feed and summary builders, templates, static,
+                               and Lens: lens.py, tls.py, qr.py (a dependency-free QR encoder)
+  scripts/                     install.ps1  install.sh  enable-lan-dns.ps1  enable-lens.ps1
+                               make-autostart.ps1
   tests/                       the offline test suite
   docs/                        the documents listed below
   data/                        runtime only, gitignored: homesoc.db, feeds/, logs/
@@ -414,6 +452,7 @@ They are offline and fixture-driven; tests that would touch the real network are
 - [docs/GUIDE_HOME_PROTECTION.md](docs/GUIDE_HOME_PROTECTION.md) — how to actually secure a home network, whether or not
   you use this tool.
 - [docs/NETWORK_DNS_SETUP.md](docs/NETWORK_DNS_SETUP.md) — the full LAN DNS walkthrough, router by router.
+- [docs/LENS_SETUP.md](docs/LENS_SETUP.md) — Lens: certificates, pairing a phone, stickers, and the honest limits.
 - [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md) — what to do about each kind of finding.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together, for anyone reading the code.
 - [docs/SPEC.md](docs/SPEC.md) and [docs/SPEC_ADDENDUM.md](docs/SPEC_ADDENDUM.md) — the build contract this was written

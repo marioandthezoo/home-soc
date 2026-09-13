@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
+</head>
+<body class="desk" data-page="{{ page }}" data-refresh="0">
+<main class="main pair-main">
+
+  <header class="topbar">
+    <h1 class="page-title">Pair a phone</h1>
+    <div class="topbar-stats">
+      <a class="chip" href="/lens/stickers">Sticker sheet</a>
+      <a class="chip" href="/devices">Devices</a>
+      <a class="chip" href="/">Dashboard</a>
+    </div>
+  </header>
+
+  <div class="pair-grid">
+    <section class="card panel">
+      <h2>Before you pair</h2>
+      <ul class="pair-checks">
+        {% for chk in checks %}
+        <li class="check check-{{ chk.level }}">
+          <span class="check-pill check-pill-{{ chk.level }}">{{ 'OK' if chk.level == 'ok' else ('Check' if chk.level == 'warn' else 'Fix') }}</span>
+          <div class="check-text">
+            <b>{{ chk.title }}</b>
+            <p class="muted small">{{ chk.detail }}</p>
+            {% if chk.fix %}
+            <ol class="steps">
+              {% for step in chk.fix %}<li><code>{{ step }}</code></li>{% endfor %}
+            </ol>
+            {% endif %}
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+      {% if blocked %}
+      <p class="warn-strip">Pairing is held back until the {{ blocked|length }} item{{ '' if blocked|length == 1 else 's' }} marked
+        <b>Fix</b> above {{ 'is' if blocked|length == 1 else 'are' }} sorted. Reload this page afterwards to mint a code.</p>
+      {% endif %}
+    </section>
+
+    <section class="card panel pair-qr-panel">
+      <h2>Scan this with the phone</h2>
+      {% if qr %}
+        <div class="qr-wrap">{{ qr }}</div>
+        <p class="pair-url mono">{{ claim_url }}</p>
+        <p class="muted small">
+          The code is single-use and expires in five minutes{% if pairing.expires_at %} (at {{ pairing.expires_at }}){% endif %}.
+          Reload this page for a fresh one. Open the phone's camera app, point it at the square above, and tap the link.
+        </p>
+        <ol class="steps pair-steps">
+          <li>The phone will warn that the certificate is not trusted — this is expected for a self-signed certificate on your own LAN.</li>
+          <li>Check the fingerprint the phone shows against the one printed below, then choose <b>Advanced → Proceed</b>.</li>
+          <li>Lens claims the code, stores a token on the phone, and opens the viewfinder.</li>
+        </ol>
+      {% elif not blocked %}
+        <p class="warn-strip">The pairing service is not installed in this build, so no code could be minted.
+          Everything else on this page is live. Install the Lens package and reload.</p>
+      {% else %}
+        <p class="muted">No pairing code was minted — fix the items on the left first.</p>
+      {% endif %}
+    </section>
+
+    <section class="card panel">
+      <h2>Certificate fingerprint (SHA-256)</h2>
+      {% if fingerprint %}
+      {# The groups are visual only: the separating ":" stays in the markup (hidden from view
+         by .fp-sep) so selecting the line and copying it yields the real colon-separated
+         fingerprint, which is exactly what the user is told to compare against. #}
+      <p class="fingerprint mono">{% for group in fingerprint %}{% if not loop.first %}<span class="fp-sep">:</span>{% endif %}<span class="fp-group">{{ group }}</span>{% endfor %}</p>
+      <p class="muted small">Compare this with the fingerprint the phone shows when it warns about the certificate.
+        They must match exactly. If they do not, stop: something else answered on that address.</p>
+      {% if cert.not_after %}<p class="muted small">Valid until {{ cert.not_after[:10] }}{% if cert.sans %} · covers {{ cert.sans|join(', ') }}{% endif %}.</p>{% endif %}
+      {% else %}
+      <p class="muted">No certificate to fingerprint yet. {{ cert.error or 'Generate one with the command above.' }}</p>
+      {% endif %}
+      <h3>Afterwards</h3>
+      <ul class="plain-list muted small">
+        <li>Paired phones expire after {{ ttl_days }} day{{ '' if ttl_days == 1 else 's' }}{{ ' (never, while token_ttl_days is 0)' if not ttl_days else '' }}.</li>
+        <li>List them with <code>python -m homesoc lens tokens</code>.</li>
+        <li>Revoke one with <code>python -m homesoc lens revoke &lt;id&gt;</code>, or all of them with <code>--all</code>.</li>
+        <li>Lens is read-only unless <code>[lens] allow_actions</code> is true (currently {{ 'on' if lens.allow_actions else 'off' }}).</li>
+      </ul>
+    </section>
+  </div>
+</main>
+</body>
+</html>

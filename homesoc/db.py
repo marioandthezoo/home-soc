@@ -9,22 +9,29 @@ are lock-free (WAL mode lets them proceed while a write is in flight).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import re
+import secrets
 import sqlite3
 import threading
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from homesoc import paths
 from homesoc.util import json_dumps, utcnow_iso
+from homesoc.util import parse_iso as util_parse_iso
+from homesoc.util import to_iso as util_to_iso
 
 logger = logging.getLogger(__name__)
 
 _WRITE_LOCK = threading.RLock()
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Complete schema (spec §4). Column order and names are normative — other packages
 # write INSERTs against them. Keep DDL idempotent so init_schema can run at every start.
@@ -274,14 +281,48 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+# Version 2 (SPEC addendum B5): the two tables Lens needs. Both are owned by the web
+# package — this module only creates them. A database written by an earlier version of
+# Home SOC gains them on the next start with every existing row untouched, which is what
+# `tests/test_lens_auth.py::test_v1_database_upgrades_and_keeps_its_rows` proves.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS lens_tokens (
+    id           INTEGER PRIMARY KEY,
+    token_hash   TEXT NOT NULL UNIQUE,
+    label        TEXT NOT NULL,
+    scopes       TEXT NOT NULL DEFAULT 'read',
+    created_at   TEXT NOT NULL,
+    last_seen_at TEXT,
+    last_ip      TEXT,
+    expires_at   TEXT,
+    revoked_at   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lens_tags (
+    id           INTEGER PRIMARY KEY,
+    code         TEXT NOT NULL UNIQUE,
+    kind         TEXT NOT NULL,
+    -- B5: deleting a device leaves the tag behind, unlearned, rather than dangling (or
+    -- blocking the delete, which is what a plain REFERENCES would do with foreign keys on).
+    device_id    INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    label        TEXT,
+    created_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL,
+    last_seen_at TEXT,
+    scans        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_lens_tags_device ON lens_tags(device_id);
+"""
+
 # Ordered list of (version, ddl). Future schema changes append here; init_schema
 # applies every version newer than the highest recorded in schema_migrations.
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1)]
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
 
 TABLES: tuple[str, ...] = (
     "schema_migrations", "settings", "feeds", "devices", "device_sightings", "services", "vulns",
     "host_checks", "software", "persistence", "file_checks", "findings", "finding_events", "scans",
     "events", "metrics", "dns_queries", "dns_hourly", "dns_overrides", "reputation", "notifications", "jobs",
+    "lens_tokens", "lens_tags",
 )
 
 
@@ -366,11 +407,19 @@ def writemany(conn: sqlite3.Connection, sql: str, seq: Iterable[Sequence[Any] | 
 
 
 def query(conn: sqlite3.Connection, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> list[sqlite3.Row]:
-    return conn.execute(sql, params).fetchall()
+    # Reads take the lock too. One connection is shared by the web threads, the scheduler and the
+    # DNS server, and sqlite3's connection-level execute() keeps its statement state on the
+    # connection: two threads interleaving there do not merely block, they corrupt each other's
+    # cursors. That surfaces as InterfaceError("no more rows available"/"bad parameter or other
+    # API misuse") and, worse, as one() returning None for a row that exists. The lock is an
+    # RLock, so nesting inside transaction() is fine, and a home-sized query load does not care.
+    with _WRITE_LOCK:
+        return conn.execute(sql, params).fetchall()
 
 
 def one(conn: sqlite3.Connection, sql: str, params: Sequence[Any] | dict[str, Any] = ()) -> sqlite3.Row | None:
-    return conn.execute(sql, params).fetchone()
+    with _WRITE_LOCK:
+        return conn.execute(sql, params).fetchone()
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -506,6 +555,335 @@ def purge_older_than(conn: sqlite3.Connection, table: str, ts_column: str, cutof
         return int(cur.rowcount)
 
 
+# -------------------------------------------------------------------------- Lens
+#
+# Pairing and token primitives for Lens (SPEC addendum B4/B10). They live here rather
+# than in the web package because the web package is built in three parallel pieces and
+# all of them need these: L1 mints from the CLI, L2 verifies on every API call, L3 hands
+# the token to the phone. Import them as ``from homesoc import db`` and call
+# ``db.lens_mint_token(...)`` — there is no other home for shared state than the module
+# that owns the tables.
+#
+# The security rules of B10 are enforced here, not by the callers:
+#   * a token is 32 bytes from ``secrets.token_urlsafe`` and is returned exactly once;
+#   * only its SHA-256 is stored, and comparison is ``secrets.compare_digest``;
+#   * expiry, revocation and the ``max_tokens`` ceiling are checked on every use;
+#   * pairing codes are single-use, short-lived, stored as hashes, and rate-limited.
+
+#: Entropy of a paired-phone token, in bytes, before url-safe base64 expansion.
+LENS_TOKEN_BYTES = 32
+#: Scopes a token may carry. ``act`` additionally requires ``lens.allow_actions``.
+LENS_SCOPES: tuple[str, ...] = ("read", "act")
+#: Pairing codes: 8 characters from an alphabet with no 0/O or 1/I/L to mistype,
+#: ~39 bits of entropy, which the claim rate limit keeps far out of guessing range.
+LENS_PAIRING_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+LENS_PAIRING_LENGTH = 8
+LENS_PAIRING_TTL_SECONDS = 300
+#: Claim attempts allowed per source address, and the lock-out that follows (B4).
+LENS_CLAIM_LIMIT = 10
+LENS_CLAIM_WINDOW_SECONDS = 3600
+
+#: Control characters are stripped from every phone-supplied label before it is stored,
+#: logged or printed (see lens_mint_token). Same class lens.normalise_code refuses.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+_LENS_PAIRING_PREFIX = "lens.pairing."
+_LENS_CLAIM_PREFIX = "lens.claim."
+_LENS_CODE_STRIP = str.maketrans("", "", " \t-_")
+
+
+class LensError(RuntimeError):
+    """A Lens token or pairing operation was refused."""
+
+
+class LensTokenLimit(LensError):
+    """``lens.max_tokens`` phones are already paired."""
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _iso_in(seconds: float) -> str:
+    return util_to_iso(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+
+
+def lens_normalise_scopes(scopes: str | Iterable[str] | None) -> str:
+    """Canonical ``read``/``read,act`` text. Unknown scopes are dropped, ``read`` is implied."""
+    if scopes is None:
+        parts: list[str] = []
+    elif isinstance(scopes, str):
+        parts = [p.strip().lower() for p in scopes.replace(" ", ",").split(",")]
+    else:
+        parts = [str(p).strip().lower() for p in scopes]
+    kept = [s for s in LENS_SCOPES if s in parts]
+    if "read" not in kept:
+        kept.insert(0, "read")
+    return ",".join(kept)
+
+
+def lens_has_scope(scopes: str | None, scope: str) -> bool:
+    return scope in lens_normalise_scopes(scopes).split(",")
+
+
+def _lens_token_row(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    """Row as a dict without ``token_hash`` — nothing that verifies a token leaves this module."""
+    data = dict(row)
+    data.pop("token_hash", None)
+    data["scopes"] = lens_normalise_scopes(data.get("scopes"))
+    data["active"] = not data.get("revoked_at") and not _lens_expired(data.get("expires_at"))
+    return data
+
+
+def _lens_expired(expires_at: Any) -> bool:
+    return bool(expires_at) and str(expires_at) <= utcnow_iso()
+
+
+def lens_active_tokens(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Paired phones that could authenticate right now."""
+    rows = query(
+        conn,
+        "SELECT * FROM lens_tokens WHERE revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY id",
+        (utcnow_iso(),),
+    )
+    return [_lens_token_row(r) for r in rows]
+
+
+def lens_list_tokens(conn: sqlite3.Connection, *, include_revoked: bool = True) -> list[dict[str, Any]]:
+    """Every paired phone for the ``lens tokens`` command and the pairing page."""
+    sql = "SELECT * FROM lens_tokens"
+    if not include_revoked:
+        sql += " WHERE revoked_at IS NULL"
+    return [_lens_token_row(r) for r in query(conn, sql + " ORDER BY id")]
+
+
+def lens_mint_token(
+    conn: sqlite3.Connection,
+    *,
+    label: str,
+    scopes: str | Iterable[str] = "read",
+    ttl_days: int = 90,
+    max_tokens: int = 10,
+) -> dict[str, Any]:
+    """Create a paired-phone token.
+
+    Returns the stored row **plus a ``token`` key holding the secret**, which is the only
+    time it exists anywhere: the database keeps nothing but its SHA-256. ``ttl_days`` of 0
+    means the token never expires. Raises :class:`LensTokenLimit` once ``max_tokens``
+    phones are already paired, so a stolen pairing code cannot mint an unbounded number.
+    """
+    # The label arrives in the /api/lens/claim body, so it is attacker-controlled the moment a
+    # pairing code leaks. It is stored, written into an events row, and printed by
+    # `python -m homesoc lens tokens` in a fixed-width table — so CR/LF and ANSI escapes in it
+    # would let the holder of a pairing code forge or hide a row in the very listing the owner
+    # reads to decide what to revoke. Strip control characters, exactly as lens.normalise_code
+    # does for the other hostile string on this surface.
+    clean_label = (_CONTROL_CHARS.sub("", str(label or "")).strip() or "phone")[:64].strip() or "phone"
+    limit = max(1, int(max_tokens))
+    active = lens_active_tokens(conn)
+    if len(active) >= limit:
+        raise LensTokenLimit(
+            f"{len(active)} of {limit} Lens tokens are already paired; revoke one "
+            f"(python -m homesoc lens revoke <id>) or raise lens.max_tokens"
+        )
+    token = secrets.token_urlsafe(LENS_TOKEN_BYTES)
+    expires_at = _iso_in(int(ttl_days) * 86400) if int(ttl_days) > 0 else None
+    row_id = write(
+        conn,
+        "INSERT INTO lens_tokens(token_hash, label, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+        (_sha256_hex(token), clean_label, lens_normalise_scopes(scopes), utcnow_iso(), expires_at),
+    )
+    record_event(conn, "info", "lens", f"paired a new device: {clean_label}",
+                 {"token_id": row_id, "scopes": lens_normalise_scopes(scopes), "expires_at": expires_at})
+    stored = one(conn, "SELECT * FROM lens_tokens WHERE id = ?", (row_id,))
+    out = _lens_token_row(stored) if stored is not None else {"id": row_id}
+    out["token"] = token
+    return out
+
+
+def lens_verify_token(
+    conn: sqlite3.Connection, token: str | None, *, ip: str | None = None, touch: bool = True
+) -> dict[str, Any] | None:
+    """Return the token's row when it is valid, otherwise ``None``.
+
+    Valid means: it exists, it has not been revoked and it has not expired. The presented
+    value is hashed and compared with :func:`secrets.compare_digest`, so neither the
+    lookup nor the comparison leaks the stored secret through timing. On success
+    ``last_seen_at``/``last_ip`` are refreshed (B4) unless ``touch`` is false.
+    """
+    presented = str(token or "").strip()
+    if not presented or len(presented) > 512:
+        return None
+    digest = _sha256_hex(presented)
+    row = one(conn, "SELECT * FROM lens_tokens WHERE token_hash = ?", (digest,))
+    if row is None or not secrets.compare_digest(str(row["token_hash"]), digest):
+        return None
+    if row["revoked_at"] or _lens_expired(row["expires_at"]):
+        return None
+    if touch:
+        write(
+            conn,
+            "UPDATE lens_tokens SET last_seen_at = ?, last_ip = ? WHERE id = ?",
+            (utcnow_iso(), (str(ip)[:45] if ip else row["last_ip"]), int(row["id"])),
+        )
+        row = one(conn, "SELECT * FROM lens_tokens WHERE id = ?", (int(row["id"]),)) or row
+    return _lens_token_row(row)
+
+
+def lens_revoke_token(conn: sqlite3.Connection, token_id: int) -> bool:
+    """Revoke one paired phone. Returns False when the id is unknown or already revoked."""
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE lens_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            (utcnow_iso(), int(token_id)),
+        )
+        conn.commit()
+        changed = int(cur.rowcount)
+    if changed:
+        record_event(conn, "info", "lens", f"revoked Lens token {int(token_id)}", {"token_id": int(token_id)})
+    return bool(changed)
+
+
+def lens_revoke_all_tokens(conn: sqlite3.Connection) -> int:
+    """Revoke every paired phone; returns how many were still active."""
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE lens_tokens SET revoked_at = ? WHERE revoked_at IS NULL", (utcnow_iso(),)
+        )
+        conn.commit()
+        changed = int(cur.rowcount)
+    if changed:
+        record_event(conn, "warning", "lens", f"revoked all {changed} Lens token(s)", {"count": changed})
+    return changed
+
+
+# ------------------------------------------------------------ pairing codes
+
+
+def lens_new_pairing_code(conn: sqlite3.Connection, *, ttl_seconds: int = LENS_PAIRING_TTL_SECONDS) -> str:
+    """Mint a single-use pairing code, returned once and stored only as a hash.
+
+    Minting first clears any earlier code: the pairing page shows one code at a time, and
+    a code left on a screen someone walked away from should not still work.
+    """
+    lens_clear_pairing_codes(conn)
+    code = "".join(secrets.choice(LENS_PAIRING_ALPHABET) for _ in range(LENS_PAIRING_LENGTH))
+    set_setting(
+        conn,
+        _LENS_PAIRING_PREFIX + _sha256_hex(code),
+        {"created_at": utcnow_iso(), "expires_at": _iso_in(max(1, int(ttl_seconds)))},
+    )
+    return code
+
+
+def lens_normalise_pairing_code(code: str | None) -> str:
+    """Accept what a person can type: spaces, dashes and lower case all work."""
+    return str(code or "").translate(_LENS_CODE_STRIP).strip().upper()[:32]
+
+
+def lens_consume_pairing_code(conn: sqlite3.Connection, code: str | None) -> bool:
+    """Spend a pairing code. True exactly once per code, and never after it expires."""
+    presented = lens_normalise_pairing_code(code)
+    if not presented:
+        return False
+    digest = _sha256_hex(presented)
+    now = utcnow_iso()
+    matched = False
+    for key, raw in settings_with_prefix(conn, _LENS_PAIRING_PREFIX).items():
+        stored = key[len(_LENS_PAIRING_PREFIX):]
+        state = _loads_dict(raw)
+        if str(state.get("expires_at", "")) <= now:
+            delete_setting(conn, key)
+            continue
+        if secrets.compare_digest(stored, digest):
+            delete_setting(conn, key)
+            matched = True
+    return matched
+
+
+def lens_clear_pairing_codes(conn: sqlite3.Connection) -> int:
+    """Invalidate every outstanding pairing code (B10: also when ``lens.enabled`` goes false)."""
+    keys = list(settings_with_prefix(conn, _LENS_PAIRING_PREFIX))
+    for key in keys:
+        delete_setting(conn, key)
+    return len(keys)
+
+
+# ------------------------------------------------------------ claim rate limit
+
+
+def lens_claim_attempt(
+    conn: sqlite3.Connection,
+    ip: str | None,
+    *,
+    limit: int = LENS_CLAIM_LIMIT,
+    window_seconds: int = LENS_CLAIM_WINDOW_SECONDS,
+) -> tuple[bool, int]:
+    """Count one ``/api/lens/claim`` attempt from ``ip``.
+
+    Returns ``(allowed, retry_after_seconds)``. The first ``limit`` attempts in a window
+    are allowed; the next one locks that address out for a further window and writes an
+    ``events`` row (B4). The counter is keyed on a hash of the address so the settings
+    table does not accumulate a list of who tried.
+    """
+    source = str(ip or "unknown")[:45]
+    key = _LENS_CLAIM_PREFIX + _sha256_hex(source)[:16]
+    now = datetime.now(timezone.utc)
+    now_iso = util_to_iso(now)
+    state = _loads_dict(get_setting(conn, key, "") or "")
+    blocked_until = str(state.get("blocked_until") or "")
+    if blocked_until > now_iso:
+        return False, _seconds_until(blocked_until, now)
+    window_start = str(state.get("window_start") or "")
+    count = int(state.get("count") or 0)
+    if not window_start or _seconds_until(window_start, now) < -window_seconds:
+        window_start, count = now_iso, 0
+    count += 1
+    if count > max(1, int(limit)):
+        until = util_to_iso(now + timedelta(seconds=window_seconds))
+        set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": until})
+        record_event(conn, "warning", "lens",
+                     "too many Lens pairing attempts; refusing this source for an hour",
+                     {"attempts": count, "limit": int(limit), "blocked_until": until, "source": source})
+        return False, int(window_seconds)
+    set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": ""})
+    return True, 0
+
+
+def lens_claim_reset(conn: sqlite3.Connection, ip: str | None) -> None:
+    """Forget one address's attempt counter — called after a successful claim."""
+    delete_setting(conn, _LENS_CLAIM_PREFIX + _sha256_hex(str(ip or "unknown")[:45])[:16])
+
+
+def lens_purge_claim_counters(conn: sqlite3.Connection, *, older_than_seconds: int = 2 * LENS_CLAIM_WINDOW_SECONDS) -> int:
+    """Drop rate-limit counters nobody is counting any more (housekeeping)."""
+    cutoff = util_to_iso(datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds))
+    removed = 0
+    for key, raw in settings_with_prefix(conn, _LENS_CLAIM_PREFIX).items():
+        state = _loads_dict(raw)
+        newest = max(str(state.get("window_start") or ""), str(state.get("blocked_until") or ""))
+        if newest < cutoff:
+            delete_setting(conn, key)
+            removed += 1
+    return removed
+
+
+def _seconds_until(iso: str, now: datetime) -> int:
+    parsed = util_parse_iso(iso)
+    if parsed is None:
+        return 0
+    return int((parsed - now).total_seconds())
+
+
+def _loads_dict(raw: str) -> dict[str, Any]:
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     counts: dict[str, int] = {}
     for table in TABLES:
@@ -539,4 +917,29 @@ __all__ = [
     "last_scans",
     "purge_older_than",
     "table_counts",
+    # Lens (SPEC addendum B4/B10) — the import path for L2 and L3 is homesoc.db.
+    "LensError",
+    "LensTokenLimit",
+    "LENS_TOKEN_BYTES",
+    "LENS_SCOPES",
+    "LENS_PAIRING_ALPHABET",
+    "LENS_PAIRING_LENGTH",
+    "LENS_PAIRING_TTL_SECONDS",
+    "LENS_CLAIM_LIMIT",
+    "LENS_CLAIM_WINDOW_SECONDS",
+    "lens_normalise_scopes",
+    "lens_has_scope",
+    "lens_mint_token",
+    "lens_verify_token",
+    "lens_list_tokens",
+    "lens_active_tokens",
+    "lens_revoke_token",
+    "lens_revoke_all_tokens",
+    "lens_new_pairing_code",
+    "lens_normalise_pairing_code",
+    "lens_consume_pairing_code",
+    "lens_clear_pairing_codes",
+    "lens_claim_attempt",
+    "lens_claim_reset",
+    "lens_purge_claim_counters",
 ]
