@@ -577,7 +577,7 @@ Sysmon's documented limitation is instructive: it "does not provide analysis of 
 Neither do most scanners. For a home user, an unexplained finding is worse than no finding, because it produces
 anxiety without an action.
 
-So every one of the ~88 IDs in `homesoc/findings/catalog.py` (1,366 lines for 88 findings — the remediation text is
+So every one of the ~92 IDs in `homesoc/findings/catalog.py` (1,501 lines for 92 findings — the remediation text is
 most of the file) carries a `rationale`, a list of click-by-click `remediation` steps written for Windows 11 Home with
 a PowerShell alternative where one exists, and `refs`. The `/summary` page and `python -m homesoc report --format md`
 embed those steps directly in the open worklist, so the exported Markdown report is actionable by someone who has

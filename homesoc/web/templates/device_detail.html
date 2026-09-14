@@ -63,6 +63,77 @@
   </div>
 </section>
 
+{# Dependencies and blast radius (SPEC addendum C7). Every row states how the link was
+   established; nothing here is drawn from anything but the edges the topology package produced. #}
+<section class="card">
+  <div class="card-head">
+    <h2>Depends on · Depended on by · If this fails</h2>
+    <a class="link" href="/map">Dependency map →</a>
+  </div>
+  {% if dep.available %}
+  <div class="grid grid-3">
+    <div>
+      <h3>Depends on</h3>
+      <div class="tbl-wrap tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>What</th><th>How we know</th></tr></thead>
+        <tbody>
+          {% for r in dep.depends_on %}
+          <tr>
+            <td class="wrap">{% if r.device_id %}<a href="/devices/{{ r.device_id }}">{{ r.label }}</a>{% else %}{{ r.label }}{% endif %}
+              <br><span class="muted small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span></td>
+            <td class="wrap">{{ badge(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
+          </tr>
+          {% else %}<tr><td colspan="2" class="empty">Nothing recorded. Home SOC has seen no lookups,
+            advertisements or port mappings from this device.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+    <div>
+      <h3>Depended on by</h3>
+      <div class="tbl-wrap tbl-scroll">
+      <table class="tbl">
+        <thead><tr><th>What</th><th>How we know</th></tr></thead>
+        <tbody>
+          {% for r in dep.dependents %}
+          <tr>
+            <td class="wrap">{% if r.device_id %}<a href="/devices/{{ r.device_id }}">{{ r.label }}</a>{% else %}{{ r.label }}{% endif %}
+              <br><span class="muted small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span></td>
+            <td class="wrap">{{ badge(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
+          </tr>
+          {% else %}<tr><td colspan="2" class="empty">No confirmed consumers. Nothing has been observed
+            depending on this device, and Home SOC will not guess which devices might.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+      </div>
+    </div>
+    <div>
+      <h3>If this fails</h3>
+      {% if dep.blast %}
+      <p>{{ dep.blast.headline }}</p>
+      <p>
+        {{ badge('fail', dep.blast.counts.offline ~ ' unreachable') }}
+        {{ badge('warn', dep.blast.counts.degraded ~ ' degraded') }}
+        {{ badge('ok', dep.blast.counts.unaffected ~ ' unaffected') }}
+      </p>
+      {% if dep.blast.services_lost %}
+      <p class="small">The house loses: {% for s in dep.blast.services_lost %}{{ s }}{% if not loop.last %}; {% endif %}{% endfor %}.</p>
+      {% endif %}
+      <p class="muted small">{{ badge(dep.blast.confidence) }}
+        {{ dep.blast.evidence or 'Nothing like this has actually been recorded — this follows from the
+        shape of the network, not from a failure Home SOC has watched.' }}</p>
+      {% else %}
+      <p class="muted small">No blast radius has been worked out for this device yet.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% else %}
+  <p class="empty">{{ dep.reason }}</p>
+  {% endif %}
+  <p class="muted small push-down">{{ dep.note }} <a class="link" href="{{ dep.doc }}">Why, and what would make it better →</a></p>
+</section>
+
 <div class="grid grid-2">
   <section class="card">
     <h2>Vulnerabilities</h2>

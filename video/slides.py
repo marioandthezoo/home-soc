@@ -24,11 +24,71 @@ them in the page, so a reworded label can never silently overrun its box.
 
 from __future__ import annotations
 
+import datetime as _dt
 import logging
+import sqlite3
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 logger = logging.getLogger(__name__)
+
+_HERE = Path(__file__).resolve().parent
+_PROJECT_ROOT = _HERE.parent
+#: The video's own database — never the owner's. Slides that quote a figure the dashboard
+#: also shows read it from here, so the two cannot drift apart between renders.
+DEMO_DB = _HERE / "demo_data" / "homesoc.db"
+
+
+def _catalogue_counts() -> tuple[int, int]:
+    """``(rules, categories)`` from the product's findings catalogue."""
+    try:
+        sys.path.insert(0, str(_HERE))
+        from script import catalogue_counts  # type: ignore[import-not-found]
+
+        return catalogue_counts()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not read the findings catalogue (%s)", exc)
+        raise
+
+
+def _device_count() -> str:
+    """How many devices the demo network has, spelled out.
+
+    The first-run slide said "a twenty-device network" while the narration spoken over it
+    said "an eighteen-device network" and the topbar behind it read 17 / 18.
+    """
+    from script import spell  # type: ignore[import-not-found]  # noqa: PLC0415
+
+    sys.path.insert(0, str(_HERE))
+    rows = _demo_query("SELECT COUNT(*) AS n FROM devices")
+    word = spell(int(rows[0]["n"]))
+    return f"{'an' if word[:1] in 'aeiou' else 'a'} {word}"
+
+
+def _schema_version() -> int:
+    """``homesoc.db.SCHEMA_VERSION`` — what a fresh install actually prints."""
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+    from homesoc import db as _db  # noqa: PLC0415
+
+    return int(_db.SCHEMA_VERSION)
+
+
+def _demo_query(sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
+    """Read-only query against ``video/demo_data/homesoc.db``. Never the real data/."""
+    if not DEMO_DB.exists():
+        raise FileNotFoundError(
+            f"{DEMO_DB} does not exist — run `python video/seed_demo.py` before rendering "
+            "slides that quote the demo network."
+        )
+    conn = sqlite3.connect(f"file:{DEMO_DB.as_posix()}?mode=ro", uri=True, timeout=10)
+    try:
+        conn.row_factory = sqlite3.Row
+        return list(conn.execute(sql, tuple(params)))
+    finally:
+        conn.close()
 
 # --------------------------------------------------------------------------- palette / metrics
 
@@ -47,6 +107,12 @@ SEV_HIGH = "#f76b15"
 SEV_MEDIUM = "#ffb224"
 SEV_LOW = "#46a758"
 SEV_INFO = "#3e63dd"
+
+#: printed-sticker colours, shared with ``video/scene_render.py`` so the sticker on the
+#: explanatory slide and the sticker in the illustrated scene are the same object
+STICKER = "#f6f7fb"
+STICKER_LINE = "#dfe2ea"
+STICKER_INK = "#1a1d27"
 
 SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
 MONO = 'ui-monospace, "Cascadia Mono", "Consolas", "SF Mono", Menlo, monospace'
@@ -220,6 +286,10 @@ def title() -> str:
         "Windows posture",
         "Microsoft Defender",
         "LAN DNS sinkhole",
+        # The headline addition of v2, and the thing the narration over this very card ends
+        # on ("you do not know which of four identical white boxes it is"). Without it the
+        # title card advertised the v1 feature set for the first nineteen seconds.
+        "Lens \u00b7 point your phone at a device",
     )
     body = f"""
 <div class="slide title-slide">
@@ -367,11 +437,17 @@ _RESOLVER = Rect(360, 566, 646, 192)
 _LAN = Rect(8, 598, 222, 132)
 _UPSTREAM = Rect(1208, 598, 296, 124)
 
+#: Lens: the phone that reads the same database, over HTTPS, with its own scoped token.
+#: It sits *outside* the process boundary because it is a different device - which is the
+#: whole point of the notch below, and the reason the notch now starts at column D's foot
+#: rather than halfway down the diagram.
+_LENS_PHONE = Rect(1186, 476, 318, 112)
+
 _BOUND_L, _BOUND_T, _BOUND_R = 252.0, 10.0, 1512.0
 # BG composited with the boundary's rgba(62,99,221,.045) wash: the exact colour inside the
 # process outline, so a label backdrop drawn there is invisible.
 _INSIDE_BG = "#111520"
-_BOUND_SHOULDER_Y, _BOUND_NOTCH_X, _BOUND_B = 540.0, 1180.0, 762.0
+_BOUND_SHOULDER_Y, _BOUND_NOTCH_X, _BOUND_B = 436.0, 1160.0, 762.0
 
 _CAPTION_Y = 90.0
 
@@ -503,8 +579,12 @@ def _scanner_panel() -> str:
 
 def _engine_panel() -> str:
     """Column C: catalogue, lifecycle and score -- the part that owns a finding's life story."""
+    # Read from the catalogue, not typed: the literal here said 88 while the code had 92
+    # and the narration said eighty-nine. script.catalogue_counts() is the same import the
+    # voice uses, so the slide and the voice cannot disagree.
+    rules, categories = _catalogue_counts()
     cards = (
-        ("CATALOGUE", "88 rules \u00b7 16 categories",
+        ("CATALOGUE", f"{rules} rules \u00b7 {categories} categories",
          "title, why it matters, numbered fix steps"),
         ("LIFECYCLE", "open \u2192 acknowledged \u2192 resolved",
          "auto-resolves only after a complete run"),
@@ -529,25 +609,64 @@ def _engine_panel() -> str:
 
 
 def _output_panel() -> str:
-    """Column D: everything a person actually reads."""
+    """Column D: everything a person actually reads - now including the phone."""
     rows = (
-        ("Dashboard", "127.0.0.1:8787", "overview \u00b7 findings \u00b7 devices \u00b7 vulns \u00b7 host \u00b7 DNS", SEV_INFO),
-        ("Activity feed", "/feed", "one stream of everything that happened \u00b7 also RSS", SEV_LOW),
-        ("Remediation summary", "/summary", "found vs fixed \u00b7 time-to-fix \u00b7 the open worklist", SEV_MEDIUM),
-        ("Notifications", "outbound", "ntfy \u00b7 Discord \u00b7 webhook \u00b7 Windows toast \u00b7 digest", SEV_HIGH),
+        ("Dashboard", "127.0.0.1:8787", "overview \u00b7 findings \u00b7 devices \u00b7 vulns \u00b7 host \u00b7 DNS",
+         SEV_INFO, False),
+        ("Activity feed", "/feed", "one stream of everything that happened \u00b7 also RSS",
+         SEV_LOW, False),
+        ("Remediation summary", "/summary", "found vs fixed \u00b7 time-to-fix \u00b7 the open worklist",
+         SEV_MEDIUM, False),
+        ("Notifications", "outbound", "ntfy \u00b7 Discord \u00b7 webhook \u00b7 toast \u00b7 digest",
+         SEV_HIGH, False),
+        ("Lens", "/lens \u00b7 TLS", "point a phone at a device and see what it knows",
+         ACCENT, True),
     )
     out = [_box(_COL_D)]
-    rh, gap = 70.0, 9.0
-    y = _COL_D.y + 14
-    for name, tag, sub, colour in rows:
+    # five rows in the height four used to have: 57 + 5 still clears the type at
+    # 17.5/13 px, and the alternative - a sixth column - would crowd the diagram.
+    rh, gap = 57.0, 5.0
+    y = _COL_D.y + 11
+    for name, tag, sub, colour, is_lens in rows:
         r = Rect(_COL_D.x + 14, y, _COL_D.w - 28, rh)
         tx, mx = r.inner(14)
-        out.append(_box(r, fill=PANEL_2, rx=8))
-        out.append(f'<rect x="{r.x:g}" y="{r.y + 12:g}" width="3" height="{rh - 24:g}" rx="1.5" fill="{colour}"/>')
-        out.append(_t(tx + 6, r.y + 30, name, maxx=mx - 130, size=18.5, weight=650))
-        out.append(_t(mx, r.y + 30, tag, maxx=mx + 1, size=13, fill=MUTED, anchor="end", mono=True))
-        out.append(_t(tx + 6, r.y + 53, sub, maxx=mx, size=13.5, fill=MUTED))
+        out.append(_box(r, fill=PANEL_2, rx=8, stroke=ACCENT if is_lens else LINE))
+        out.append(f'<rect x="{r.x:g}" y="{r.y + 10:g}" width="3" height="{rh - 20:g}" rx="1.5" fill="{colour}"/>')
+        out.append(_t(tx + 6, r.y + 25, name, maxx=mx - 108, size=17.5, weight=650))
+        out.append(_t(mx, r.y + 25, tag, maxx=mx + 1, size=12.5, fill=MUTED, anchor="end", mono=True))
+        out.append(_t(tx + 6, r.y + 45, sub, maxx=mx, size=13, fill=MUTED))
         y += rh + gap
+    return "".join(out)
+
+
+def _lens_phone() -> str:
+    """The phone, drawn outside the process boundary, and the link that reaches it."""
+    out: list[str] = []
+    r = _LENS_PHONE
+
+    # the arrow out of the Lens row, crossing the boundary on its way to the phone
+    ax = 1230.0
+    out.append(_line(ax, _COL_D.bottom - 10, ax, r.y - 6, stroke=ACCENT, width=2.4,
+                     marker="ah-accent"))
+    # the label sits below the boundary line, on its own backdrop, so neither the
+    # dashes nor the text has to survive being drawn through the other
+    out.append(f'<rect x="1244" y="444" width="188" height="22" fill="{BG}"/>')
+    out.append(_t(1250, 460, "HTTPS \u00b7 scoped read-only token", maxx=1432, size=12.5,
+                  fill=MUTED))
+
+    # solid, not dashed: the legend spends the dashed outline on "one OS process", and
+    # the point of this box is that the phone is a different machine altogether
+    out.append(_box(r, fill=PANEL_2, stroke=ACCENT, stroke_width=1.6))
+    tx, mx = r.inner(14)
+    out.append(_t(tx, r.y + 28, "Your phone", maxx=mx - 96, size=18.5, weight=650))
+    out.append(_t(mx, r.y + 28, "Chrome \u00b7 Android", maxx=mx + 1, size=12.5, fill=MUTED,
+                  anchor="end"))
+    for i, line in enumerate((
+        "the camera reads a barcode or a sticker,",
+        "the token resolves only on this PC,",
+        "and a phone is revoked on its own.",
+    )):
+        out.append(_t(tx, r.y + 54 + i * 18, line, maxx=mx, size=13, fill=MUTED))
     return "".join(out)
 
 
@@ -644,7 +763,8 @@ def _architecture_svg() -> str:
         f'<svg width="{_AW:g}" height="{_AH:g}" viewBox="0 0 {_AW:g} {_AH:g}" '
         'xmlns="http://www.w3.org/2000/svg" role="img" '
         'aria-label="Home SOC architecture: definition feeds, scanners, findings engine, outputs, '
-        'SQLite and the embedded DNS resolver, all inside one Python process.">',
+        'SQLite and the embedded DNS resolver, all inside one Python process - plus Lens, a phone '
+        'outside that process reading the same database over HTTPS with a scoped read-only token.">',
         "<defs>",
         _marker("ah-muted", MUTED),
         _marker("ah-accent", ACCENT),
@@ -727,6 +847,7 @@ def _architecture_svg() -> str:
                        marker="ah-muted"))
     parts.append(_t(692, 552, "dns_queries", maxx=800, size=12.5, fill=MUTED, mono=True))
 
+    parts.append(_lens_phone())
     parts.append(_dns_band())
     parts.append("</svg>")
     return "".join(parts)
@@ -750,14 +871,15 @@ svg {{ display: block; }}
   <header class="head">
     <h1>Architecture &mdash; one process, one database, one PC</h1>
     <p>Definitions come in on the left, the scanners look, the engine remembers, and everything you read
-      comes out on the right. It complements Defender: <b>not an antivirus engine, not an EDR</b>.</p>
+      comes out on the right &mdash; in a browser, or on your phone through Lens. It complements Defender:
+      <b>not an antivirus engine, not an EDR</b>.</p>
   </header>
   {_architecture_svg()}
   <div class="arch-legend">
     <span><b>{TRI} needs administrator</b> &mdash; Secure Boot, TPM and BitLocker report
       &ldquo;needs administrator&rdquo; rather than failing; so does the one inbound firewall rule that
       lets the LAN reach the resolver. Everything else runs as a normal user.</span>
-    <span style="margin-left:auto">dashed outline = one OS process</span>
+    <span style="margin-left:auto; white-space:nowrap">dashed outline = one OS process</span>
   </div>
 </div>
 """
@@ -776,30 +898,30 @@ _TERMINAL: tuple[tuple[str, str], ...] = (
     ("tag", "[Home SOC] installing dependencies ..."),
     ("out", "config: C:\\Users\\you\\Home_SOC\\config.toml (created from example with a random "
             "web.token - edit it to taste)"),
-    ("out", "database: C:\\Users\\you\\Home_SOC\\data\\homesoc.db (schema v1)"),
+    ("out", "database: C:\\Users\\you\\Home_SOC\\data\\homesoc.db (schema v{schema})"),
     ("out", "downloading first feeds (oui, kev) ..."),
     ("out", "&nbsp;&nbsp;kev: <span class='ok'>ok</span>"),
     ("out", "&nbsp;&nbsp;oui: <span class='ok'>ok</span>"),
     ("blank", ""),
     ("out", "Next: python -m homesoc run   (dashboard at "
             "<span class='url'>http://127.0.0.1:8787/login?token=Qh7dK2\u2026</span>)"),
-    ("log", "2026-09-07 09:14:02 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t0} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "scheduler started with 15 jobs"),
     ("hero", "Dashboard: <span class='url'>http://127.0.0.1:8787/login?token=Qh7dK2\u2026</span>"
              "  (Ctrl-C to stop)"),
-    ("log", "2026-09-07 09:14:03 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t1} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "job feeds starting"),
-    ("log", "2026-09-07 09:14:11 <span class='lvl'>INFO</span>    homesoc.feeds.updater: "
+    ("log", "{t2} <span class='lvl'>INFO</span>    homesoc.feeds.updater: "
             "feed kev updated: 1743210 bytes, 1412 entries, sha256=3b91f0c2ad4e"),
-    ("log", "2026-09-07 09:14:12 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t3} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "job discovery starting"),
-    ("log", "2026-09-07 09:14:33 <span class='lvl'>INFO</span>    homesoc.cli: "
+    ("log", "{t4} <span class='lvl'>INFO</span>    homesoc.cli: "
             "[discovery] sweep 254/254"),
-    ("log", "2026-09-07 09:14:36 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t5} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "job services starting"),
-    ("log", "2026-09-07 09:16:44 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t6} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "job vulns starting"),
-    ("log", "2026-09-07 09:16:51 <span class='lvl'>INFO</span>    homesoc.scheduler: "
+    ("log", "{t7} <span class='lvl'>INFO</span>    homesoc.scheduler: "
             "job host starting"),
 )
 
@@ -884,12 +1006,26 @@ def first_run() -> str:
 .side-chips {{ display: flex; gap: 8px; flex-wrap: wrap; }}
 .side-chips .chip {{ font-size: 13px; padding: 5px 12px; }}
 """
+    # The terminal used to carry a literal `schema v1` and eight literal 2026-09-07
+    # timestamps — the day of the v1 recording. The product is on schema 3 (Lens's tables
+    # arrived by migration, so a fresh install cannot print v1), and CONTRACT.md §1 says
+    # seeded times are relative to now so the film never looks stale. Both are filled in at
+    # render time; the offsets below keep the original relative spacing, which is what makes
+    # the run read as "about a minute, then a couple of minutes of first scans".
+    schema = _schema_version()
+    started = _dt.datetime.now().replace(microsecond=0) - _dt.timedelta(minutes=9, seconds=14)
+    offsets = (0, 1, 9, 10, 31, 34, 162, 169)
+    stamps = {
+        f"t{i}": (started + _dt.timedelta(seconds=off)).strftime("%Y-%m-%d %H:%M:%S")
+        for i, off in enumerate(offsets)
+    }
+
     lines: list[str] = []
     for kind, html in _TERMINAL:
         if kind == "blank":
             lines.append("<div>&nbsp;</div>")
         else:
-            lines.append(f'<div class="{kind}">{html}</div>')
+            lines.append(f'<div class="{kind}">{html.format(schema=schema, **stamps)}</div>')
     lines.append('<div class="prompt">C:\\Users\\you\\Home_SOC&gt; <span class="caret"></span></div>')
 
     steps = "".join(f"<li><div><h3>{h}</h3><p>{d}</p></div></li>" for h, d in _FIRST_RUN_STEPS)
@@ -915,8 +1051,8 @@ def first_run() -> str:
       <div class="card">
         <h2>Then give it five minutes</h2>
         <p class="note muted">About <b>a minute</b> before the link appears; the scans run in the
-          background after that. The first full picture of a twenty-device network lands inside
-          <b>five minutes</b>.</p>
+          background after that. The first full picture of {_device_count()}-device network lands
+          inside <b>five minutes</b>.</p>
       </div>
       <div class="side-chips">
         <span class="chip">no admin</span>
@@ -1046,7 +1182,524 @@ def daily_use() -> str:
     return _document("Day to day", body, css)
 
 
-# --------------------------------------------------------------------------- 6. close
+# --------------------------------------------------------------------------- 6. Lens: the gap
+
+
+def _shelf_svg() -> str:
+    """The hallway shelf: four identical white boxes, none of them wearing its IP address."""
+    w, h = 1080.0, 396.0
+    boxes = [96.0, 344.0, 592.0, 840.0]
+    bw, bh = 144.0, 132.0
+    shelf_y = 300.0
+    out: list[str] = [
+        f'<svg width="{w:g}" height="{h:g}" viewBox="0 0 {w:g} {h:g}" '
+        'xmlns="http://www.w3.org/2000/svg" role="img" '
+        'aria-label="A shelf with four identical white boxes on it, each labelled with a '
+        'question mark: from the hallway, nothing tells you which one is 192.168.1.142.">',
+        f'<rect width="{w:g}" height="{h:g}" rx="12" fill="#12151d"/>',
+        f'<rect x="0" y="{shelf_y + 46:g}" width="{w:g}" height="{h - shelf_y - 46:g}" '
+        f'fill="#0e111a"/>',
+        # the shelf itself
+        f'<rect x="28" y="{shelf_y:g}" width="{w - 56:g}" height="18" rx="3" fill="#3b3226"/>',
+        f'<rect x="28" y="{shelf_y:g}" width="{w - 56:g}" height="5" rx="2.5" fill="#5c4d3a"/>',
+        f'<rect x="28" y="{shelf_y + 18:g}" width="{w - 56:g}" height="8" fill="#241f18"/>',
+    ]
+    for i, x in enumerate(boxes):
+        top = shelf_y - bh
+        out.append(
+            f'<rect x="{x:g}" y="{top:g}" width="{bw:g}" height="{bh:g}" rx="14" '
+            f'fill="#e9ebf1" stroke="#c6cad6" stroke-width="2"/>'
+        )
+        # the one feature every one of them has: a dark disc that could be a lens, or a vent
+        out.append(
+            f'<circle cx="{x + bw / 2:g}" cy="{top + 52:g}" r="27" fill="#1b1e27" '
+            'stroke="#aeb3c2" stroke-width="2"/>'
+        )
+        out.append(f'<circle cx="{x + bw / 2 - 8:g}" cy="{top + 44:g}" r="7" fill="#39415c"/>')
+        out.append(f'<circle cx="{x + bw - 24:g}" cy="{top + 22:g}" r="5" fill="{SEV_LOW}"/>')
+        out.append(
+            f'<rect x="{x + 30:g}" y="{top + 96:g}" width="{bw - 60:g}" height="8" rx="4" '
+            'fill="#d3d7e2"/>'
+        )
+        # a cable, because these things are plugged into something
+        out.append(
+            f'<path d="M {x + bw / 2:g},{shelf_y:g} C {x + bw / 2:g},{shelf_y + 34:g} '
+            f'{x + bw / 2 + (26 if i % 2 else -26):g},{shelf_y + 40:g} '
+            f'{x + bw / 2 + (44 if i % 2 else -44):g},{shelf_y + 62:g}" '
+            'fill="none" stroke="#2a2f3d" stroke-width="5" stroke-linecap="round"/>'
+        )
+        # the question mark each of them is wearing instead of an address
+        cy = top - 52.0
+        out.append(
+            f'<rect x="{x + bw / 2 - 30:g}" y="{cy - 26:g}" width="60" height="52" rx="12" '
+            f'fill="{PANEL}" stroke="{ACCENT}" stroke-width="1.6"/>'
+        )
+        out.append(
+            f'<text x="{x + bw / 2:g}" y="{cy + 11:g}" text-anchor="middle" '
+            f'font-family=\'{SANS}\' font-size="30" font-weight="700" fill="{ACCENT}">?</text>'
+        )
+        out.append(
+            f'<line x1="{x + bw / 2:g}" y1="{cy + 30:g}" x2="{x + bw / 2:g}" y2="{top - 10:g}" '
+            f'stroke="{ACCENT}" stroke-width="1.6" stroke-dasharray="5 5" opacity=".75"/>'
+        )
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _camera_row(ip: str = "192.168.1.142") -> dict[str, str]:
+    """The demo camera's row as the dashboard renders it, read from the demo database.
+
+    This slide used to carry the literals "first seen 12 days ago" and three port chips.
+    Both were contradicted by the real pages minutes later in the same film — /devices
+    says the camera arrived three days ago, and the Lens card says "Exposed 4". The seed
+    is relative to *now*, so a literal age is wrong the day after it is typed.
+    """
+    rows = _demo_query(
+        "SELECT ip, first_seen FROM devices WHERE ip = ? LIMIT 1", (ip,)
+    )
+    if not rows:
+        raise LookupError(f"{DEMO_DB} has no device at {ip}; re-run video/seed_demo.py")
+    first_seen = str(rows[0]["first_seen"] or "")
+    try:
+        seen = _dt.datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
+        days = max(0, (_dt.datetime.now(_dt.timezone.utc) - seen).days)
+    except ValueError:
+        days = 0
+    age = "today" if days == 0 else ("1 day ago" if days == 1 else f"{days} days ago")
+
+    ports = _demo_query(
+        "SELECT port, name FROM services s JOIN devices d ON d.id = s.device_id "
+        "WHERE d.ip = ? AND s.state = 'open' ORDER BY s.port",
+        (ip,),
+    )
+    chips = "".join(
+        f'<span class="port">{int(r["port"])} {str(r["name"] or "?")}</span>' for r in ports
+    )
+    return {"ip": str(rows[0]["ip"]), "age": age, "ports": chips}
+
+
+def lens_why() -> str:
+    """Scene 14: the gap between a row in a table and an object on a shelf."""
+    camera = _camera_row()
+    css = f"""
+.why {{ display: flex; flex-direction: column; }}
+.why .head h1 {{ font-size: 31px; }}
+.why-row {{
+  display: grid; grid-template-columns: 430px minmax(0,1fr); gap: 28px;
+  margin-top: 24px; flex: 1 1 auto; min-height: 0; align-items: stretch;
+}}
+.why-row .card {{ display: flex; flex-direction: column; }}
+.row-mock {{
+  background: {PANEL_2}; border: 1px solid {LINE}; border-radius: 10px; padding: 16px 18px;
+}}
+.row-mock .ip {{ font-family: {MONO}; font-size: 27px; color: {FG}; }}
+.row-mock .who {{ font-size: 14px; color: {MUTED}; margin-top: 4px; }}
+.row-mock .ports {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }}
+.row-mock .port {{
+  font-family: {MONO}; font-size: 12.5px; color: {FG};
+  background: {PANEL}; border: 1px solid {LINE}; border-radius: 6px; padding: 5px 9px;
+}}
+.row-mock .sev {{
+  display: inline-block; margin-top: 14px; font-size: 12.5px; font-weight: 650;
+  letter-spacing: .06em; text-transform: uppercase; color: #1a1d27;
+  background: {SEV_CRITICAL}; border-radius: 999px; padding: 4px 12px;
+}}
+.why p.lede {{ font-size: 16px; color: {MUTED}; line-height: 1.55; margin-top: 16px; }}
+.why p.lede b {{ color: {FG}; }}
+.why-art {{ display: flex; flex-direction: column; }}
+.why-art svg {{ display: block; width: 100%; height: auto; }}
+.why-art .cap {{ font-size: 15px; color: {MUTED}; margin-top: 14px; line-height: 1.5; }}
+.why-art .cap b {{ color: {FG}; }}
+.why .kicker {{
+  margin-top: auto; padding-top: 14px; border-top: 1px solid {LINE};
+  font-size: 14.5px; color: {MUTED}; line-height: 1.5;
+}}
+.why-foot {{
+  margin-top: 20px; display: flex; align-items: center; gap: 16px;
+  border: 1px solid {LINE}; border-left: 3px solid {ACCENT}; border-radius: 12px;
+  background: {PANEL}; padding: 14px 20px; font-size: 16px; color: {MUTED};
+}}
+.why-foot b {{ color: {FG}; font-weight: 650; }}
+"""
+    body = f"""
+<div class="slide why">
+  {_head("The gap", "A row in a table is not an object on a shelf",
+         "Everything up to here has been a screen telling you about a network. This is where "
+         "that stops being enough.")}
+  <div class="why-row">
+    <section class="card">
+      <h2>What the dashboard says</h2>
+      <div class="row-mock">
+        <div class="ip">{camera['ip']}</div>
+        <div class="who">unknown vendor &middot; first seen {camera['age']} &middot; not trusted</div>
+        <div class="ports">
+          {camera['ports']}
+        </div>
+        <div><span class="sev">critical</span></div>
+      </div>
+      <p class="lede">All of it true. All of it <b>useless</b> while you are standing in the
+        hallway, because the thing you have to go and unplug does not know its own IP address
+        and would not tell you if it did.</p>
+      <p class="kicker">You can pull plugs one at a time and watch the dashboard for a device
+        going offline. That works. It takes an evening.</p>
+    </section>
+    <section class="card why-art">
+      <h2>What the hallway says</h2>
+      {_shelf_svg()}
+      <p class="cap"><b>Two of these are cameras, one is a smart plug you forgot you owned,
+        and one is a doorbell.</b> None of them has an address written on the side.</p>
+    </section>
+  </div>
+  <div class="why-foot">
+    <span>That gap &mdash; between a row in a table and an object on a shelf &mdash;
+      <b>is what Lens closes.</b></span>
+  </div>
+</div>
+"""
+    return _document("Lens · the gap", body, css)
+
+
+# --------------------------------------------------------------------------- 7. Lens: how it identifies
+
+#: The token on the demo camera's sticker. Opaque on purpose: 22 url-safe characters after
+#: an ``hs1:`` prefix, exactly what ``lens.mint_sticker_codes`` produces, and deliberately
+#: not the token in ``video/demo_data`` - this is a slide, not a credential.
+_DEMO_STICKER = "hs1:9Fq2xNt7Lm0aVb3Rd6Ks1p"
+
+
+def _qr_svg(payload: str, *, scale: int = 4, quiet_zone: int = 2) -> str:
+    """A real QR code for ``payload``, rendered by the product's own encoder.
+
+    ``homesoc/web/qr.py`` is the module that prints the stickers, so the code on this
+    slide is the same code the product would generate rather than a drawing of one. If
+    the package cannot be imported (slides are sometimes rendered on their own), fall
+    back to a plainly decorative grid rather than failing the whole render.
+    """
+    try:
+        import sys
+        from pathlib import Path as _Path
+
+        root = str(_Path(__file__).resolve().parent.parent)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from homesoc.web.qr import to_svg  # type: ignore[import-not-found]
+
+        return to_svg(payload, scale=scale, quiet_zone=quiet_zone)
+    except Exception as exc:  # noqa: BLE001 - a slide must still render
+        logger.warning("homesoc.web.qr unavailable (%s); drawing a placeholder QR", exc)
+        side = 29 * scale
+        cells: list[str] = []
+        state = 0x2F6E2B93
+        for row in range(29):
+            for col in range(29):
+                state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+                corner = (row < 8 and col < 8) or (row < 8 and col > 20) or (row > 20 and col < 8)
+                if corner or not (state >> 17) & 1:
+                    continue
+                cells.append(f'<rect x="{col * scale}" y="{row * scale}" width="{scale}" '
+                             f'height="{scale}" fill="#1a1d27"/>')
+        for ox, oy in ((0, 0), (22, 0), (0, 22)):
+            cells.append(
+                f'<rect x="{ox * scale}" y="{oy * scale}" width="{7 * scale}" height="{7 * scale}" '
+                f'fill="#1a1d27"/><rect x="{(ox + 1) * scale}" y="{(oy + 1) * scale}" '
+                f'width="{5 * scale}" height="{5 * scale}" fill="#fff"/>'
+                f'<rect x="{(ox + 2) * scale}" y="{(oy + 2) * scale}" width="{3 * scale}" '
+                f'height="{3 * scale}" fill="#1a1d27"/>'
+            )
+        return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{side}" height="{side}" '
+                f'viewBox="0 0 {side} {side}" role="img" aria-label="QR code">'
+                f'<rect width="{side}" height="{side}" fill="#fff"/>{"".join(cells)}</svg>')
+
+
+def _barcode_svg(width: float = 236.0, height: float = 56.0) -> str:
+    """A factory label's barcode - the kind already printed on the back of a router."""
+    widths = (3, 1, 2, 1, 1, 3, 2, 1, 1, 2, 3, 1, 2, 2, 1, 1, 3, 1, 2, 1, 1, 2, 2, 3, 1, 2, 1, 3)
+    unit = width / (sum(widths) + 2)
+    bars: list[str] = []
+    x = unit
+    for i, w in enumerate(widths):
+        if i % 2 == 0:
+            bars.append(f'<rect x="{x:.2f}" y="0" width="{w * unit:.2f}" height="{height:g}" '
+                        f'fill="{STICKER_INK}"/>')
+        x += w * unit
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:g}" height="{height:g}" '
+            f'viewBox="0 0 {width:g} {height:g}" role="img" aria-label="barcode">'
+            f'{"".join(bars)}</svg>')
+
+
+_LEARN_STEPS: tuple[tuple[str, str], ...] = (
+    ("Lens decodes a code it has never seen",
+     "any format the phone can read &mdash; Code&nbsp;128, EAN, Data Matrix, QR."),
+    ("It asks which device this is",
+     "the list is ranked: online first, then anything with open findings."),
+    ("You tap once",
+     "the code and the device are bound, and the tag is saved."),
+    ("Every later scan is instant",
+     "the same sticker, the same barcode, the same box &mdash; resolved immediately."),
+)
+
+_NEVER: tuple[tuple[str, str], ...] = (
+    ("00:1A:2B:3C:4D:5E", "its MAC address"),
+    ("192.168.1.142", "its address on your network"),
+    ("hallway-cam.local", "its hostname"),
+    ("Hallway camera", "the name you gave it"),
+)
+
+
+def lens_how() -> str:
+    """Scene 15: how Lens knows which physical object you are pointing at."""
+    css = f"""
+.how {{ display: flex; flex-direction: column; }}
+.how .head h1 {{ font-size: 31px; }}
+.how-three {{
+  display: grid; grid-template-columns: 1.06fr 1fr 1.16fr; gap: 22px;
+  margin-top: 24px; flex: 1 1 auto; min-height: 0;
+}}
+.how-three .card {{ display: flex; flex-direction: column; }}
+.art {{
+  display: flex; align-items: center; justify-content: center; gap: 18px;
+  background: {PANEL_2}; border: 1px solid {LINE}; border-radius: 10px;
+  padding: 13px 18px; margin-bottom: 13px;
+}}
+.art svg {{ display: block; }}
+.art .label {{ font-family: {MONO}; font-size: 12.5px; color: {MUTED}; }}
+.art--label {{
+  flex-direction: column; gap: 9px; padding: 20px 18px 16px;
+  background: {STICKER}; border-color: {STICKER_LINE};
+}}
+.art--label .label {{ color: #4a4f5e; letter-spacing: .06em; }}
+.art--label .model {{
+  font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #6b7182;
+}}
+.art-cap {{ font-size: 13px; color: {MUTED}; margin: -4px 0 12px; }}
+.sheet {{
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px;
+  background: {PANEL_2}; border: 1px solid {LINE}; border-radius: 10px; padding: 10px;
+  margin-top: 12px;
+}}
+.sheet i {{
+  display: flex; align-items: center; gap: 7px; background: {STICKER}; border-radius: 5px;
+  padding: 7px 8px; font-style: normal; font-size: 9.5px; color: #4a4f5e;
+}}
+.sheet i b {{ display: block; width: 22px; height: 22px; border-radius: 2px; background: {STICKER_INK}; }}
+.resolve {{
+  display: flex; align-items: center; gap: 10px; margin-top: 13px;
+  background: {PANEL_2}; border: 1px solid {LINE}; border-radius: 10px; padding: 13px 14px;
+  font-size: 13px; color: {MUTED};
+}}
+.resolve .m {{ font-family: {MONO}; font-size: 12.5px; color: {FG}; }}
+.resolve .step {{ min-width: 0; }}
+.resolve .sep {{ color: {ACCENT}; }}
+.sticker {{
+  background: {STICKER}; border: 1px solid {STICKER_LINE}; border-radius: 10px;
+  padding: 12px 12px 10px; display: flex; flex-direction: column; align-items: center; gap: 6px;
+}}
+.sticker .nick {{ font-size: 13.5px; font-weight: 650; color: {STICKER_INK}; }}
+.sticker .mark {{ font-size: 10.5px; color: #6b7182; letter-spacing: .1em; text-transform: uppercase; }}
+.sticker-note {{ font-size: 13.5px; color: {MUTED}; line-height: 1.5; }}
+.steps {{ list-style: none; padding: 0; }}
+.steps li {{ display: grid; grid-template-columns: 26px minmax(0,1fr); gap: 12px; padding: 10px 0; }}
+.steps li + li {{ border-top: 1px solid {LINE}; }}
+.steps .n {{
+  width: 24px; height: 24px; border-radius: 50%; margin-top: 1px;
+  background: rgba(62,99,221,.18); color: #9db0ff;
+  font-size: 12.5px; font-weight: 650; display: grid; place-items: center;
+}}
+.steps h3 {{ font-size: 15.5px; font-weight: 650; }}
+.steps p {{ font-size: 13.5px; color: {MUTED}; margin-top: 3px; line-height: 1.45; }}
+.tok {{ display: flex; flex-direction: column; gap: 6px; min-width: 0; }}
+.tok .cap {{ font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: {MUTED}; }}
+.tok code {{
+  font-family: {MONO}; font-size: 14px; color: {FG};
+  background: {PANEL}; border: 1px solid {LINE}; border-radius: 7px; padding: 8px 10px;
+}}
+.art .to {{ color: {ACCENT}; font-size: 22px; }}
+.never {{ list-style: none; padding: 0; }}
+.never li {{
+  display: flex; align-items: baseline; gap: 12px; padding: 8px 0; font-size: 14px;
+}}
+.never li + li {{ border-top: 1px solid {LINE}; }}
+.never s {{
+  font-family: {MONO}; font-size: 13.5px; color: {SEV_CRITICAL}; opacity: .85;
+  text-decoration-thickness: 1.5px;
+}}
+.never span {{ color: {MUTED}; margin-left: auto; }}
+.how-foot {{
+  margin-top: 16px; display: flex; align-items: center; gap: 16px;
+  border: 1px solid {LINE}; border-left: 3px solid {ACCENT}; border-radius: 12px;
+  background: {PANEL}; padding: 12px 20px; font-size: 15px; color: {MUTED};
+}}
+.how-foot b {{ color: {FG}; font-weight: 650; }}
+.how-foot .m {{ font-family: {MONO}; font-size: 13.5px; color: {FG}; }}
+.how .steps li {{ padding: 10px 0; }}
+.how .never li {{ padding: 9px 0; }}
+.how .kicker {{
+  margin-top: auto; padding-top: 14px; border-top: 1px solid {LINE};
+  font-size: 14px; color: {MUTED}; line-height: 1.5;
+}}
+.how .kicker b {{ color: {FG}; }}
+.how .kicker .m {{ font-family: {MONO}; font-size: 13px; color: {FG}; }}
+"""
+    steps = "".join(
+        f'<li><span class="n">{i}</span><div><h3>{h}</h3><p>{d}</p></div></li>'
+        for i, (h, d) in enumerate(_LEARN_STEPS, start=1)
+    )
+    never = "".join(
+        f"<li><s>{code}</s><span>{what}</span></li>" for code, what in _NEVER
+    )
+    body = f"""
+<div class="slide how">
+  {_head("Lens", "How it knows which box you are pointing at",
+         "One mechanism &mdash; a visual tag &mdash; from two sources, plus a manual pick that always "
+         "works. No OCR, no fingerprinting, no guessing from the camera image.")}
+  <div class="how-three">
+    <section class="card">
+      <h2>1 &nbsp;The label it already has</h2>
+      <div class="art art--label">
+        <span class="model">Model RT-58U &nbsp;·&nbsp; 12V 2A</span>
+        {_barcode_svg()}
+        <span class="label">SN 4C8A-2219-KQ</span>
+      </div>
+      <p class="art-cap">The sticker the manufacturer already put on the box.</p>
+      <ul class="steps">{steps}</ul>
+      <p class="kicker">Most devices need no sticker at all: the barcode already printed on the back
+        of the router <b>becomes</b> its identifier the first time you scan it.</p>
+    </section>
+    <section class="card">
+      <h2>2 &nbsp;A sticker for the rest</h2>
+      <div class="art">
+        <div class="sticker">
+          {_qr_svg(_DEMO_STICKER, scale=5)}
+          <span class="nick">Hallway camera</span>
+          <span class="mark">{BRAND_MARK} Home SOC</span>
+        </div>
+      </div>
+      <p class="sticker-note">Smart plugs, cameras, anything already screwed to a wall: no readable
+        label, and no way to reach one. <span class="mono" style="font-size:13px">/lens/stickers</span>
+        prints a sheet from the inventory &mdash; Avery&nbsp;5160 labels or 40&nbsp;mm squares, with
+        the nickname under each code.</p>
+      <div class="sheet">
+        {''.join(f'<i><b></b>{n}</i>' for n in
+                 ("Hallway camera", "Front doorbell", "Kitchen plug",
+                  "Utility plug", "Epson printer", "Garage TV"))}
+      </div>
+      <p class="kicker">Minting is <b>idempotent</b>: reprinting the sheet never invalidates a sticker
+        that is already on a device.</p>
+    </section>
+    <section class="card">
+      <h2>3 &nbsp;What a photograph of it gives away</h2>
+      <div class="art">
+        {_qr_svg(_DEMO_STICKER, scale=3)}
+        <span class="to">&rarr;</span>
+        <div class="tok">
+          <span class="cap">everything it encodes</span>
+          <code>{_DEMO_STICKER}</code>
+        </div>
+      </div>
+      <ul class="never">{never}</ul>
+      <div class="resolve">
+        <span class="step"><span class="m">{_DEMO_STICKER[:12]}&hellip;</span></span>
+        <span class="sep">&rarr;</span>
+        <span class="step"><span class="m">lens_tags</span><br>in your own database</span>
+        <span class="sep">&rarr;</span>
+        <span class="step"><span class="m">Hallway camera</span><br>192.168.1.142</span>
+      </div>
+      <p class="kicker">An opaque random token, and nothing else. A visitor who photographs a sticker
+        &mdash; or a stranger who finds the printed sheet &mdash; learns <b>nothing</b> about your
+        network: the token resolves only against <span class="m">data/homesoc.db</span> on your PC.</p>
+    </section>
+  </div>
+  <div class="how-foot">
+    <span><b>And there is always the third path.</b> A persistent <span class="m">Pick manually</span>
+      button lists every device, ranked the same way &mdash; online first, then whatever has open
+      findings &mdash; so Lens still works with the camera closed, in a browser that cannot scan, and
+      on a device that carries no code at all.</span>
+  </div>
+</div>
+"""
+    return _document("Lens · identification", body, css)
+
+
+# --------------------------------------------------------------------------- 7. Lens: honest limits
+
+_LIMITS: tuple[tuple[str, str, str], ...] = (
+    ("The browser", "Chrome on Android is the target",
+     "Automatic scanning uses <span class='m'>BarcodeDetector</span>, a platform API Chrome ships on "
+     "Android. Where it is missing &mdash; desktop browsers, iOS &mdash; Lens hides the reticle, says "
+     "so on screen, and the manual picker becomes the main path. It never leaves you staring at a "
+     "camera that silently does nothing."),
+    ("The certificate", "A self-signed certificate is a real trust decision",
+     "Browsers hand out the camera only in a secure context, and a home LAN has no certificate "
+     "authority. So Home SOC generates its own: your phone warns you once and you accept it "
+     "knowingly &mdash; or you run Home SOC behind Tailscale Serve and get a genuinely trusted one, "
+     "which <span class='m'>docs/LENS_SETUP.md</span> walks through."),
+    ("The first scan", "One tap per device, once",
+     "A code Lens has never seen costs a single tap to bind to a device. That is the whole price of "
+     "identification, and it is paid once per code &mdash; every later scan of it resolves "
+     "immediately."),
+    ("The illusion", "It is not augmented reality",
+     "No world-anchored 3D labels floating on the device. It is a camera viewfinder with an "
+     "information panel over it, which is what stays readable at arm&rsquo;s length in a dim "
+     "cupboard."),
+    ("The camera", "It cannot read a model number off a label",
+     "There is no OCR: vendoring an engine for it would break the rule that this project ships no "
+     "external assets. A device with no barcode and no sticker is picked from the list &mdash; "
+     "ranked, so it is usually the first row."),
+    ("The scope", "Read-only until you decide otherwise",
+     "A paired phone gets the <span class='m'>read</span> scope. Rescanning, acknowledging and "
+     "trusting need <span class='m'>act</span>, which is off by default. Any phone can be revoked on "
+     "its own, without changing the dashboard password."),
+)
+
+
+def lens_limits() -> str:
+    """The honest-limits card that closes the Lens act."""
+    css = f"""
+.lim {{ display: flex; flex-direction: column; }}
+.lim .head h1 {{ font-size: 31px; }}
+.lim-grid {{
+  display: grid; grid-template-columns: repeat(2, 1fr); grid-auto-rows: 1fr;
+  gap: 18px 22px; margin-top: 24px; flex: 1 1 auto; min-height: 0;
+}}
+.lim-grid .card {{
+  display: grid; grid-template-columns: 132px minmax(0,1fr); align-items: center;
+  column-gap: 20px; padding: 20px 24px;
+}}
+.lim-grid .eyebrow {{ font-size: 12px; color: {SEV_MEDIUM}; line-height: 1.5; }}
+.lim-grid h3 {{ font-size: 20px; font-weight: 650; letter-spacing: -.012em; }}
+.lim-grid p {{ font-size: 15px; color: {MUTED}; margin-top: 8px; line-height: 1.55; }}
+.lim-grid .m {{ font-family: {MONO}; font-size: .92em; color: {FG}; }}
+.lim-foot {{
+  margin-top: 22px; display: flex; align-items: center; gap: 18px;
+  border: 1px solid {LINE}; border-left: 3px solid {SEV_MEDIUM}; border-radius: 12px;
+  background: {PANEL}; padding: 15px 20px; font-size: 15.5px; color: {MUTED};
+}}
+.lim-foot b {{ color: {FG}; font-weight: 650; }}
+.lim-foot .m {{ font-family: {MONO}; font-size: 13.5px; color: {FG}; }}
+"""
+    cards = "".join(
+        f'<section class="card"><div class="eyebrow">{eyebrow}</div>'
+        f"<div><h3>{heading}</h3><p>{detail}</p></div></section>"
+        for eyebrow, heading, detail in _LIMITS
+    )
+    body = f"""
+<div class="slide lim">
+  {_head("Lens", "What Lens does not do",
+         "It widens Home SOC from one loopback address to your LAN, so it is worth being exact about "
+         "where the edges are.")}
+  <div class="lim-grid">{cards}</div>
+  <div class="lim-foot">
+    <span><b>Lens is off by default.</b> Turning it on is a deliberate decision: choose a bind
+      address, generate a certificate, open one firewall port. Do it over plain HTTP from a LAN
+      address and Home SOC raises a finding against itself &mdash;
+      <span class="m">SOC-LENS-001</span>.</span>
+  </div>
+</div>
+"""
+    return _document("Lens · honest limits", body, css)
+
+
+# --------------------------------------------------------------------------- 8. close
 
 
 def close() -> str:
@@ -1093,6 +1746,10 @@ def close() -> str:
         ("docs/PLAYBOOKS.md", "what to do about each finding"),
         ("docs/GUIDE_HOME_PROTECTION.md", "securing a home network at all"),
         ("docs/NETWORK_DNS_SETUP.md", "the LAN DNS walkthrough, router by router"),
+        # Act 3 is five minutes of Lens and ends by naming the certificate as a real trust
+        # decision. This is the document that resolves it — including the Tailscale route —
+        # and it was the one doc the closing card did not list.
+        ("docs/LENS_SETUP.md", "turning Lens on: certificate, firewall, Tailscale"),
     )
     docs_html = "".join(f'<li><span class="doc">{p}</span><br>{d}</li>' for p, d in docs)
     body = f"""
@@ -1158,7 +1815,24 @@ SLIDES: dict[str, Callable[[], str]] = {
     "architecture": architecture,
     "first_run": first_run,
     "daily_use": daily_use,
+    "lens_why": lens_why,
+    "lens_how": lens_how,
+    "lens_limits": lens_limits,
     "close": close,
+}
+
+#: Spellings :func:`render` also answers to. ``script.py`` and ``slides.py`` are written by
+#: different hands; a near-miss on a slide name should not cost a whole capture run. The
+#: canonical names above are the ones :func:`slide_names` and :func:`write_all` use.
+ALIASES: dict[str, str] = {
+    "lens_gap": "lens_why",
+    "lens_problem": "lens_why",
+    "lens_identify": "lens_how",
+    "lens_tags": "lens_how",
+    "lens_identification": "lens_how",
+    "lens_honest": "lens_limits",
+    "lens_honest_limits": "lens_limits",
+    "lens_caveats": "lens_limits",
 }
 
 
@@ -1173,8 +1847,9 @@ def render(name: str) -> str:
     Raises ``KeyError`` with the known names listed, so a typo in ``script.py`` fails loudly during
     capture rather than producing a blank frame.
     """
+    key = name if name in SLIDES else ALIASES.get(name, name)
     try:
-        fn = SLIDES[name]
+        fn = SLIDES[key]
     except KeyError:
         raise KeyError(f"unknown slide {name!r}; known slides: {', '.join(SLIDES)}") from None
     html = fn()

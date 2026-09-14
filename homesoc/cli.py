@@ -38,7 +38,9 @@ EXIT_USAGE = 2
 
 # Scan step names accepted by `scan --only` and the "full" job, in execution order:
 # vulns needs fresh services, everything else is independent.
-SCAN_STEPS: tuple[str, ...] = ("discovery", "services", "vulns", "host", "exposure", "wifi", "files")
+# SPEC addendum C6 adds "topology": it reads what discovery and the DNS filter already wrote,
+# so it comes after them and costs no network traffic of its own.
+SCAN_STEPS: tuple[str, ...] = ("discovery", "services", "vulns", "topology", "host", "exposure", "wifi", "files")
 # What a "quick" scan covers: what changed on the LAN plus a cheap host check.
 QUICK_STEPS: tuple[str, ...] = ("discovery", "services", "vulns", "wifi")
 
@@ -56,6 +58,8 @@ MODULES = {
     "persistence": ("homesoc.scanners.persistence", "run"),
     "files": ("homesoc.scanners.files", "run"),
     "match_services": ("homesoc.vulns.matcher", "match_services"),
+    "topology": ("homesoc.topology", "run"),
+    "topology_graph": ("homesoc.topology.graph", None),
     "apply": ("homesoc.findings.engine", "apply"),
     "list_findings": ("homesoc.findings.engine", "list_findings"),
     "counts": ("homesoc.findings.engine", "counts"),
@@ -73,6 +77,10 @@ MODULES = {
 }
 
 _UNAVAILABLE: set[str] = set()
+
+#: SPEC addendum C6: the topology job's default interval, in hours. A literal rather than an
+#: import of homesoc.topology, so a missing package degrades to a skipped job like every other.
+TOPOLOGY_JOB_HOURS = 6
 
 #: How many devices/finding types the plain-text commands list before summarising the rest.
 BASELINE_LIST_LIMIT = 20
@@ -359,10 +367,19 @@ def scan_files(cfg: Config, conn: sqlite3.Connection, *, quick: bool = False) ->
     return run_step(cfg, conn, "files", [("files", call, None)])
 
 
+def scan_topology(cfg: Config, conn: sqlite3.Connection, *, quick: bool = False) -> dict[str, Any]:
+    """SPEC addendum C6. Scope "device:" so a NET-DEP finding auto-resolves the moment the
+    dependency it describes stops being true — the device stopped being load-bearing, or the
+    endpoint it could never reach started answering."""
+    call = _call_scanner("topology", cfg, conn, quick=quick, progress=_progress_logger("topology"))
+    return run_step(cfg, conn, "topology", [("topology", call, "device:")])
+
+
 SCAN_FUNCS: dict[str, Callable[..., dict[str, Any]]] = {
     "discovery": scan_discovery,
     "services": scan_services,
     "vulns": scan_vulns,
+    "topology": scan_topology,
     "host": scan_host,
     "exposure": scan_exposure,
     "wifi": scan_wifi,
@@ -539,6 +556,10 @@ def build_jobs(cfg: Config, conn: sqlite3.Connection,
             description="Service scan of online devices"),
         Job("vulns", hours(cfg.schedule.services_hours), lambda: scan_vulns(cfg, conn),
             description="Match services against KEV / NVD / EPSS"),
+        # SPEC addendum C6: after discovery (and after services, so the providers a device offers
+        # are known the first time the graph is built rather than six hours later).
+        Job("topology", hours(TOPOLOGY_JOB_HOURS), lambda: scan_topology(cfg, conn),
+            description="Dependency map, outage history and blast radius"),
         Job("host", hours(cfg.schedule.host_hours), job_host, description="Host posture, Defender, updates, persistence, Wi-Fi"),
         Job("exposure", hours(cfg.schedule.exposure_hours), lambda: scan_exposure(cfg, conn),
             description="WAN exposure: public IP, InternetDB, UPnP"),
@@ -1444,6 +1465,129 @@ def cmd_feed(ctx: Context) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------- blast radius (addendum C)
+
+
+def resolve_device(conn: sqlite3.Connection, needle: str) -> tuple[int | None, list[dict[str, Any]]]:
+    """Find one device by IP, MAC or name.
+
+    Returns ``(device_id, candidates)``: an id when exactly one device matches, otherwise None
+    and the list of candidates so the caller can print them. Matching is deliberately ordered —
+    an address is unambiguous, a name is not — and a name only falls back to a substring match
+    when nothing matched it exactly, so "iPhone" asks which one rather than picking.
+    """
+    text = str(needle or "").strip()
+    if not text:
+        return None, []
+    rows = db.rows_to_dicts(db.query(
+        conn, "SELECT id, mac, ip, hostname, nickname, kind, online FROM devices ORDER BY id"))
+    mac = text.lower().replace("-", ":")
+    lowered = text.lower()
+    for test in (
+        lambda r: str(r["ip"] or "") == text,
+        lambda r: str(r["mac"] or "").lower() == mac,
+        lambda r: str(r["nickname"] or "").lower() == lowered,
+        lambda r: str(r["hostname"] or "").lower() == lowered,
+        lambda r: lowered in f"{r['nickname'] or ''} {r['hostname'] or ''}".lower(),
+    ):
+        matches = [r for r in rows if test(r)]
+        if len(matches) == 1:
+            return int(matches[0]["id"]), matches
+        if len(matches) > 1:
+            return None, matches
+    return None, []
+
+
+def cmd_blast(ctx: Context) -> int:
+    """`python -m homesoc blast <device>` — what the house loses if this device fails."""
+    graph = _lazy("topology_graph")
+    if graph is None:
+        emit("The dependency map (homesoc.topology) is not available in this install; "
+             "reinstall or update Home SOC, then try again.")
+        return EXIT_ERROR
+    needle = str(getattr(ctx.args, "device", "") or "")
+    device_id, candidates = resolve_device(ctx.conn, needle)
+    if device_id is None:
+        if candidates:
+            emit(f"{len(candidates)} devices match {needle!r}; name one of these exactly, or use its IP:")
+            for row in candidates[:BASELINE_LIST_LIMIT]:
+                emit(f"  {str(row['ip'] or ''):15} {str(row['mac'] or ''):18} "
+                     f"{str(row['nickname'] or row['hostname'] or '')}")
+            return EXIT_USAGE
+        emit(f"no device matches {needle!r} (try an IP, a MAC, or a nickname from: python -m homesoc status)")
+        return EXIT_ERROR
+
+    hours = int(getattr(ctx.cfg, "topology", None).hours) if getattr(ctx.cfg, "topology", None) else 168
+    try:
+        blast = graph.blast_radius(ctx.conn, device_id, hours=hours)
+    except Exception as exc:
+        logger.exception("blast radius failed")
+        emit(f"could not work out the blast radius: {type(exc).__name__}: {exc}")
+        return EXIT_ERROR
+    if not blast:
+        emit(f"no device with id {device_id}")
+        return EXIT_ERROR
+
+    device = blast["device"]
+    emit(f"{device['label']}   {device['ip'] or ''}  {device['mac'] or ''}"
+         f"{'' if device['online'] else '   (currently offline)'}")
+    emit("")
+    for line in _wrap(blast["headline"], 88):
+        emit(line)
+    emit("")
+    _emit_blast_list("Goes offline", blast["offline"])
+    _emit_blast_list("Keeps working, but degraded", blast["degraded"])
+    if blast["services_lost"]:
+        emit("Services lost")
+        for item in blast["services_lost"]:
+            emit(f"  - {item}")
+        emit("")
+    unaffected = blast["unaffected"]
+    if unaffected:
+        names = ", ".join(str(d["label"]) for d in unaffected[:8])
+        more = f", and {len(unaffected) - 8} more" if len(unaffected) > 8 else ""
+        emit(f"Unaffected ({len(unaffected)}): {names}{more}")
+        emit("")
+    emit(f"Confidence: {blast['confidence']}")
+    if blast.get("evidence"):
+        for line in _wrap(str(blast["evidence"]), 88):
+            emit(f"  {line}")
+    else:
+        emit("  Nothing like this has been recorded yet, so this is worked out from the shape of the")
+        emit("  network rather than from an outage Home SOC has watched happen.")
+    if blast.get("resolution"):
+        for line in _wrap(str(blast["resolution"]), 88):
+            emit(f"  {line}")
+    emit("")
+    emit("  Home SOC cannot see traffic between devices - it has no packet visibility. These links")
+    emit("  are what it has observed or can reasonably infer.")
+    return EXIT_OK
+
+
+def _emit_blast_list(title: str, items: list[dict[str, Any]]) -> None:
+    if not items:
+        return
+    emit(f"{title} ({len(items)})")
+    for item in items:
+        emit(f"  - {item['label']}: {item.get('why') or ''}".rstrip(": "))
+    emit("")
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    words = str(text or "").split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
 def cmd_defender(ctx: Context) -> int:
     defender = _lazy("defender_module")
     if defender is None:
@@ -1658,6 +1802,7 @@ COMMANDS: dict[str, Callable[[Context], int]] = {
     "defender": cmd_defender,
     "dns-test": cmd_dns_test,
     "lens": cmd_lens,
+    "blast": cmd_blast,
 }
 
 
@@ -1737,6 +1882,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("dns-test", help="show the policy decision and upstream answer for a domain")
     p.add_argument("domain")
 
+    # SPEC addendum C6.
+    p = sub.add_parser("blast", help="what stops working if a device fails")
+    p.add_argument("device", metavar="DEVICE", help="an IP, a MAC, or a nickname/hostname")
+
     # Lens (SPEC addendum B3). A sub-group rather than four top-level commands, so
     # `homesoc lens` alone prints the four things you can do with it.
     p = sub.add_parser("lens", help="pair a phone with Lens, list or revoke tokens, manage the certificate")
@@ -1797,6 +1946,8 @@ __all__ = [
     "queue_device_scan", "run_device_scan", "dashboard_url", "parse_since", "RETENTION_DAYS",
     "list_findings_safe", "fallback_counts", "fallback_score", "current_score", "grade", "GRADE_BANDS",
     "score_breakdown_lines", "cmd_baseline",
+    # Dependencies and blast radius (SPEC addendum C)
+    "scan_topology", "TOPOLOGY_JOB_HOURS", "resolve_device", "cmd_blast",
     "BASELINE_LIST_LIMIT", "SCORE_BREAKDOWN_LIMIT",
     # Lens (SPEC addendum B3)
     "WILDCARD_HOSTS", "TLS_SETTING", "BIND_SETTING", "recorded_bind", "lens_hosts", "lens_display_host",

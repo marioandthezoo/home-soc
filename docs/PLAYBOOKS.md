@@ -2,7 +2,7 @@
 
 Every issue Home SOC can report, what it means for a home network, and exactly how to fix it.
 
-There are **88 findings** in the catalog. A scanner never writes its own wording: it emits a
+There are **92 findings** in the catalog. A scanner never writes its own wording: it emits a
 finding ID plus evidence, and everything you read below — the title, the reason it matters, the
 numbered steps, the links — comes from `homesoc/findings/catalog.py`. That is why the dashboard,
 the terminal (`python -m homesoc findings`), the exported report (`python -m homesoc report`) and
@@ -237,7 +237,7 @@ Every non-elevated run also raises `SOC-SYS-002`, an informational finding that 
 
 ## Every finding at a glance
 
-Home SOC's catalog contains **88 findings**. Titles containing `{something}` are templates: the scanner's evidence is substituted in when the finding is raised, so what you see on the dashboard reads "Defender signatures are 9 days old". The severity column is the catalog default; three findings are re-graded at runtime and are marked with an asterisk. The last column is the scan that produces the finding, with **needs admin** for the three checks that are refused to a standard user and *may need admin* for the ones that can degrade to `needs_admin`.
+Home SOC's catalog contains **92 findings**. Titles containing `{something}` are templates: the scanner's evidence is substituted in when the finding is raised, so what you see on the dashboard reads "Defender signatures are 9 days old". The severity column is the catalog default; three findings are re-graded at runtime and are marked with an asterisk. The last column is the scan that produces the finding, with **needs admin** for the three checks that are refused to a standard user and *may need admin* for the ones that can degrade to `needs_admin`.
 
 | ID | Severity | Title | Category | Emitted by | Scan |
 |---|---|---|---|---|---|

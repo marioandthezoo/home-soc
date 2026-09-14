@@ -47,6 +47,12 @@ logger = logging.getLogger("seed_demo")
 
 DEMO_DIR = VIDEO_DIR / "demo_data"
 DEMO_DB = DEMO_DIR / "homesoc.db"
+BUILD_DIR = VIDEO_DIR / "build"
+#: Where the Lens facts the *other* packages need land: the sticker payload `scene_render.py`
+#: draws into the QR, and the paired-phone token `phone.py` injects into ``localStorage``.
+#: Neither can be recovered from the database afterwards (the sticker is minted at random and
+#: only the SHA-256 of the token is stored), so the seed is the one place that can publish them.
+LENS_JSON = BUILD_DIR / "lens_demo.json"
 REAL_DATA_DIR = (PROJECT_ROOT / "data").resolve()
 
 RNG_SEED = 20260907
@@ -57,6 +63,37 @@ PUBLIC_IP = "203.0.113.42"
 LAN_CIDR = "192.168.1.0/24"
 GATEWAY_IP = "192.168.1.1"
 CAMERA_IP = "192.168.1.142"
+
+# --------------------------------------------------------------------------- Lens (CONTRACT_V2 V4)
+#
+# Act 3 of the video is Lens, so the demo household has to arrive already paired and already
+# carrying tags. Everything below is created through the product's own helpers
+# (``db.lens_mint_token``, ``web.lens.mint_sticker_codes`` / ``learn_tag``) and only then nudged
+# backwards in time, so the rows are byte-for-byte what a real pairing and two real scans would
+# have written — not a hand-rolled imitation of them.
+
+#: The phone in scene 18. Label only: this is what ``python -m homesoc lens tokens`` prints.
+LENS_PHONE_LABEL = "Pixel in the hallway"
+#: ``lens.token_ttl_days`` default. Not expired, and visibly not expired, during the shoot.
+LENS_TOKEN_TTL_DAYS = 90
+LENS_PAIRED_DAYS_AGO = 2.2
+
+#: The **learned** tag: the Code 128 serial already printed on the Epson's factory label. The
+#: point of B2 is that most devices need no sticker at all, and this is the row that proves it.
+#: Invented serial in Epson's shape; it identifies nothing on any real network.
+LENS_PRINTER_CODE = "X4TY291508"
+LENS_PRINTER_TAG_LABEL = "Serial barcode on the back of the printer"
+LENS_PRINTER_TAG_DAYS_AGO = 41.0
+
+#: The **ignored** code: a retail EAN-13 off a cardboard box in the same cupboard. Somebody
+#: pointed Lens at it once and tapped "not a device", so Lens never asks about it again.
+LENS_IGNORED_CODE = "5012345678900"
+LENS_IGNORED_TAG_LABEL = "Barcode on the router's box — not a device"
+LENS_IGNORED_TAG_DAYS_AGO = 9.0
+
+#: The camera's printed sticker. The payload is minted at random by the product, so the value
+#: lives in ``video/build/lens_demo.json`` rather than here.
+LENS_STICKER_TAG_DAYS_AGO = 2.1
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 RNG = random.Random(RNG_SEED)
@@ -1068,6 +1105,14 @@ def seed_settings(conn: sqlite3.Connection, counts: Counts) -> None:
         "dns.urlhaus_auth_key": "",
         "dns.reputation_min_malicious_votes": 3,
         "dns.reputation_ttl_hours": 168,
+        # Lens is off by default in the product (SPEC B10) and has to be turned on deliberately.
+        # Without this the demo database's /lens, /lens/pair and /lens/stickers are 404s, and Act
+        # 3 has nothing to film. Only the master switch is set here: settings rows outrank
+        # config.toml, so every other [lens] knob is left to build/demo_config.toml, which is
+        # where the capture harness turns them for the shoot (require_https, tag_learning,
+        # allow_actions, ttl). The bind host stays loopback, so SOC-LENS-001 does not apply and
+        # the score the narration quotes is unchanged.
+        "lens.enabled": True,
         "notify.min_severity": "high",
         "notify.ntfy_url": "",
         "notify.discord_webhook": "",
@@ -1396,6 +1441,138 @@ def seed_findings(conn: sqlite3.Connection, ids: dict[str, int], counts: Counts)
     )
 
 
+# --------------------------------------------------------------------------- Lens
+
+
+def _lens_backdate_tag(conn: sqlite3.Connection, code: str, *, created_days: float,
+                       last_seen_days: float | None, scans: int) -> None:
+    """Move one tag back in time. The row itself was written by the product's own helper."""
+    hdb.write(
+        conn,
+        "UPDATE lens_tags SET created_at=?, last_seen_at=?, scans=? WHERE code=?",
+        (iso_ago(days=created_days),
+         None if last_seen_days is None else iso_ago(days=last_seen_days),
+         int(scans), code),
+    )
+
+
+def seed_lens(conn: sqlite3.Connection, ids: dict[str, int], counts: Counts) -> dict[str, Any]:
+    """Pair a phone and plant the three tag states Act 3 needs (CONTRACT_V2 V4).
+
+    Returns the facts the rest of the pipeline cannot recover from the database:
+    the paired-phone token (stored only as a SHA-256) and the camera's sticker payload
+    (minted at random), plus the ``events`` rows minting the token produced. Those events are
+    handed back rather than left where they landed because ``events`` is read ``ORDER BY id
+    DESC``: a row inserted last but stamped two days ago would sit at the top of the overview's
+    "latest events" card wearing the wrong timestamp. :func:`seed_events` folds them in.
+    """
+    from homesoc.web import lens as lensmod
+
+    camera_id = ids["camera"]
+    printer_id = ids["printer"]
+
+    # --- the paired phone ---------------------------------------------------------------
+    minted = hdb.lens_mint_token(
+        conn, label=LENS_PHONE_LABEL, scopes="read",
+        ttl_days=LENS_TOKEN_TTL_DAYS, max_tokens=10,
+    )
+    token = str(minted["token"])
+    created = ago(days=LENS_PAIRED_DAYS_AGO)
+    # Backdated as a pair, so "paired two days ago, expires in 88" reads consistently wherever
+    # it is printed. last_seen_at/last_ip are deliberately left as minted (NULL): the product
+    # writes them on the phone's first authenticated request, which is exactly what the capture
+    # run is about to make.
+    hdb.write(
+        conn,
+        "UPDATE lens_tokens SET created_at=?, expires_at=? WHERE id=?",
+        (iso(created), iso(created + timedelta(days=LENS_TOKEN_TTL_DAYS)), int(minted["id"])),
+    )
+    counts.note("lens_tokens", 1)
+
+    # The token's own events row, lifted out for seed_events to place in time order.
+    pending_events = [
+        (iso(created), str(r["level"]), str(r["source"]), str(r["message"]), r["data"])
+        for r in hdb.query(conn, "SELECT * FROM events WHERE source='lens' ORDER BY id")
+    ]
+    hdb.write(conn, "DELETE FROM events WHERE source='lens'")
+
+    # --- the sticker on the camera ------------------------------------------------------
+    # mint_sticker_codes is what /lens/stickers itself calls, and it is idempotent by contract:
+    # re-seeding a database that already has this sticker reuses the payload rather than
+    # invalidating a label that is (in the fiction) already stuck to the camera.
+    sticker = lensmod.mint_sticker_codes(conn, [camera_id])[camera_id]
+    _lens_backdate_tag(conn, sticker, created_days=LENS_STICKER_TAG_DAYS_AGO,
+                       last_seen_days=1.1, scans=2)
+
+    # --- the barcode the printer already had --------------------------------------------
+    lensmod.learn_tag(conn, LENS_PRINTER_CODE, printer_id, kind="learned",
+                      label=LENS_PRINTER_TAG_LABEL, created_by="lens")
+    _lens_backdate_tag(conn, LENS_PRINTER_CODE, created_days=LENS_PRINTER_TAG_DAYS_AGO,
+                       last_seen_days=3.5, scans=6)
+
+    # --- the code that is not a device --------------------------------------------------
+    lensmod.learn_tag(conn, LENS_IGNORED_CODE, None, kind="ignored",
+                      label=LENS_IGNORED_TAG_LABEL, created_by="lens")
+    _lens_backdate_tag(conn, LENS_IGNORED_CODE, created_days=LENS_IGNORED_TAG_DAYS_AGO,
+                       last_seen_days=LENS_IGNORED_TAG_DAYS_AGO, scans=1)
+
+    counts.note("lens_tags", 3)
+
+    tagged = {camera_id, printer_id}
+    untagged = [spec.key for spec in DEVICES if ids[spec.key] not in tagged]
+    if len(untagged) < 4:  # V4: the sticker sheet must have something to print
+        raise SystemExit(f"only {len(untagged)} devices are untagged; the sticker sheet needs at least 4")
+
+    return {
+        "token": token,
+        "token_id": int(minted["id"]),
+        "token_label": LENS_PHONE_LABEL,
+        "token_scopes": str(minted.get("scopes") or "read"),
+        "token_created_at": iso(created),
+        "token_expires_at": iso(created + timedelta(days=LENS_TOKEN_TTL_DAYS)),
+        "sticker_code": sticker,
+        "sticker_device_id": camera_id,
+        "sticker_device_ip": CAMERA_IP,
+        "learned_code": LENS_PRINTER_CODE,
+        "learned_device_id": printer_id,
+        "learned_device_ip": DEVICE_BY_KEY["printer"].ip,
+        "ignored_code": LENS_IGNORED_CODE,
+        "untagged_devices": len(untagged),
+        "_events": pending_events,
+    }
+
+
+def lens_json_path(db_path: Path) -> Path:
+    """Where this seed's Lens facts belong.
+
+    The canonical demo database publishes to ``video/build/lens_demo.json``, which is what
+    ``scene_render.py``, ``phone.py`` and ``capture.py`` read. A seed written anywhere else
+    (a throwaway ``--out`` while someone is holding the demo database open) publishes beside
+    its own database instead, so a test run can never leave the shared file describing a
+    token that only works against a temporary copy.
+    """
+    if db_path.resolve() == DEMO_DB.resolve():
+        return LENS_JSON
+    return db_path.parent / "lens_demo.json"
+
+
+def write_lens_json(path: Path, facts: dict[str, Any], *, db_path: Path = DEMO_DB) -> Path:
+    """Publish the Lens secrets for the other video packages.
+
+    ``video/build/`` is gitignored, and every value here belongs to the throwaway demo
+    database in ``video/demo_data/`` — never to the owner's real install.
+    """
+    _guard_target(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {k: v for k, v in facts.items() if not k.startswith("_")}
+    payload["generated_at"] = iso(NOW)
+    payload["database"] = str(db_path)
+    payload["note"] = ("Demo-only secrets for video/demo_data/homesoc.db. Regenerated by "
+                       "seed_demo.py; never valid against a real Home SOC install.")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 # --------------------------------------------------------------------------- scans / jobs / events
 
 
@@ -1457,8 +1634,9 @@ def seed_jobs(conn: sqlite3.Connection, counts: Counts) -> None:
     )
 
 
-def seed_events(conn: sqlite3.Connection, counts: Counts) -> None:
-    rows: list[tuple[Any, ...]] = []
+def seed_events(conn: sqlite3.Connection, counts: Counts,
+                extra: Sequence[tuple[Any, ...]] = ()) -> None:
+    rows: list[tuple[Any, ...]] = list(extra)
 
     def event(hours: float, level: str, source: str, message: str, data: dict | None = None) -> None:
         rows.append((iso_ago(hours=hours), level, source, message, jdump(data) if data else None))
@@ -1795,20 +1973,77 @@ def _guard_target(path: Path) -> None:
         )
 
 
+def _empty_schema(path: Path) -> None:
+    """Drop every table, view, index and trigger, leaving an empty but existing file.
+
+    Windows refuses to unlink a SQLite file another process still has open, which is what
+    ``_remove_db`` runs into whenever a ``homesoc serve`` is left pointed at
+    ``video/demo_data``.  SQLite itself has no such problem: a second writer may connect and
+    empty the schema, after which ``hdb.connect`` re-creates it exactly as it would on a
+    brand-new file.  The resulting database is byte-for-byte equivalent in content; only the
+    inode survives.  Used by ``--in-place``.
+    """
+    conn = sqlite3.connect(path, timeout=60)
+    try:
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        objects = conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' "
+            "ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 "
+            "WHEN 'index' THEN 2 ELSE 3 END"
+        ).fetchall()
+        for kind, name in objects:
+            try:
+                conn.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
+            except sqlite3.Error:
+                if kind != "index":  # an index that went with its table is not an error
+                    raise
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        left = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        if left:
+            raise SystemExit(f"could not empty {path.name}: {left} schema objects remain.")
+        logger.info("emptied %s in place (%d objects dropped)", path.name, len(objects))
+    except sqlite3.Error as exc:
+        raise SystemExit(
+            f"cannot empty {path.name} in place ({exc}).\nIf a dashboard is mid-request "
+            "against the demo database, wait a moment and try again."
+        ) from exc
+    finally:
+        conn.close()
+
+
 def _remove_db(path: Path) -> None:
     for suffix in ("", "-wal", "-shm", "-journal"):
         candidate = Path(str(path) + suffix)
-        if candidate.exists():
+        if not candidate.exists():
+            continue
+        try:
             candidate.unlink()
-            logger.info("removed %s", candidate.name)
+        except PermissionError as exc:
+            # Windows will not unlink a file SQLite still has open, and the usual culprit is a
+            # `homesoc serve` left pointed at video/demo_data. Say so, rather than showing a
+            # traceback that looks like a bug in the seed.
+            raise SystemExit(
+                f"cannot rebuild {path.name}: {candidate.name} is open in another process "
+                f"({exc.strerror}).\nSomething is still serving the demo database — stop it "
+                "(a `python -m homesoc serve` started against video/demo_data, or a capture run) "
+                "and try again."
+            ) from exc
+        logger.info("removed %s", candidate.name)
 
 
-def build(path: Path, *, force: bool) -> dict[str, Any]:
+def build(path: Path, *, force: bool, in_place: bool = False) -> dict[str, Any]:
     _guard_target(path)
     if path.exists():
         if not force:
             raise SystemExit(f"{path} already exists — pass --force to rebuild it.")
-        _remove_db(path)
+        if in_place:
+            _empty_schema(path)
+        else:
+            _remove_db(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     problems = validate_findings(ALL_FINDINGS)
@@ -1831,13 +2066,27 @@ def build(path: Path, *, force: bool) -> dict[str, Any]:
         seed_findings(conn, ids, counts)
         seed_scans(conn, counts)
         seed_jobs(conn, counts)
-        seed_events(conn, counts)
+        lens_facts = seed_lens(conn, ids, counts)
+        seed_events(conn, counts, lens_facts["_events"])
         seed_notifications(conn, counts)
         seed_dns(conn, counts)
 
         score = scoremod.security_score(conn)
         seed_metrics(conn, score, counts)
         report = _report(conn, counts, score)
+        report["lens"] = {k: v for k, v in lens_facts.items() if not k.startswith("_")}
+        report["lens_tags"] = [
+            dict(row) for row in hdb.query(
+                conn,
+                "SELECT t.id, t.code, t.kind, t.device_id, t.label, t.created_at, t.created_by, "
+                "t.last_seen_at, t.scans, d.ip AS device_ip, "
+                "COALESCE(d.nickname, d.hostname, d.ip) AS device_name "
+                "FROM lens_tags t LEFT JOIN devices d ON d.id = t.device_id ORDER BY t.id",
+            )
+        ]
+        report["lens_json"] = str(
+            write_lens_json(lens_json_path(path), lens_facts, db_path=path)
+        )
     finally:
         # Fold the write-ahead log back into the file so the shipped database is one self-contained
         # artefact that capture.py (or anyone) can copy without losing rows.
@@ -1876,13 +2125,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="rebuild the database if it exists")
     parser.add_argument("--out", type=Path, default=DEMO_DB, help=f"target database (default: {DEMO_DB})")
     parser.add_argument("--quiet", action="store_true", help="only print the final summary line")
+    parser.add_argument(
+        "--in-place", action="store_true",
+        help="rebuild without unlinking the file: empty its schema and re-create it. Use when "
+             "a `homesoc serve` still has the demo database open (Windows will not unlink it).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
     )
-    report = build(args.out, force=args.force)
+    report = build(args.out, force=args.force, in_place=args.in_place)
 
     print(f"wrote {args.out}")
     for table, n in report["rows"].items():
@@ -1895,6 +2149,18 @@ def main(argv: Sequence[str] | None = None) -> int:
           f"(median time to fix {report['median_hours_to_fix']} h)")
     print(f"  dns 24 h           {report['dns_queries_24h']:,} queries · "
           f"{report['dns_block_rate'] * 100:.1f}% blocked")
+
+    lens = report["lens"]
+    print(f"  lens phone         {lens['token_label']} · scopes {lens['token_scopes']} · "
+          f"paired {lens['token_created_at']} · expires {lens['token_expires_at']}")
+    print(f"  lens sticker       {lens['sticker_code']}  ->  {lens['sticker_device_ip']}")
+    print(f"  lens untagged      {lens['untagged_devices']} devices left for the sticker sheet")
+    print(f"  lens facts         {report['lens_json']}")
+    print("  lens_tags:")
+    for tag in report["lens_tags"]:
+        bound = tag["device_name"] or "(nothing — ignored)"
+        print(f"    #{tag['id']} {tag['kind']:<8} {tag['code']:<28} -> {bound:<16} "
+              f"by {tag['created_by']:<9} scans={tag['scans']} created={tag['created_at']}")
     return 0
 
 

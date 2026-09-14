@@ -124,6 +124,13 @@ tag_learning = true                # allow unknown codes to be bound to a device
 allow_actions = false              # when true, a paired phone may trigger a rescan / acknowledge a finding
 token_ttl_days = 90                # paired-phone tokens expire after this; 0 = never
 max_tokens = 10                    # how many phones may be paired at once
+
+[topology]                         # dependency map and blast radius (see docs/SPEC_TOPOLOGY.md)
+enabled = true
+window_hours = 168                 # how far back to read DNS and sightings when building the graph
+include_cloud = true               # show external endpoints as nodes
+min_outage_members = 3             # devices that must drop together before it counts as an outage
+criticality_alert = 5              # dependents before NET-DEP-001 fires
 '''
 
 # Parsed once at import: DEFAULTS is the single source of truth for keys and types.
@@ -285,6 +292,38 @@ class Lens:
 
 
 @dataclass(frozen=True)
+class Topology:
+    """SPEC addendum C6. On by default: it reads data Home SOC already collects and adds
+    no traffic to the network, so the only cost is a few seconds of SQL every six hours.
+
+    The clamping properties exist because these numbers are also reachable from the
+    dashboard, and a zero or negative value would not be a policy — it would be a typo
+    that silently turns honest evidence into noise (``min_outage_members = 1`` would call
+    every phone leaving the house an outage).
+    """
+
+    enabled: bool = True
+    window_hours: int = 168
+    include_cloud: bool = True
+    min_outage_members: int = 3
+    criticality_alert: int = 5
+
+    @property
+    def hours(self) -> int:
+        """Graph window, clamped to a day at the bottom and a year at the top."""
+        return max(24, min(int(self.window_hours), 24 * 365))
+
+    @property
+    def outage_members(self) -> int:
+        """Two devices dropping together is a coincidence; the floor is 2, the default 3."""
+        return max(2, int(self.min_outage_members))
+
+    @property
+    def alert_dependents(self) -> int:
+        return max(1, int(self.criticality_alert))
+
+
+@dataclass(frozen=True)
 class Config:
     general: General = field(default_factory=General)
     web: Web = field(default_factory=Web)
@@ -297,6 +336,7 @@ class Config:
     notify: Notify = field(default_factory=Notify)
     schedule: Schedule = field(default_factory=Schedule)
     lens: Lens = field(default_factory=Lens)
+    topology: Topology = field(default_factory=Topology)
     source_path: str | None = None
 
     def get(self, dotted: str) -> Any:
@@ -327,6 +367,7 @@ SECTION_TYPES: dict[str, type] = {
     "notify": Notify,
     "schedule": Schedule,
     "lens": Lens,
+    "topology": Topology,
 }
 SECTIONS: tuple[str, ...] = tuple(SECTION_TYPES)
 
@@ -522,10 +563,28 @@ def write_example(path: Path) -> None:
     util.atomic_write_text(Path(path), EXAMPLE_TOML)
 
 
+# Numeric keys where a value outside the range is a mistake rather than a preference, checked
+# when a human sets one (set_override). A value read from config.toml is only clamped by the
+# section's properties — a bad file must not stop Home SOC starting — but a value typed into the
+# dashboard gets rejected at the point the person can still see why.
+# SPEC addendum C6: the topology numbers all have a floor below which the feature would report
+# things it has not seen (min_outage_members = 1 makes every phone leaving the house an outage).
+RANGES: dict[str, tuple[int, int]] = {
+    "topology.window_hours": (24, 24 * 365),
+    "topology.min_outage_members": (2, 1000),
+    "topology.criticality_alert": (1, 1000),
+}
+
+
 def set_override(conn: sqlite3.Connection, key: str, value: str) -> None:
     """Persist a dashboard override for a dotted key, validating type first so a typo
     never silently breaks the next config load."""
     normalized = coerce(key, value)  # raises ValueError for unknown key / bad value
+    bounds = RANGES.get(key)
+    if bounds is not None and isinstance(normalized, int) and not isinstance(normalized, bool):
+        low, high = bounds
+        if not low <= normalized <= high:
+            raise ValueError(f"{key}: {normalized} is outside the usable range {low}..{high}")
     if isinstance(normalized, tuple):
         stored = json.dumps(list(normalized))
     elif isinstance(normalized, bool):
@@ -567,6 +626,7 @@ __all__ = [
     "DEFAULTS",
     "SECTIONS",
     "SECRET_KEYS",
+    "RANGES",
     "Config",
     "General",
     "Web",
@@ -579,6 +639,7 @@ __all__ = [
     "Notify",
     "Schedule",
     "Lens",
+    "Topology",
     "load",
     "build",
     "with_overrides",

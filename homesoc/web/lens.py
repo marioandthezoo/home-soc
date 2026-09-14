@@ -979,6 +979,28 @@ def dns_section(
     return out
 
 
+def blast_section(conn: sqlite3.Connection, device_id: int) -> dict | None:
+    """"If this fails": what the house loses without this box (SPEC addendum C7).
+
+    The single best use of the dependency map — point the phone at a box and learn what depends on
+    it — so it ships inside the identification payload rather than costing a second round trip. It
+    stays deliberately small: the headline, the two counts, the confidence and the evidence line,
+    plus the packet-visibility note, and none of the three member lists.
+
+    The engine lives in ``homesoc.topology``, which is a separate package and may not be installed:
+    :func:`api.blast_summary` imports it lazily and answers ``None`` rather than raising, so a
+    missing (or broken) topology package costs the phone this one section and nothing else.
+    """
+    fn = getattr(api, "blast_summary", None)
+    if not callable(fn):  # an older api module: the overlay simply has no blast section
+        return None
+    try:
+        return fn(conn, int(device_id))
+    except Exception:  # belt and braces: this must never blank the rest of the card
+        logger.exception("could not build the Lens blast section for device %s", device_id)
+        return None
+
+
 def timeline(conn: sqlite3.Connection, device: dict, *, limit: int = TIMELINE_LIMIT) -> list[dict]:
     """The device's slice of the activity feed (A2), so Lens and the feed can never disagree."""
     device_id = int(device.get("id") or 0)
@@ -1089,6 +1111,9 @@ def lens_device(
             "severity_counts": counts,
             "headline": headline(device, open_findings, scanned=bool(device.get("last_service_scan"))),
         },
+        # None when the topology package is not installed (C7) — the key is always present so the
+        # phone can tell "nothing depends on this" from "this install cannot answer that".
+        "blast": blast_section(conn, int(device["id"])),
         "services": services,
         "vulns": vulns,
         "findings": [
@@ -1407,6 +1432,7 @@ __all__ = [
     "Match",
     "PORT_INFO",
     "STICKER_PREFIX",
+    "blast_section",
     "claim",
     "claim_allowed",
     "claim_reset",

@@ -13,6 +13,20 @@ as a PNG except when you explicitly ask for probe frames.
 
 Output format (CONTRACT.md section 5): 1920x1080, 30 fps, H.264 yuv420p, CRF 19.
 
+CONTRACT_V2 adds the Lens act, which brings three new things to this module:
+
+* **phone shots** - a 390x844 Lens screen, captured at ``device_scale_factor=3``
+  and composited into a drawn phone body (``video/phone.phone_frame`` when that
+  module is importable, otherwise the equivalent drawn here), standing on the
+  1920x1080 canvas at roughly two thirds of frame height so the screen text is
+  legible at 1080p;
+* ``PhonePair`` - the illustrated scene and the phone side by side for scene 18,
+  with a dashed view cone from the phone to a target ring on the thing it is
+  pointed at, so the relationship reads without narration;
+* ``Tap`` and ``PhoneScroll`` - a finger press (a filled circle that expands and
+  fades, deliberately *not* the desktop cursor's arrow-and-halo) and a genuine
+  translation of the phone's screen content.
+
 --------------------------------------------------------------------------
 File conventions this module expects from the other packages
 --------------------------------------------------------------------------
@@ -22,6 +36,12 @@ File conventions this module expects from the other packages
                                is the opening shot; each later one is produced
                                by a ``PageSequence`` member, a ``Click``'s
                                ``then_shot``, or a ``Scroll``.
+                               ``kind`` is ``"page"``, ``"slide"``, ``"phone"``
+                               or ``"phone_pair"``; a ``phone_pair`` row also
+                               carries ``scene_png`` (the illustrated scene) and
+                               may carry ``aim`` = ``[fx, fy]``, where in that
+                               illustration the phone is pointed (fractions of
+                               the image, default the middle right).
 ``build/shots/<scene_id>_<k>.png``   the images the manifest points at; also the
                                glob fallback when there is no manifest.
 ``build/geometry.json``        ``{scene_id: {"css=<selector>": [x, y, w, h]}}``,
@@ -61,7 +81,9 @@ a cursor blit, which is what keeps a ~14,000 frame render inside a few minutes.
 
 Run ``python video/compose.py --selftest`` to render a synthetic 10 second clip
 that exercises every effect against fake shots it draws itself, and leaves
-probe PNGs in ``build/selftest/probe`` to look at.
+probe PNGs in ``build/selftest/probe`` to look at.  ``--selftest-phone`` does the
+same for the Lens shots: a phone screen, a ``Tap``, a ``PhoneScroll``, a
+``PhonePair`` and the head dissolve, into ``build/selftest/probe_phone``.
 """
 
 from __future__ import annotations
@@ -77,7 +99,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Final, Iterable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -126,6 +148,13 @@ PRESS_SECONDS = 0.06
 AFTER_DELAY = 0.12  # crossfade to the after-state starts this long after the ripple
 SWAP_SECONDS = 0.22
 CAPTION_FADE = 0.30
+#: How long the lower third stays up before fading, in seconds. It used to hold for the
+#: whole scene, and at 34 px the pill is ~300 CSS px wide - about 60 px past the sidebar -
+#: so on a 65 s scene it sat on top of page content for a minute: it ate the leading "W" of
+#: WIN-ACC-005, blanked the hostname cell of the 192.168.1.71 row under a Zoom, and covered
+#: the "BY CATEGORY" heading on /summary. A lower third names the shot and leaves; holding
+#: one is what broadcast calls a bug, not a caption.
+CAPTION_HOLD = 5.6
 HIGHLIGHT_FADE = 0.25
 DIM_STRENGTH = 0.25
 MAX_ZOOM = 1.6
@@ -151,6 +180,41 @@ CURSOR_HOT = 46  # hotspot offset inside the tile, both axes
 SUBPIXEL_STEPS = 4
 
 DEFAULT_CURSOR_START = (1180.0, 760.0)  # CSS space
+
+# --- phone shots (CONTRACT_V2 V2) ------------------------------------------
+#: the Lens viewport, in phone CSS pixels; captured at device_scale_factor=3
+PHONE_CSS_W, PHONE_CSS_H = 390.0, 844.0
+#: Phone *body* height as a fraction of the 1080 px canvas (the drop shadow is not
+#: part of the phone). CONTRACT_V2 V5 asks for 55-70% in phone-only scenes, and the
+#: top of that range is the only part of it that keeps the Lens screen near 1:1 with
+#: its own CSS pixels - 0.70 puts a 390x844 viewport on screen at 0.87x, so 15 px
+#: body text lands at 13 px. Anything lower and the phone starts lying about how
+#: readable the real thing is.
+PHONE_BODY_FRAC = 0.70
+#: The pair shot has to fit an illustration beside it, so the phone gives up a little -
+#: but only a little. This is the money shot, and the card that rises on it is the densest
+#: screen in the film; 0.68 costs the illustration about 2% of its width and buys the card
+#: a tenth more type. Still inside the contract's 55-70%.
+PHONE_PAIR_BODY_FRAC = 0.68
+#: canvas margins for the pair layout
+PHONE_MARGIN = 88
+PHONE_PAIR_GAP = 56
+#: Where the phone is pointed in the illustrated scene, as fractions of the
+#: illustration - by default the sticker, which ``scene_render.py`` centres at
+#: (WIDTH/2, 250) of its 1280x720 frame. A manifest row overrides it with
+#: ``"aim": [fx, fy]``.
+PHONE_AIM_DEFAULT = (0.50, 0.35)
+
+#: a finger press: a filled circle that expands and fades
+TAP_SECONDS = 0.55
+#: Contact radius and final ring radius, **in the phone's own 390x844 CSS pixels**, scaled
+#: to the canvas by however big the composited phone is. They used to be canvas constants
+#: (18 -> 104 px), which on a 0.83x phone drew a ~200 px near-white disc: the one tap in the
+#: Lens act washed out the sheet's drag handle, the "Vulnerabilities 1" header and the top
+#: two lines of the CVE text. A fingertip on a 390 px-wide screen is about 40 px across.
+TAP_START_R_CSS = 11.0
+TAP_MAX_R_CSS = 42.0
+TAP_RGB = (226, 236, 255)
 
 _FONT_CANDIDATES = (
     r"C:\Windows\Fonts\seguisb.ttf",
@@ -520,6 +584,57 @@ def glow_sprite(w: int, h: int) -> Sprite:
     return sprite_from_image(im)
 
 
+_tap_grids: dict[int, np.ndarray] = {}
+
+
+def tap_tile(scale: float) -> int:
+    """Sprite side for a tap drawn at ``scale`` (canvas px per phone CSS px)."""
+    return int(2 * math.ceil(TAP_MAX_R_CSS * max(0.05, scale)) + 26)
+
+
+def tap_sprite(t: float, seconds: float = TAP_SECONDS, scale: float = 1.0) -> Sprite | None:
+    """A finger press: a filled disc that expands and fades.  ``t`` is seconds since the tap.
+
+    Deliberately not the desktop click ripple.  That one is two thin expanding
+    *rings* drawn under an arrow pointer; this is a solid translucent disc with a
+    soft edge and no pointer at all, which is what a touch looks like and what
+    tells a viewer that nobody is holding a mouse.
+
+    ``scale`` is canvas pixels per phone CSS pixel, so the circle is a fingertip on
+    the screen it is touching rather than a fixed lump of canvas.
+    """
+    if t < 0.0 or t > seconds:
+        return None
+    tile = tap_tile(scale)
+    d = _tap_grids.get(tile)
+    if d is None:
+        yy, xx = np.mgrid[0:tile, 0:tile].astype(np.float32)
+        c = tile / 2.0
+        d = np.hypot(xx - c, yy - c)
+        _tap_grids[tile] = d
+
+    r0 = TAP_START_R_CSS * scale
+    r1 = TAP_MAX_R_CSS * scale
+    shoulder = max(2.0, 5.0 * scale)
+    u = t / max(1e-6, seconds)
+    r = r0 + (r1 - r0) * ease_out_cubic(u)
+    fade = (1.0 - u) ** 1.35
+
+    # the disc: full inside, a soft shoulder at the rim
+    disc = np.clip((r - d) / shoulder, 0.0, 1.0) * (0.19 * fade)
+    # a brighter rim, so the growth is readable against a busy camera image
+    rim = np.exp(-(((d - r) / max(1.6, 3.4 * scale)) ** 2)) * (0.46 * fade)
+    # the contact point itself: a small bright dot that fades faster than the disc
+    core = np.exp(-((d / max(4.0, 8.0 * scale)) ** 2)) * max(0.0, 1.0 - u * 2.4) * 0.50
+
+    a = np.clip(disc + rim + core, 0.0, 0.66)
+    if float(a.max()) < 0.004:
+        return None
+    rgb = np.empty((tile, tile, 3), dtype=np.uint8)
+    rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2] = TAP_RGB
+    return Sprite(rgb=rgb, alpha=np.ascontiguousarray(a[:, :, None].astype(np.float32)))
+
+
 # --------------------------------------------------------------------------
 # Window chrome
 # --------------------------------------------------------------------------
@@ -824,6 +939,617 @@ def blend_frames(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# Phone layers (the Lens shots)
+# --------------------------------------------------------------------------
+
+PHONE_KINDS = frozenset({"phone", "phone_pair", "phonepair", "phone-pair"})
+
+
+def is_phone_kind(kind: str) -> bool:
+    return str(kind or "").strip().lower() in PHONE_KINDS
+
+
+def is_pair_kind(kind: str) -> bool:
+    return str(kind or "").strip().lower() in {"phone_pair", "phonepair", "phone-pair"}
+
+
+_phone_module_cache: list[Any] = []
+
+
+def phone_module() -> Any | None:
+    """``video/phone.py`` if the capture package has landed it, else ``None``.
+
+    The drawn phone body belongs to the capture package (CONTRACT_V2 V2), so it
+    is used whenever it is importable.  The fallback below exists so this module
+    can be developed and self-tested on its own, and so a missing phone.py is a
+    warning rather than a dead pipeline.
+    """
+    if not _phone_module_cache:
+        try:
+            import phone as _phone  # type: ignore[import-not-found]
+
+            _phone_module_cache.append(_phone)
+        except Exception as exc:  # noqa: BLE001 - any import failure is the same story
+            log.info(
+                "video/phone.py is not importable (%s: %s) - drawing the phone body here instead",
+                type(exc).__name__, exc,
+            )
+            _phone_module_cache.append(None)
+    return _phone_module_cache[0]
+
+
+def _fallback_phone_frame(screen: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Draw a phone body around ``screen``.  Returns (RGBA image, screen rect in it).
+
+    Only used when ``video/phone.py`` is not importable.  Everything is drawn
+    programmatically at the screen's own resolution (3x), so the one downscale
+    to the canvas happens afterwards and the text stays crisp.
+    """
+    sw, sh = screen.size
+    bez = max(6, int(round(sh * 0.0295)))  # uniform bezel
+    pad = max(8, int(round(sh * 0.040)))  # room for the drop shadow
+    r_out = int(round(sh * 0.082))
+    r_in = max(2, r_out - bez)
+    w, h = sw + 2 * bez + 2 * pad, sh + 2 * bez + 2 * pad
+    body = (pad, pad, pad + sw + 2 * bez, pad + sh + 2 * bez)
+
+    im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+    shadow = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (body[0], body[1] + int(pad * 0.55), body[2], body[3] + int(pad * 0.55)),
+        radius=r_out, fill=210,
+    )
+    shadow = shadow.filter(ImageFilter.GaussianBlur(pad * 0.55))
+    im.putalpha(shadow)
+    im.paste((0, 0, 0), (0, 0, w, h), shadow)
+
+    draw = ImageDraw.Draw(im)
+    draw.rounded_rectangle(body, radius=r_out, fill=(8, 10, 14, 255))
+    # rim highlight: a hairline of reflected light around the body
+    draw.rounded_rectangle(body, radius=r_out, outline=(120, 132, 156, 150), width=max(2, bez // 10))
+    draw.rounded_rectangle(
+        (body[0] + bez - 2, body[1] + bez - 2, body[2] - bez + 2, body[3] - bez + 2),
+        radius=r_in + 2, outline=(0, 0, 0, 210), width=max(2, bez // 8),
+    )
+
+    sx, sy = pad + bez, pad + bez
+    mask = Image.new("L", (sw, sh), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, sw - 1, sh - 1), radius=r_in, fill=255)
+    im.paste(screen.convert("RGB"), (sx, sy), mask)
+
+    # speaker slot
+    slot_w, slot_h = int(sw * 0.20), max(3, int(sh * 0.0075))
+    cx = pad + bez + sw // 2
+    slot_y = pad + bez // 2 - slot_h // 2
+    draw.rounded_rectangle(
+        (cx - slot_w // 2, slot_y, cx + slot_w // 2, slot_y + slot_h),
+        radius=slot_h, fill=(30, 34, 44, 255),
+    )
+    return im, (sx, sy, sw, sh)
+
+
+Rect4 = tuple[float, float, float, float]
+
+
+def _frame_geometry(framed: Image.Image, screen_size: tuple[int, int]) -> tuple[Rect4, Rect4]:
+    """``(body rect, screen rect)`` inside a framed phone drawn by another module.
+
+    The body is the opaque part of the image - a drop shadow is translucent, so a
+    threshold removes it, which matters because the shadow is what makes "70% of
+    frame height" mean two different things.  Assuming the bezel is the same
+    thickness on all four sides - which is what every drawn phone body in this
+    project does - the screen height then solves exactly:
+    ``body_h - s == body_w - a*s`` for screen aspect ``a``.
+    """
+    alpha = np.asarray(framed.convert("RGBA"), dtype=np.uint8)[:, :, 3]
+    solid = alpha > 190
+    rows = np.flatnonzero(solid.any(axis=1))
+    cols = np.flatnonzero(solid.any(axis=0))
+    if not rows.size or not cols.size:
+        whole = (0.0, 0.0, float(framed.width), float(framed.height))
+        return whole, whole
+    by, bx = float(rows[0]), float(cols[0])
+    bh, bw = float(rows[-1] - rows[0] + 1), float(cols[-1] - cols[0] + 1)
+    body = (bx, by, bw, bh)
+    a = screen_size[0] / screen_size[1]
+    s_h = (bh - bw) / (1.0 - a)
+    bez = (bh - s_h) / 2.0
+    if 0.55 * bh <= s_h <= bh and bez >= 0.0:
+        return body, (bx + bez, by + bez, a * s_h, s_h)
+    log.warning(
+        "could not infer the screen rect inside the phone frame "
+        "(body %.0fx%.0f -> screen height %.1f); using the whole body",
+        bw, bh, s_h,
+    )
+    return body, body
+
+
+def frame_phone(screen: Image.Image, body_height: float) -> tuple[Image.Image, Rect4, Rect4]:
+    """Composite a Lens screen into a phone body whose *body* is ``body_height`` px tall.
+
+    Returns ``(RGBA image, screen rect, body rect)``.  ``body_height`` is measured
+    on the phone itself, not on the returned image: the frame carries a drop
+    shadow, and sizing to the image would quietly make the phone a tenth smaller
+    than CONTRACT_V2 V5 asks for, which is a tenth off the screen text too.
+
+    The 3x screen is resampled exactly once - the frame is drawn at the
+    screenshot's own resolution, then the finished frame is scaled down in a
+    single LANCZOS pass.
+    """
+    mod = phone_module()
+    fn = getattr(mod, "phone_frame", None) if mod is not None else None
+    if fn is None:
+        natural, _ = _fallback_phone_frame(screen)
+        body, screen_rect_f = _frame_geometry(natural, screen.size)
+    else:
+        natural = fn(screen)
+        if not isinstance(natural, Image.Image):
+            raise ComposeError(
+                f"phone.phone_frame returned {type(natural).__name__}, expected a PIL Image"
+            )
+        natural = natural.convert("RGBA")
+        body, screen_rect_f = _frame_geometry(natural, screen.size)
+        rect_fn = getattr(mod, "screen_rect", None)
+        if callable(rect_fn):
+            try:
+                r = tuple(float(v) for v in rect_fn(natural))
+                if len(r) == 4 and r[2] > 0 and r[3] > 0:
+                    screen_rect_f = r  # type: ignore[assignment]
+            except Exception as exc:  # noqa: BLE001
+                log.warning("phone.screen_rect failed (%s); inferring it instead", exc)
+
+    k = body_height / max(1.0, body[3])
+    framed = natural.resize(
+        (max(2, int(round(natural.width * k))), max(2, int(round(natural.height * k)))),
+        Image.LANCZOS,
+    )
+    natural.close()
+    return (
+        framed,
+        tuple(v * k for v in screen_rect_f),  # type: ignore[return-value]
+        tuple(v * k for v in body),  # type: ignore[return-value]
+    )
+
+
+def _rounded_mask(w: int, h: int, radius: int) -> np.ndarray:
+    m = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(m).rounded_rectangle((0, 0, w - 1, h - 1), radius=max(0, radius), fill=255)
+    return (np.asarray(m, dtype=np.float32) / 255.0)[:, :, None]
+
+
+_phone_backdrop_cache: dict[int, np.ndarray] = {}
+
+
+def phone_backdrop(cx: int) -> np.ndarray:
+    """The canvas a phone stands on: the film's background plus one soft accent glow."""
+    key = int(cx) // 16
+    hit = _phone_backdrop_cache.get(key)
+    if hit is not None:
+        return hit
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot((xx - key * 16) / 1.35, (yy - H * 0.52) / 1.0)
+    g = (np.clip(1.0 - d / 780.0, 0.0, 1.0) ** 1.8 * 0.20)[:, :, None]
+    base = np.empty((H, W, 3), dtype=np.float32)
+    base[:, :] = BG
+    out = np.clip(base * (1.0 - g) + np.asarray(ACCENT, dtype=np.float32) * g, 0, 255).astype(
+        np.uint8
+    )
+    _phone_backdrop_cache[key] = out
+    return out
+
+
+def scene_card(im: Image.Image, max_w: int, max_h: int) -> tuple[Sprite, int, int, int]:
+    """The illustrated scene as a framed card.
+
+    Returns ``(sprite, card_w, card_h, margin)``; the sprite is ``margin`` px
+    bigger on every side than the card, because it carries its own drop shadow.
+    """
+    k = min(max_w / im.width, max_h / im.height)
+    cw, ch = max(2, int(im.width * k)), max(2, int(im.height * k))
+    card = im.convert("RGB").resize((cw, ch), Image.LANCZOS)
+    margin = 30
+    out = Image.new("RGBA", (cw + margin * 2, ch + margin * 2), (0, 0, 0, 0))
+
+    shadow = Image.new("L", out.size, 0)
+    ImageDraw.Draw(shadow).rounded_rectangle(
+        (margin, margin + 12, margin + cw, margin + ch + 12), radius=CORNER_RADIUS + 4, fill=190
+    )
+    out.putalpha(shadow.filter(ImageFilter.GaussianBlur(16)))
+    out.paste((0, 0, 0), (0, 0, *out.size), out.getchannel("A"))
+
+    mask = Image.new("L", (cw, ch), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, cw - 1, ch - 1), radius=CORNER_RADIUS, fill=255)
+    out.paste(card, (margin, margin), mask)
+    ImageDraw.Draw(out).rounded_rectangle(
+        (margin, margin, margin + cw - 1, margin + ch - 1),
+        radius=CORNER_RADIUS, outline=(*BORDER, 255), width=2,
+    )
+    return sprite_from_image(out), cw, ch, margin
+
+
+def _dashed_line(
+    draw: ImageDraw.ImageDraw,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    colour: tuple[int, int, int, int],
+    width: int = 3,
+    dash: float = 16.0,
+    gap: float = 12.0,
+) -> None:
+    length = math.dist(p0, p1)
+    if length <= 1.0:
+        return
+    ux, uy = (p1[0] - p0[0]) / length, (p1[1] - p0[1]) / length
+    pos = 0.0
+    while pos < length:
+        end = min(length, pos + dash)
+        draw.line(
+            [(p0[0] + ux * pos, p0[1] + uy * pos), (p0[0] + ux * end, p0[1] + uy * end)],
+            fill=colour, width=width,
+        )
+        pos = end + gap
+
+
+def sight_line_sprite(
+    apex: tuple[float, float],
+    aim: tuple[float, float],
+    spread: float,
+    fill_until: float | None = None,
+) -> Sprite:
+    """The 'this phone is looking at that thing' overlay: a view cone and a target ring.
+
+    ``fill_until`` is the right edge of the illustration: the cone's translucent
+    fill is cut off there so it reads as a beam crossing the gap rather than as a
+    blue wash over half the picture, while the dashed edges carry on to the target.
+    """
+    im = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    ax, ay = aim
+    top = (ax, ay - spread)
+    bottom = (ax, ay + spread)
+
+    cone = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(cone).polygon([apex, top, bottom], fill=(*ACCENT, 30))
+    if fill_until is not None:
+        edge = int(clamp(fill_until, 0, W))
+        fade = np.asarray(cone, dtype=np.uint8).copy()
+        ramp = 90
+        fade[:, :max(0, edge - ramp), 3] = 0
+        if ramp > 0 and edge > 0:
+            lo = max(0, edge - ramp)
+            grad = np.linspace(0.0, 1.0, edge - lo, dtype=np.float32)[None, :]
+            fade[:, lo:edge, 3] = (fade[:, lo:edge, 3] * grad).astype(np.uint8)
+        cone = Image.fromarray(fade, "RGBA")
+    im.alpha_composite(cone)
+
+    _dashed_line(d, apex, top, (*ACCENT, 170), width=3)
+    _dashed_line(d, apex, bottom, (*ACCENT, 170), width=3)
+
+    # Focus brackets, not a bullseye: this lands on the sticker, and the sticker is the
+    # thing the shot is about. One faint ring for the eye, four corner ticks for the
+    # framing, and nothing at all over the code itself.
+    outer = spread
+    d.ellipse((ax - outer, ay - outer, ax + outer, ay + outer), outline=(*ACCENT, 95), width=2)
+    tick = outer * 0.30
+    for sx, sy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+        cx, cy = ax + sx * outer, ay + sy * outer
+        d.line([(cx, cy), (cx - sx * tick, cy)], fill=(*ACCENT, 235), width=3)
+        d.line([(cx, cy), (cx, cy - sy * tick)], fill=(*ACCENT, 235), width=3)
+    return sprite_from_image(im)
+
+
+def detect_fixed_rows(
+    a: np.ndarray, b: np.ndarray, tol: int = 6, cap_frac: float = 0.70
+) -> list[tuple[int, int]]:
+    """Leading/trailing row bands identical in both scroll states, as ``(y0, y1)``.
+
+    The phone equivalent of :func:`detect_fixed_bands`.  A ``PhoneScroll`` scrolls
+    the Lens card's own body, so the status bar, the viewfinder above the card and
+    any pinned footer are pixel-identical in both shots and must not slide with the
+    content - which is exactly what these bands hold still.
+
+    ``cap_frac`` is deliberately looser than the desktop's 45%: on a phone the
+    viewfinder takes the top third and the card's pinned header another fifth, so
+    well over half the screen legitimately does not move.
+    """
+    h = a.shape[0]
+    same = np.abs(a.astype(np.int16) - b.astype(np.int16)).max(axis=2) <= tol
+    row_frac = same.mean(axis=1)
+    cap = int(h * cap_frac)
+    bands: list[tuple[int, int]] = []
+
+    top = 0
+    while top < cap and row_frac[top] > 0.985:
+        top += 1
+    if top >= 8 and float(a[:top].std()) > 4.0:
+        bands.append((0, top))
+
+    bot = 0
+    while bot < cap and row_frac[h - 1 - bot] > 0.985:
+        bot += 1
+    if bot >= 8 and float(a[h - bot :].std()) > 4.0:
+        bands.append((h - bot, h))
+    return bands
+
+
+class PhoneStore:
+    """Builds and caches the composed canvas for every phone state in one scene.
+
+    A scene has a handful of phone states, so everything here is done once per
+    state and then reused: framing the 3x screen, the single downscale to the
+    canvas, the illustrated scene's card, the view cone, and the finished
+    1920x1080 canvas.  Per frame the store only hands back a cached array (or,
+    during a ``PhoneScroll``, splices a translated strip into the screen rect).
+    """
+
+    def __init__(self, states: Sequence[ShotState], scene_id: str = "?") -> None:
+        self._states = list(states)
+        self._scene_id = scene_id
+        self._entries: dict[int, dict[str, Any]] = {}
+        self._strips: dict[tuple[int, int], tuple[np.ndarray, int]] = {}
+
+    # -- construction -------------------------------------------------------
+
+    def _entry(self, idx: int) -> dict[str, Any]:
+        idx = min(max(idx, 0), len(self._states) - 1)
+        hit = self._entries.get(idx)
+        if hit is not None:
+            return hit
+        st = self._states[idx]
+        if not st.png.exists():
+            raise FileNotFoundError(f"[{self._scene_id}] missing phone shot: {st.png}")
+        with Image.open(st.png) as raw:
+            screen = raw.convert("RGB")
+            screen.load()
+
+        pair = is_pair_kind(st.kind)
+        frac = PHONE_PAIR_BODY_FRAC if pair else PHONE_BODY_FRAC
+        framed, rect, body = frame_phone(screen, H * frac)
+        screen.close()
+        sx, sy = int(round(rect[0])), int(round(rect[1]))
+        sw, sh = max(1, int(round(rect[2]))), max(1, int(round(rect[3])))
+        bx, by = int(round(body[0])), int(round(body[1]))
+        bw, bh = max(1, int(round(body[2]))), max(1, int(round(body[3])))
+
+        # placed by the phone's *body*, so the drop shadow does not shift it
+        if pair:
+            px = W - PHONE_MARGIN - (bx + bw)
+        else:
+            px = (W - bw) // 2 - bx
+        py = (H - bh) // 2 - by
+
+        canvas = phone_backdrop(int(W * 0.5) if pair else px + bx + bw // 2).copy()
+        entry: dict[str, Any] = {
+            "sprite": sprite_from_image(framed),
+            "framed": framed,
+            "pos": (px, py),
+            # the screen rect on the 1920x1080 canvas
+            "screen": (px + sx, py + sy, sw, sh),
+            "body": (px + bx, py + by, bw, bh),
+            "radius": int(round(sh * 0.055)),
+            "pair": pair,
+        }
+
+        if pair:
+            scene_png = st.scene_png
+            if scene_png is None or not Path(scene_png).exists():
+                raise ComposeError(
+                    f"[{self._scene_id}] state {idx} is a PhonePair but has no illustrated "
+                    f"scene image (looked for {scene_png!r}). capture.py must record it as "
+                    f"'scene_png' in shots_manifest.json, or leave it next to the phone shot "
+                    f"as <scene>_<n>_scene.png."
+                )
+            with Image.open(scene_png) as raw_scene:
+                illo = raw_scene.convert("RGB")
+                illo.load()
+            avail_w = (px + bx) - PHONE_PAIR_GAP - PHONE_MARGIN
+            avail_h = int(H * 0.72)
+            card, cw, ch, margin = scene_card(illo, max(120, avail_w), avail_h)
+            illo.close()
+            cx0 = PHONE_MARGIN + max(0, (avail_w - cw) // 2)
+            cy0 = (H - ch) // 2
+            blit(canvas, card, cx0 - margin, cy0 - margin)
+            fx, fy = st.aim or PHONE_AIM_DEFAULT
+            aim = (cx0 + cw * float(fx), cy0 + ch * float(fy))
+            apex = (px + bx, py + by + bh * 0.30)
+            blit(
+                canvas,
+                # the brackets want to sit just outside the sticker, which is about a
+                # sixth of the illustration's height in scene_render.py's framing
+                sight_line_sprite(apex, aim, spread=min(ch * 0.17, 128.0), fill_until=cx0 + cw),
+                0,
+                0,
+            )
+
+        blit(canvas, entry["sprite"], px, py)
+        entry["canvas"] = canvas
+
+        # A burst state: pre-downscale every captured frame's screen once, so playback is
+        # one masked paste per output frame. The screen is resampled straight from the 3x
+        # screenshot to the composited screen rect, which is what frame_phone does to the
+        # first one, so nothing pops between frame 0 and the rest.
+        if st.frames:
+            mask = _rounded_mask(sw, sh, entry["radius"])
+            screens: list[np.ndarray] = []
+            for path in st.all_frames:
+                with Image.open(path) as raw_frame:
+                    small = raw_frame.convert("RGB").resize((sw, sh), Image.LANCZOS)
+                    screens.append(np.asarray(small, dtype=np.uint8).copy())
+            entry["burst"] = screens
+            entry["burst_mask"] = mask
+            entry["burst_interval"] = float(st.frame_interval) or (1.0 / 15.0)
+            log.info(
+                "[%s] state %d plays a %d-frame burst at %.0f ms",
+                self._scene_id, idx, len(screens), entry["burst_interval"] * 1000.0,
+            )
+
+        self._entries[idx] = entry
+        return entry
+
+    # -- what the frame loop asks for ---------------------------------------
+
+    def canvas(self, idx: int) -> np.ndarray:
+        return self._entry(idx)["canvas"]
+
+    def has_burst(self, idx: int) -> bool:
+        return bool(self._entry(idx).get("burst"))
+
+    def canvas_at(self, idx: int, t: float) -> np.ndarray:
+        """The canvas for this state at scene time ``t``.
+
+        Identical to :meth:`canvas` unless the state was captured as a burst, in which case
+        the viewfinder plays: the handheld drift that ``scene_render.py`` baked into
+        ``build/scene_camera.y4m`` (CONTRACT_V2 V3.2) reaches the finished film here and
+        nowhere else. The burst loops, forwards then backwards, so a six-second clip
+        sampled for sixteen seconds never jump-cuts back to its first frame.
+        """
+        entry = self._entry(idx)
+        burst: list[np.ndarray] | None = entry.get("burst")
+        if not burst:
+            return entry["canvas"]
+        n = len(burst)
+        if n == 1:
+            return entry["canvas"]
+        step = int(max(0.0, t) / entry["burst_interval"])
+        period = 2 * n - 2
+        k = step % period
+        k = k if k < n else period - k
+        canvas = entry["canvas"].copy()
+        sx, sy, sw, sh = entry["screen"]
+        m = entry["burst_mask"]
+        region = canvas[sy : sy + sh, sx : sx + sw]
+        np.copyto(region, (region * (1.0 - m) + burst[k] * m + 0.5).astype(np.uint8))
+        return canvas
+
+    def css_scale(self, idx: int) -> float:
+        """Canvas pixels per phone CSS pixel for this state's composited screen."""
+        return float(self._entry(idx)["screen"][2]) / PHONE_CSS_W
+
+    def to_canvas(self, idx: int, css: tuple[float, float]) -> tuple[float, float]:
+        """A point in the 390x844 Lens viewport -> a point on the 1920x1080 canvas."""
+        sx, sy, sw, sh = self._entry(idx)["screen"]
+        x, y = float(css[0]), float(css[1])
+        # capture.py may report a tap target in device pixels (3x); treat anything
+        # far outside the CSS viewport as such rather than putting the tap off-screen
+        if x > PHONE_CSS_W * 1.2 or y > PHONE_CSS_H * 1.2:
+            x, y = x / 3.0, y / 3.0
+        return (sx + x / PHONE_CSS_W * sw, sy + y / PHONE_CSS_H * sh)
+
+    def _scroll_band(
+        self, frm: int, to: int, crop_a: np.ndarray, crop_b: np.ndarray, sh: int
+    ) -> tuple[int, int]:
+        """Which rows of the composited screen a PhoneScroll is allowed to move.
+
+        Prefer the rect ``phone.py`` measured for the element that actually scrolls. The
+        fallback - differencing the two screenshots and calling the identical rows fixed -
+        is right on a static page and *wrong* on Lens: the rows above the card are a live
+        camera feed, so two captures of the same card at different offsets differ up there
+        by a few units of noise, the top band is never detected, and the whole screen gets
+        stacked. That is the tear at 11:30 in the v2 cut - the card's headline clipped at a
+        hard edge with a band of viewfinder spliced under it and a second drag handle below
+        that.
+        """
+        rect = self._states[frm].scroller or self._states[to].scroller
+        if rect is not None:
+            sy_screen = self._entry(frm)["screen"][3]
+            k = sy_screen / PHONE_CSS_H
+            y0 = int(round(rect[1] * k))
+            y1 = int(round((rect[1] + rect[3]) * k))
+            y0 = max(0, min(sh, y0))
+            y1 = max(y0, min(sh, y1))
+            if y1 - y0 >= 40:
+                return y0, y1
+            log.warning(
+                "[%s] the declared scroller rect %r is only %d px tall on the composited "
+                "screen; falling back to differencing", self._scene_id, rect, y1 - y0,
+            )
+        y0, y1 = 0, sh
+        for band_y0, band_y1 in detect_fixed_rows(crop_a, crop_b):
+            if band_y0 == 0:
+                y0 = band_y1
+            elif band_y1 >= sh:
+                y1 = band_y0
+        if y1 - y0 < 40:  # nothing sensible left to move
+            y0, y1 = 0, sh
+        return y0, y1
+
+    def _strip(self, swap: Swap) -> tuple[np.ndarray, int, tuple[int, int]]:
+        """The scrolling part of the screen, stacked into the strip it came from.
+
+        Returns ``(strip, dy, (y0, y1))`` where ``y0..y1`` is the band of screen
+        rows that actually moves.  Only that band is stacked: a ``PhoneScroll``
+        moves the Lens card's body while the viewfinder above it and the card's
+        own header stay put, and stacking the whole screen would drag a second
+        copy of that header up through the frame.
+        """
+        key = (swap.frm, swap.to)
+        hit = self._strips.get(key)
+        if hit is not None:
+            return hit  # type: ignore[return-value]
+        a = self._entry(swap.frm)
+        b = self._entry(swap.to)
+        sx, sy, sw, sh = a["screen"]
+        dy = int(round(abs(swap.dy_css) * (sh / PHONE_CSS_H)))
+        crop_a = a["canvas"][sy : sy + sh, sx : sx + sw]
+        bx, by, _bw, _bh = b["screen"]
+        crop_b = b["canvas"][by : by + sh, bx : bx + sw]
+        if dy <= 0 or crop_a.shape != crop_b.shape:
+            out = (np.ascontiguousarray(crop_b), 0, (0, sh))
+        else:
+            y0, y1 = self._scroll_band(swap.frm, swap.to, crop_a, crop_b, sh)
+            band_h = y1 - y0
+            if dy >= band_h:
+                # No overlap between the two screens: the rows in between were never
+                # captured, so there is no strip to translate. Cross-fade instead of
+                # scrolling through pixels that do not exist.
+                log.info(
+                    "[%s] a %.0f px scroll is longer than the %d px it scrolls, so states "
+                    "%d->%d cross-fade rather than glide",
+                    self._scene_id, abs(swap.dy_css), band_h, swap.frm, swap.to,
+                )
+                out = (np.ascontiguousarray(crop_b), 0, (y0, y1))
+                self._strips[key] = out  # type: ignore[assignment]
+                return out  # type: ignore[return-value]
+            tall = np.empty((band_h + dy, sw, 3), dtype=np.uint8)
+            if swap.dy_css > 0:  # scrolling down: A on top, B below
+                tall[:band_h] = crop_a[y0:y1]
+                tall[dy:] = crop_b[y0:y1]
+            else:
+                tall[:band_h] = crop_b[y0:y1]
+                tall[dy:] = crop_a[y0:y1]
+            out = (tall, dy, (y0, y1))
+        self._strips[key] = out  # type: ignore[assignment]
+        return out  # type: ignore[return-value]
+
+    def scroll_canvas(self, swap: Swap, progress: float) -> np.ndarray:
+        """A mid-``PhoneScroll`` canvas: the screen content translated inside the bezel."""
+        a = self._entry(swap.frm)
+        sx, sy, sw, sh = a["screen"]
+        strip, dy, (y0, y1) = self._strip(swap)
+        if dy <= 0:
+            return blend_frames(a["canvas"], self.canvas(swap.to), ease_in_out_cubic(progress))
+        u = ease_in_out_cubic(progress)
+        off = int(round(dy * u)) if swap.dy_css > 0 else int(round(dy * (1.0 - u)))
+        window = strip[off : off + (y1 - y0)]
+        canvas = a["canvas"].copy()
+        # the screen has rounded corners, so the moving content is composited
+        # through the same rounded mask rather than pasted as a square
+        m = _rounded_mask(sw, sh, a["radius"])[y0:y1]
+        region = canvas[sy + y0 : sy + y1, sx : sx + sw]
+        np.copyto(region, (region * (1.0 - m) + window * m + 0.5).astype(np.uint8))
+        return canvas
+
+    def release(self) -> None:
+        for entry in self._entries.values():
+            im = entry.get("framed")
+            if isinstance(im, Image.Image):
+                im.close()
+        self._entries.clear()
+        self._strips.clear()
+
+
+# --------------------------------------------------------------------------
 # The scene plan: actions -> a timeline the frame loop can evaluate
 # --------------------------------------------------------------------------
 
@@ -839,6 +1565,15 @@ class MoveSeg:
 @dataclass(frozen=True)
 class ClickEvt:
     t: float
+
+
+@dataclass(frozen=True)
+class TapEvt:
+    """A finger press on the phone screen, in the 390x844 Lens viewport."""
+
+    t: float
+    css: tuple[float, float]
+    seconds: float = TAP_SECONDS
 
 
 @dataclass(frozen=True)
@@ -881,8 +1616,31 @@ class ShotState:
 
     png: Path
     scroll: float = 0.0
-    kind: str = "page"  # "page" | "slide"
+    kind: str = "page"  # "page" | "slide" | "phone" | "phone_pair"
     path: str = ""
+    #: the Lens screen state ("scan", "card", "picker", "unknown") - phone shots only
+    state: str = ""
+    #: the illustrated scene that stands beside the phone - ``phone_pair`` only
+    scene_png: Path | None = None
+    #: where in that illustration the phone is pointed, as fractions of the image
+    aim: tuple[float, float] | None = None
+    #: Viewport rect (390x844 CSS) of the element a PhoneScroll moves, when it is not the
+    #: window. Measured by phone.py; the compositor uses it instead of guessing which rows
+    #: are fixed by differencing two screenshots - which cannot work when the rows above the
+    #: scroller are a live camera feed.
+    scroller: tuple[float, float, float, float] | None = None
+    #: Frames after the first, for a state captured as a burst, in order.
+    frames: tuple[Path, ...] = ()
+    #: Seconds between those frames, as captured.
+    frame_interval: float = 0.0
+
+    @property
+    def is_phone(self) -> bool:
+        return is_phone_kind(self.kind)
+
+    @property
+    def all_frames(self) -> tuple[Path, ...]:
+        return (self.png, *self.frames)
 
 
 @dataclass
@@ -894,6 +1652,7 @@ class ScenePlan:
     caption: str | None = None
     moves: list[MoveSeg] = field(default_factory=list)
     clicks: list[ClickEvt] = field(default_factory=list)
+    taps: list[TapEvt] = field(default_factory=list)
     swaps: list[Swap] = field(default_factory=list)
     highlights: list[HighlightEvt] = field(default_factory=list)
     cameras: list[CameraEvt] = field(default_factory=list)
@@ -905,6 +1664,13 @@ class ScenePlan:
     #: day" slide read as a position carried over from the previous scene rather than as a
     #: gesture. Every scene whose actions start on a slide and finish on a page hits this.
     slide_states: frozenset[int] = frozenset()
+    #: Indices of the states that carry the dashboard sidebar (every ``/`` page, but not
+    #: ``/lens/*``, which has none). Only these get the caption's footer repaint.
+    sidebar_states: frozenset[int] = frozenset()
+    #: Indices of the states that are phone shots (``Phone`` or ``PhonePair``). These are
+    #: composed by :class:`PhoneStore` instead of the window-chrome path, and the desktop
+    #: cursor never appears over them: a phone is touched, not pointed at.
+    phone_states: frozenset[int] = frozenset()
     #: CSS-space rects of position:fixed chrome, from geometry["__fixed__"]
     fixed: list[list[float]] = field(default_factory=list)
     #: Earliest time the lower-third pill may be drawn. A slide already carries its own
@@ -983,6 +1749,33 @@ def _attr(action: Any, *names: str, default: Any = None) -> Any:
     return default
 
 
+def _rect4(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    return (x, y, w, h) if w > 0 and h > 0 else None
+
+
+def _frames_of(meta: Mapping[str, Any], build: Path) -> tuple[Path, ...]:
+    """The extra burst frames of one state, as paths that exist."""
+    raw = meta.get("frames")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[Path] = []
+    for item in raw:
+        p = Path(str(item))
+        if not p.is_absolute():
+            p = build / "shots" / p.name
+        if p.exists():
+            out.append(p)
+        else:
+            log.warning("burst frame %s is in the manifest but not on disk; skipping", p)
+    return tuple(out)
+
+
 def load_states(build: Path, scene_id: str, scene: Any = None) -> list[ShotState]:
     """Read a scene's visual states from ``build/shots_manifest.json``.
 
@@ -999,15 +1792,27 @@ def load_states(build: Path, scene_id: str, scene: Any = None) -> list[ShotState
                 png = Path(row["png"])
                 if not png.is_absolute():
                     png = build / "shots" / png.name
+                kind = str(row.get("kind") or "page")
+                # capture.py nests everything about a phone shot under "phone"
+                meta = row.get("phone")
+                merged: dict[str, Any] = dict(row)
+                if isinstance(meta, Mapping):
+                    merged.update(meta)
                 out.append(
                     ShotState(
                         png=png,
-                        scroll=float(row.get("scroll") or 0.0),
-                        kind=str(row.get("kind") or "page"),
+                        scroll=float(merged.get("scroll") or 0.0),
+                        kind=kind,
                         path=str(row.get("path") or ""),
+                        state=str(merged.get("state") or merged.get("lens_state") or ""),
+                        scene_png=_scene_png_for(merged, png) if is_pair_kind(kind) else None,
+                        aim=_aim_of(merged),
+                        scroller=_rect4(merged.get("scroller")),
+                        frames=_frames_of(merged, build),
+                        frame_interval=float(merged.get("frame_interval") or 0.0),
                     )
                 )
-            return out
+            return _reconcile_phone_states(out, scene, scene_id)
         log.warning("shots_manifest.json has no entry for %s; globbing instead", scene_id)
 
     shots_dir = build / "shots"
@@ -1024,20 +1829,115 @@ def load_states(build: Path, scene_id: str, scene: Any = None) -> list[ShotState
     out = []
     for i, png in enumerate(found):
         member = members[i] if i < len(members) else None
+        kind = _shot_kind(member)
         out.append(
             ShotState(
                 png=png,
                 scroll=float(getattr(member, "scroll", 0) or 0),
-                kind="slide" if type(member).__name__ == "Slide" else "page",
+                kind=kind,
                 path=str(getattr(member, "path", "") or ""),
+                state=str(getattr(member, "state", "") or getattr(member, "phone_state", "") or ""),
+                scene_png=_scene_png_for({}, png) if is_pair_kind(kind) else None,
+                aim=_aim_of(member),
             )
         )
     return out
 
 
+def _reconcile_phone_states(
+    states: list[ShotState], scene: Any, scene_id: str
+) -> list[ShotState]:
+    """Let the script fill in what an older manifest does not say about phone shots.
+
+    ``capture.py`` is the authority on the images; the script is the authority on
+    what kind of thing each one *is*.  When the two line up one-for-one and the
+    script says a state is a ``Phone`` or a ``PhonePair``, that wins over a
+    manifest row still labelled ``page`` - otherwise a phone screen would be
+    letterboxed into the desktop window frame and look like a mistake.
+    """
+    members = _seq_members(getattr(scene, "shot", None)) if scene is not None else []
+    if not members or len(members) != len(states):
+        return states
+    if not any(is_phone_kind(_shot_kind(m)) for m in members):
+        return states
+    out: list[ShotState] = []
+    for st, member in zip(states, members):
+        kind = _shot_kind(member)
+        if not is_phone_kind(kind) or is_phone_kind(st.kind):
+            out.append(st)
+            continue
+        log.info(
+            "[%s] the manifest calls state %s %r but script.py declares a %s - "
+            "composing it as a phone shot", scene_id, st.png.name, st.kind,
+            type(member).__name__,
+        )
+        scene_png = None
+        if is_pair_kind(kind):
+            raw = getattr(member, "scene_png", None)
+            if raw:
+                candidate = Path(str(raw))
+                scene_png = candidate if candidate.exists() else _scene_png_for({}, st.png)
+            else:
+                scene_png = _scene_png_for({}, st.png)
+        out.append(
+            ShotState(
+                png=st.png,
+                scroll=float(getattr(member, "scroll", 0) or 0),
+                kind=kind,
+                path=str(getattr(member, "path", "") or st.path),
+                state=str(
+                    getattr(member, "state", "") or getattr(member, "phone_state", "") or ""
+                ),
+                scene_png=scene_png,
+                aim=_aim_of(member),
+            )
+        )
+    return out
+
+
+#: how a shot's class name maps onto a manifest ``kind``
+_SHOT_KINDS = {
+    "Slide": "slide",
+    "Phone": "phone",
+    "PhonePair": "phone_pair",
+    "PhoneShot": "phone",
+}
+
+
+def _shot_kind(shot: Any) -> str:
+    return _SHOT_KINDS.get(type(shot).__name__, "page")
+
+
+def _scene_png_for(row: Mapping[str, Any], png: Path) -> Path | None:
+    """The illustrated scene beside a PhonePair's phone.
+
+    The manifest row wins; otherwise the convention is the phone shot's own name
+    with ``_scene`` appended, which is what a hand-made fixture can produce too.
+    """
+    for key in ("scene_png", "scene", "png2", "background"):
+        raw = row.get(key)
+        if raw:
+            candidate = Path(str(raw))
+            if not candidate.is_absolute():
+                candidate = png.parent / candidate.name
+            return candidate
+    guess = png.with_name(f"{png.stem}_scene{png.suffix}")
+    return guess if guess.exists() else None
+
+
+def _aim_of(source: Any) -> tuple[float, float] | None:
+    raw = source.get("aim") if isinstance(source, Mapping) else getattr(source, "aim", None)
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        try:
+            return (float(raw[0]), float(raw[1]))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _seq_members(shot: Any) -> list[Any]:
     """Flatten a Shot into the list of states it declares, in order."""
-    if type(shot).__name__ == "PageSequence":
+    if type(shot).__name__ in {"PageSequence", "ShotSequence"}:
         return list(getattr(shot, "shots", ()) or ())
     return [shot] if shot is not None else []
 
@@ -1062,9 +1962,28 @@ def _target_key(shot: Any, current_path: str | None) -> tuple[str, str, int]:
     name = type(shot).__name__
     if name == "Slide":
         return ("slide", str(getattr(shot, "html_fn", "") or ""), 0)
-    if name == "PageSequence":
+    if name in {"PageSequence", "ShotSequence"}:
         items = _seq_members(shot)
         return _target_key(items[0], current_path) if items else ("page", "/", 0)
+    if name == "PhonePair":
+        # mirrors capture.Target("phone_pair", path, scroll, state, scene)
+        inner = getattr(shot, "phone", None) or getattr(shot, "phone_shot", None)
+        state = (
+            getattr(inner, "state", "") if inner is not None
+            else getattr(shot, "phone_state", "") or getattr(shot, "state", "") or "scan"
+        )
+        return (
+            "phone_pair",
+            f"{getattr(shot, 'path', '') or '/lens'}|{state}|"
+            f"{getattr(shot, 'scene_png', '') or ''}",
+            int(getattr(shot, "scroll", 0) or 0),
+        )
+    if name in {"Phone", "PhoneShot"}:
+        return (
+            "phone",
+            f"{getattr(shot, 'path', '') or '/lens'}|{getattr(shot, 'state', '') or ''}",
+            int(getattr(shot, "scroll", 0) or 0),
+        )
     return (
         "page",
         str(getattr(shot, "path", None) or current_path or "/"),
@@ -1093,12 +2012,14 @@ def plan_transitions(scene: Any) -> list[Transition]:
     ):
         kind = _kind(action)
         at = float(_attr(action, "at", default=0.0))
-        if kind == "click":
+        if kind in {"click", "tap"}:
             then_shot = _attr(action, "then_shot", "then", "after")
             if then_shot is not None:
-                declared.append((at, then_shot, "click"))
-        elif kind == "scroll":
-            declared.append((at, ("__scroll__", float(_attr(action, "to_y", "y", default=0) or 0)), "scroll"))
+                declared.append((at, then_shot, kind))
+        elif kind in {"scroll", "phonescroll"}:
+            declared.append(
+                (at, ("__scroll__", float(_attr(action, "to_y", "y", default=0) or 0)), "scroll")
+            )
     declared.sort(key=lambda e: e[0])
 
     first = _target_key(members[0], None)
@@ -1106,11 +2027,12 @@ def plan_transitions(scene: Any) -> list[Transition]:
     current = first
     for frac, payload, produced_by in declared:
         if isinstance(payload, tuple) and payload and payload[0] == "__scroll__":
-            key = ("page", current[1], int(payload[1]))
+            # a Scroll (or PhoneScroll) keeps whatever is on screen and moves it
+            key = (current[0] if current[0] != "slide" else "page", current[1], int(payload[1]))
             to_y: float | None = float(payload[1])
         else:
             key = _target_key(payload, current[1])
-            to_y = float(key[2]) if key[0] == "page" else None
+            to_y = float(key[2]) if key[0] in {"page", "phone"} else None
         previous = plan[-1]
         if key == previous.key and frac - previous.frac <= MERGE_WINDOW:
             previous.produced_by += f"+{produced_by}"
@@ -1198,12 +2120,21 @@ def build_plan(
             click_times.append(t)
             plan.show_cursor = True
 
-        elif kind == "scroll":
+        elif kind in {"scroll", "phonescroll"}:
             scrolls.append(
                 (
                     float(_attr(action, "to_y", "y", default=0.0) or 0.0),
                     t,
                     float(_attr(action, "seconds", default=1.2) or 1.2),
+                )
+            )
+
+        elif kind == "tap":
+            plan.taps.append(
+                TapEvt(
+                    t,
+                    _tap_point(action, geom=geom, scene_id=scene_id, strict=strict),
+                    max(0.18, float(_attr(action, "seconds", default=TAP_SECONDS) or TAP_SECONDS)),
                 )
             )
 
@@ -1283,7 +2214,7 @@ def build_plan(
         tr = transitions[k]
         a, b = states[k], states[k + 1]
         t0 = LEAD_IN + tr.frac * narration
-        is_scroll = "scroll" in tr.produced_by and a.path == b.path
+        is_scroll = "scroll" in tr.produced_by and a.path == b.path and a.kind == b.kind
         if "click" in tr.produced_by:
             # cause before effect: the after-state starts 120 ms into the ripple
             t0 += AFTER_DELAY
@@ -1305,8 +2236,42 @@ def build_plan(
                 plan.caption_from = swap.t1  # once the cross-fade to the page is done
                 break
 
+    # ---- phone shots: no cursor, no Ken Burns, no scrim ----------------------
+    plan.phone_states = frozenset(i for i, st in enumerate(states) if st.is_phone)
+    if plan.phone_states:
+        plan.show_cursor = plan.show_cursor and bool(
+            set(range(len(states))) - plan.phone_states
+        )
+        if len(plan.phone_states) == len(states):
+            if plan.cameras:
+                log.warning(
+                    "[%s] Zoom does nothing on a phone shot - the phone is already the "
+                    "subject; ignoring %d camera move(s)", scene_id, len(plan.cameras),
+                )
+                plan.cameras.clear()
+            if plan.highlights:
+                log.warning(
+                    "[%s] Highlight does nothing on a phone shot; ignoring %d of them",
+                    scene_id, len(plan.highlights),
+                )
+                plan.highlights.clear()
+    elif plan.taps:
+        log.warning(
+            "[%s] %d Tap(s) on a scene with no phone shot - a tap is a finger on the "
+            "Lens screen, not a desktop click", scene_id, len(plan.taps),
+        )
+
     # ---- slide drift: a gentle 1.03x push, only while a slide is on screen ---
     plan.slide_states = frozenset(i for i, st in enumerate(states) if st.kind == "slide")
+    # Which states actually carry the dashboard's sticky sidebar, and so have a status
+    # block under the caption pill that needs repainting. /lens/* is served by the same
+    # app but has no sidebar: on scene 16 the repaint sampled a colour from where the
+    # sidebar would have been and painted a hard-edged 237x172 px block of it behind the
+    # pill, clipping the window's rounded bottom-left corner for the whole scene.
+    plan.sidebar_states = frozenset(
+        i for i, st in enumerate(states)
+        if st.kind == "page" and not st.path.startswith("/lens")
+    )
     for i, st in enumerate(states[: len(plan.swaps) + 1] if SLIDE_DRIFT > 1.001 else []):
         if st.kind != "slide":
             continue
@@ -1361,6 +2326,29 @@ def _point(
     """Resolve an action target to a single CSS-space point inside the viewport."""
     rect = resolve_target(_attr(action, *names), geom, scene_id, strict)
     rect = _clamp_css_rect(rect, scene_id, _attr(action, *names, default="?"))
+    x, y, w, h = rect
+    return (x + w / 2.0, y + h / 2.0) if (w or h) else (x, y)
+
+
+def _tap_point(
+    action: Any,
+    *,
+    geom: Mapping[str, Any],
+    scene_id: str,
+    strict: bool,
+) -> tuple[float, float]:
+    """Where a ``Tap`` lands, in the 390x844 Lens viewport.
+
+    ``Tap(at=..., xy=(x, y))`` is the usual form; a ``css=`` selector works too
+    when capture.py resolved it in the phone context.
+    """
+    raw = _attr(action, "xy", "to", "target", "sel", "selector")
+    if raw is None:
+        raise GeometryError(
+            f"[{scene_id}] a Tap has no target - give it xy=(x, y) in the "
+            f"{int(PHONE_CSS_W)}x{int(PHONE_CSS_H)} Lens viewport"
+        )
+    rect = resolve_target(raw, geom, scene_id, strict)
     x, y, w, h = rect
     return (x + w / 2.0, y + h / 2.0) if (w or h) else (x, y)
 
@@ -1566,10 +2554,28 @@ def _state_at(plan: ScenePlan, t: float) -> tuple[int, int, float, Swap | None]:
     return idx, idx, 0.0, None
 
 
-_tall_cache: dict[tuple[int, int, int], tuple[np.ndarray, int]] = {}
+_tall_cache: dict[tuple[int, int, int], tuple[np.ndarray | None, int]] = {}
 
 
-def _scroll_tall(store: PageStore, sw: Swap) -> tuple[np.ndarray, int]:
+#: Fraction of a non-overlapping scroll's duration spent holding each end still, so the
+#: dissolve itself occupies the middle 1 - 2*hold. See the tall is None branch below.
+CUT_DISSOLVE_HOLD: Final[float] = 0.20
+
+#: The same idea for an in-scene cross-fade between two page states (a click that reflows
+#: the page). Both layouts are text, and text dissolved through text is unreadable, so the
+#: dissolve is squeezed into the middle 40% of the swap and each end is held still.
+FADE_DISSOLVE_HOLD: Final[float] = 0.30
+
+
+def _compressed(prog: float, hold: float) -> float:
+    """Remap 0..1 so the first and last ``hold`` of it are flat."""
+    span = 1.0 - 2.0 * hold
+    if span <= 0:
+        return 0.0 if prog < 0.5 else 1.0
+    return min(1.0, max(0.0, (prog - hold) / span))
+
+
+def _scroll_tall(store: PageStore, sw: Swap) -> tuple[np.ndarray | None, int]:
     """Stack two scroll states into one tall image so the scroll is continuous.
 
     The two shots overlap by ``viewport - dy`` rows of identical page content,
@@ -1587,6 +2593,20 @@ def _scroll_tall(store: PageStore, sw: Swap) -> tuple[np.ndarray, int]:
     if dy <= 0:
         _tall_cache[key] = (b, 0)
         return b, 0
+    if dy >= WIN_H:
+        # The two shots do not overlap, so there is no document strip to reconstruct -
+        # everything between them was never captured. Signal that with dy < 0 and let the
+        # caller cross-dissolve, which is what the phone scroller already does for the same
+        # case. Returning the destination with dy == 0 (as this did) produced a hard jump
+        # cut on the scroll's first frame, and handed the caller a read-only array it then
+        # tried to paste the fixed bands into.
+        log.warning(
+            "scroll of %.0f CSS px is taller than the viewport: the two states do not "
+            "overlap, so the scroll cross-dissolves instead of gliding. Capture an "
+            "intermediate scroll state if this beat needs to move.", abs(sw.dy_css),
+        )
+        _tall_cache[key] = (None, -1)
+        return None, -1
     tall = np.empty((WIN_H + dy, WIN_W, 3), dtype=np.uint8)
     if sw.dy_css > 0:  # scrolling down: A on top, B below
         tall[:WIN_H] = a
@@ -1629,6 +2649,7 @@ def render_scene(
     started = time.perf_counter()
     out_clip.parent.mkdir(parents=True, exist_ok=True)
     store = PageStore(plan.shots, plan.fixed)
+    phones = PhoneStore(plan.states, plan.scene_id) if plan.phone_states else None
     camera = Camera()
     dims = DimCache()
     glow_cache: dict[tuple[int, int], Sprite] = {}
@@ -1665,7 +2686,7 @@ def render_scene(
         assert proc.stdin is not None
         for f in range(plan.n_frames):
             t = f / FPS
-            frame = _render_frame(plan, store, camera, dims, glow_cache, cap, t)
+            frame = _render_frame(plan, store, camera, dims, glow_cache, cap, t, phones)
             if prev_frame is not None and f < dissolve_frames:
                 u = ease_in_out_cubic((f + 1) / (dissolve_frames + 1))
                 frame = blend_frames(prev_frame, frame, u)
@@ -1704,6 +2725,8 @@ def render_scene(
         except OSError:
             pass
         store.release()
+        if phones is not None:
+            phones.release()
 
     if last is None:  # pragma: no cover - n_frames >= 1 always
         raise RuntimeError(f"scene {plan.scene_id} produced no frames")
@@ -1718,6 +2741,100 @@ def render_scene(
     )
 
 
+def _slide_mix(plan: ScenePlan, frm: int, to: int, prog: float, swap: Swap | None) -> float:
+    """How much of this frame is a slide, 0..1 - including mid-cross-fade."""
+    if not plan.slide_states:
+        return 0.0
+    if swap is None:
+        return 1.0 if frm in plan.slide_states else 0.0
+    mix = 0.0
+    if frm in plan.slide_states:
+        mix += 1.0 - prog
+    if to in plan.slide_states:
+        mix += prog
+    return clamp(mix, 0.0, 1.0)
+
+
+def _draw_caption(
+    plan: ScenePlan,
+    canvas: np.ndarray,
+    cap: tuple[Sprite, int, int] | None,
+    t: float,
+    cover: bool,
+    cam_rect: tuple[float, float, float, float] | None = None,
+    scale: float = 1.0,
+) -> None:
+    """The lower-third pill, with its own fade.  ``cover`` repaints the sidebar footer.
+
+    ``scale`` is how much of the pill to show: a scene that comes back to a slide (the
+    Lens act does it twice) fades the caption out with the slide fading in, because a
+    slide carries its own title and fills the frame to its own edges.
+    """
+    if cap is None or t < plan.caption_from or scale <= 0.004:
+        return
+    sp, cx0, cy0 = cap
+    start = max(LEAD_IN * 0.5, plan.caption_from)
+    a_in = clamp((t - start) / CAPTION_FADE, 0.0, 1.0)
+    a_out = clamp((plan.duration - 0.25 - t) / CAPTION_FADE, 0.0, 1.0)
+    # ...and it leaves of its own accord after CAPTION_HOLD, whichever comes first.
+    a_hold = clamp((start + CAPTION_FADE + CAPTION_HOLD - t) / CAPTION_FADE, 0.0, 1.0)
+    a = ease_in_out_cubic(min(a_in, a_out, a_hold)) * scale
+    if cover:
+        # The cover is the pill's own backdrop, so it has to be opaque *before* the pill is
+        # legible: matching the two alphas exactly put the sidebar's status lines at 50%
+        # under a 50% pill and printed both, which read as crossed text mid-fade.
+        _cover_sidebar_foot(canvas, clamp(a * 2.6, 0.0, 1.0), cam_rect)
+    blit(canvas, sp, cx0, cy0, a)
+
+
+def _render_phone_frame(
+    plan: ScenePlan,
+    phones: PhoneStore,
+    store: PageStore,
+    cap: tuple[Sprite, int, int] | None,
+    t: float,
+    frm: int,
+    to: int,
+    prog: float,
+    swap: Swap | None,
+) -> np.ndarray:
+    """One frame of a Lens shot: the framed phone, any tap, and the caption.
+
+    There is no cursor and no window chrome here.  A ``PhoneScroll`` translates
+    the screen content inside the bezel; anything else between two states is a
+    cross-fade of the two finished canvases, which is also what carries a scene
+    that moves between the dashboard and the phone.
+    """
+
+    def canvas_for(idx: int) -> np.ndarray:
+        # canvas_at, not canvas: a burst state plays its captured frames, which is how the
+        # viewfinder's handheld drift gets into the film.
+        return phones.canvas_at(idx, t) if idx in plan.phone_states else store.canvas(idx)
+
+    if swap is None:
+        canvas = canvas_for(frm).copy()
+    elif swap.kind == "scroll" and frm in plan.phone_states and to in plan.phone_states:
+        canvas = phones.scroll_canvas(swap, prog)
+    else:
+        canvas = blend_frames(canvas_for(frm), canvas_for(to), ease_in_out_cubic(prog))
+
+    for tap in plan.taps:
+        idx = frm if frm in plan.phone_states else to
+        if idx not in plan.phone_states:
+            break
+        sp = tap_sprite(t - tap.t, tap.seconds, scale=phones.css_scale(idx))
+        if sp is None:
+            continue
+        tx, ty = phones.to_canvas(idx, tap.css)
+        side = sp.alpha.shape[0]
+        blit(canvas, sp, tx - side / 2, ty - side / 2)
+        break
+
+    _draw_caption(plan, canvas, cap, t, cover=False,
+                  scale=1.0 - _slide_mix(plan, frm, to, prog, swap))
+    return canvas
+
+
 def _render_frame(
     plan: ScenePlan,
     store: PageStore,
@@ -1726,8 +2843,11 @@ def _render_frame(
     glow_cache: dict[tuple[int, int], Sprite],
     cap: tuple[Sprite, int, int] | None,
     t: float,
+    phones: PhoneStore | None = None,
 ) -> np.ndarray:
     frm, to, prog, swap = _state_at(plan, t)
+    if phones is not None and (frm in plan.phone_states or to in plan.phone_states):
+        return _render_phone_frame(plan, phones, store, cap, t, frm, to, prog, swap)
     hi = _highlight_at(plan, t)
     cam = _camera_rect(plan, t)
     cam_rect = cam[0] if cam is not None else None
@@ -1754,14 +2874,48 @@ def _render_frame(
         page_static = swap is None
         if swap is not None and swap.kind == "scroll":
             tall, dy = _scroll_tall(store, swap)
-            u = ease_in_out_cubic(prog)
-            off = int(round(dy * u)) if swap.dy_css > 0 else int(round(dy * (1.0 - u)))
-            page = np.ascontiguousarray(tall[off : off + WIN_H])
-            _apply_fixed(page, store.page(swap.to), store.fixed_bands(swap.frm, swap.to))
-            page_id = 900000 + off
+            if tall is None:
+                # The two offsets do not overlap, so there is no captured document strip
+                # to translate through. Dissolve instead — which is what the phone
+                # scroller already does for the same case, and better than the hard jump
+                # cut this used to produce on the scroll's first frame.
+                #
+                # A scroll is declared over 1.3-1.8s, and spreading the dissolve across all
+                # of it leaves two dense pages half-visible for most of a second, which
+                # reads as ghosting rather than a transition. Hold the source, dissolve
+                # across the middle, hold the destination: the same total beat, with the
+                # ambiguous part compressed. Nothing is invented either way — both layers
+                # are captured pixels.
+                u = _compressed(prog, CUT_DISSOLVE_HOLD)
+                page = blend_pages(store.page(frm), store.page(to), ease_in_out_cubic(u))
+                page_id = 800000 + int(u * 1000)
+            else:
+                u = ease_in_out_cubic(prog)
+                off = int(round(dy * u)) if swap.dy_css > 0 else int(round(dy * (1.0 - u)))
+                bands = store.fixed_bands(swap.frm, swap.to)
+                window = tall[off : off + WIN_H]
+                if bands:
+                    # _apply_fixed writes in place, and this window is not ours to write
+                    # to. `tall` is either the cached strip — where a write would smear the
+                    # pinned header permanently into the document for every later frame of
+                    # the same scroll — or, when dy == 0, the store's own page array, which
+                    # is read-only and raised "assignment destination is read-only". One
+                    # copy per scrolling frame, and only when there is something to paste.
+                    page = window.copy()
+                    _apply_fixed(page, store.page(swap.to), bands)
+                else:
+                    page = np.ascontiguousarray(window)
+                page_id = 900000 + off
         elif swap is not None:
-            page = blend_pages(store.page(frm), store.page(to), ease_in_out_cubic(prog))
-            page_id = 800000 + int(prog * 1000)
+            # An in-scene fade is usually a *reflow* of the same page - a finding row
+            # expanding under a click - and a straight cross-dissolve leaves both layouts
+            # half-visible for its whole length: at t=3:18.8 "Telnet open on
+            # 192.168.1.142:23" was printed twice, offset, and the column header read
+            # "SSUUBBJJEECCTT". Hold the source, dissolve across the middle, hold the
+            # destination: the same 220 ms beat, with the ambiguous part cut to ~130 ms.
+            u = _compressed(prog, FADE_DISSOLVE_HOLD)
+            page = blend_pages(store.page(frm), store.page(to), ease_in_out_cubic(u))
+            page_id = 800000 + int(u * 1000)
         else:
             page = store.page(frm)
 
@@ -1832,17 +2986,15 @@ def _render_frame(
             blit(canvas, sp, fx - CURSOR_HOT, fy - CURSOR_HOT)
 
     # ---- caption ------------------------------------------------------------
-    if cap is not None and t >= plan.caption_from:
-        sp, cx0, cy0 = cap
-        a_in = clamp((t - max(LEAD_IN * 0.5, plan.caption_from)) / CAPTION_FADE, 0.0, 1.0)
-        a_out = clamp((plan.duration - 0.25 - t) / CAPTION_FADE, 0.0, 1.0)
-        a = ease_in_out_cubic(min(a_in, a_out))
-        # Captions only ever run over dashboard pages (a slide-only scene sets caption_from
-        # to infinity), and the sidebar sits in the same place on every one of them, so the
-        # band is a constant in page space and only the camera can move it.
-        if not on_slide:
-            _cover_sidebar_foot(canvas, a, cam_rect)
-        blit(canvas, sp, cx0, cy0, a)
+    # The sidebar sits in the same place on every dashboard page, so the band is a constant
+    # in page space and only the camera can move it - but /lens/pair and /lens/stickers are
+    # pages with no sidebar at all, and repainting a sidebar that is not there is what put a
+    # hard-edged grey rectangle behind the caption for the whole of scene 16.
+    cover = (not on_slide) and bool(
+        {frm, to} & plan.sidebar_states
+    )
+    _draw_caption(plan, canvas, cap, t, cover=cover, cam_rect=cam_rect,
+                  scale=1.0 - _slide_mix(plan, frm, to, prog, swap))
     return canvas
 
 
@@ -1911,6 +3063,238 @@ def _fake_shot(path: Path, variant: int, scroll: int = 0) -> None:
         d.rounded_rectangle((1400 * s, y - 2 * s, 1470 * s, y + 20 * s), radius=10 * s, fill=col)
         d.text((1412 * s, y + 2 * s), sev, font=f_s, fill=(20, 22, 30))
     im.save(path)
+
+
+def _draw_room(d: ImageDraw.ImageDraw, w: int, h: int) -> None:
+    """A flat illustration of the thing the phone is pointed at: a camera on a shelf.
+
+    Stands in for ``video/scene_render.py``'s real output (which carries a genuine QR
+    from ``homesoc/web/qr.py``) so the compositor can be verified on its own.
+    """
+    d.rectangle((0, 0, w, h), fill=(26, 29, 38))
+    d.rectangle((0, int(h * 0.62), w, h), fill=(20, 23, 30))
+    d.line((0, int(h * 0.62), w, int(h * 0.62)), fill=(44, 50, 66), width=max(2, h // 300))
+    # shelf
+    sy = int(h * 0.60)
+    d.rectangle((int(w * 0.10), sy, int(w * 0.92), sy + max(6, h // 90)), fill=(58, 48, 38))
+    d.rectangle((int(w * 0.10), sy, int(w * 0.92), sy + max(2, h // 260)), fill=(84, 70, 54))
+    # the camera body
+    bx0, by0 = int(w * 0.44), int(h * 0.30)
+    bx1, by1 = int(w * 0.68), sy
+    d.rounded_rectangle((bx0, by0, bx1, by1), radius=max(6, h // 60), fill=(226, 228, 234))
+    d.rounded_rectangle((bx0, by0, bx1, by1), radius=max(6, h // 60), outline=(150, 155, 168), width=2)
+    lr = int((bx1 - bx0) * 0.22)
+    lcx, lcy = (bx0 + bx1) // 2, by0 + int((by1 - by0) * 0.34)
+    d.ellipse((lcx - lr, lcy - lr, lcx + lr, lcy + lr), fill=(22, 25, 33), outline=(120, 126, 140), width=3)
+    d.ellipse(
+        (lcx - lr // 3, lcy - lr // 3, lcx + lr // 4, lcy + lr // 4), fill=(52, 62, 88)
+    )
+    d.ellipse((bx1 - int(lr * 0.8), by0 + int(lr * 0.5), bx1 - int(lr * 0.4), by0 + int(lr * 0.9)),
+              fill=(70, 167, 88))
+    # the sticker, with a QR-ish matrix
+    qs = int((bx1 - bx0) * 0.34)
+    qx, qy = bx0 + int((bx1 - bx0) * 0.10), by1 - qs - int(h * 0.03)
+    d.rectangle((qx - 6, qy - 6, qx + qs + 6, qy + qs + 20), fill=(252, 252, 252))
+    cells = 21
+    cell = qs / cells
+    rng = 1
+    for gy in range(cells):
+        for gx in range(cells):
+            rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF
+            finder = (gx < 7 and gy < 7) or (gx >= cells - 7 and gy < 7) or (gx < 7 and gy >= cells - 7)
+            on = ((rng >> 16) & 1) if not finder else 0
+            if on:
+                d.rectangle((qx + gx * cell, qy + gy * cell, qx + (gx + 1) * cell, qy + (gy + 1) * cell),
+                            fill=(16, 18, 24))
+    for ox, oy in ((0, 0), (cells - 7, 0), (0, cells - 7)):
+        x0, y0 = qx + ox * cell, qy + oy * cell
+        d.rectangle((x0, y0, x0 + 7 * cell, y0 + 7 * cell), fill=(16, 18, 24))
+        d.rectangle((x0 + cell, y0 + cell, x0 + 6 * cell, y0 + 6 * cell), fill=(252, 252, 252))
+        d.rectangle((x0 + 2 * cell, y0 + 2 * cell, x0 + 5 * cell, y0 + 5 * cell), fill=(16, 18, 24))
+    d.text((qx, qy + qs + 4), "hallway camera", font=_font(max(9, qs // 12), False), fill=(40, 44, 56))
+
+
+def _fake_scene_png(path: Path, w: int = 1600, h: int = 900) -> None:
+    im = Image.new("RGB", (w, h), (26, 29, 38))
+    _draw_room(ImageDraw.Draw(im), w, h)
+    im.save(path)
+
+
+def _fake_lens_screen(path: Path, state: str, scroll: int = 0) -> None:
+    """A stand-in for a real ``/lens`` capture: 390x844 at device_scale_factor=3."""
+    s = 3
+    w, h = int(PHONE_CSS_W) * s, int(PHONE_CSS_H) * s
+    im = Image.new("RGB", (w, h), (10, 12, 16))
+    d = ImageDraw.Draw(im)
+    _draw_room(d, w, int(h * 0.62))
+    d.rectangle((0, int(h * 0.62), w, h), fill=(10, 12, 16))
+
+    f_big = _font(21 * s, True)
+    f_mid = _font(15 * s, True)
+    f_sm = _font(12 * s, False)
+
+    # status bar + top pill
+    d.text((18 * s, 14 * s), "9:41", font=_font(13 * s, True), fill=(236, 238, 244))
+    d.rounded_rectangle((110 * s, 10 * s, 280 * s, 34 * s), radius=12 * s, fill=(16, 20, 28))
+    d.ellipse((120 * s, 19 * s, 127 * s, 26 * s), fill=(70, 167, 88))
+    d.text((134 * s, 14 * s), "Lens · paired", font=f_sm, fill=(200, 206, 220))
+
+    if state == "scan":
+        rx0, ry0, rx1, ry1 = 70 * s, 250 * s, 320 * s, 500 * s
+        arm = 34 * s
+        for cx, cy, dx, dy in (
+            (rx0, ry0, 1, 1), (rx1, ry0, -1, 1), (rx0, ry1, 1, -1), (rx1, ry1, -1, -1)
+        ):
+            d.line((cx, cy, cx + dx * arm, cy), fill=(91, 124, 255), width=4 * s)
+            d.line((cx, cy, cx, cy + dy * arm), fill=(91, 124, 255), width=4 * s)
+        d.rounded_rectangle((40 * s, 700 * s, 350 * s, 748 * s), radius=14 * s, fill=(22, 26, 36))
+        d.text((195 * s, 724 * s), "Pick manually", font=f_mid, fill=(226, 230, 242), anchor="mm")
+        d.text((195 * s, 560 * s), "Point at a device", font=f_big, fill=(236, 238, 246), anchor="mm")
+        d.text((195 * s, 592 * s), "any barcode or Home SOC sticker",
+               font=f_sm, fill=(150, 156, 172), anchor="mm")
+    else:
+        # The card rises over the bottom two thirds; its header is pinned and only the
+        # body scrolls, which is what a PhoneScroll moves - and what detect_fixed_rows
+        # has to notice, or the status bar would slide away with the list.
+        top = 300 * s
+        rows = (
+            ("PROBLEMS", None, None),
+            ("Telnet is open on port 23", "critical", (229, 72, 77)),
+            ("Admin page needs no password", "critical", (229, 72, 77)),
+            ("Firmware has a known flaw", "high", (247, 107, 21)),
+            ("EXPOSED", None, None),
+            ("23  Telnet — remote control, no encryption", "high", (247, 107, 21)),
+            ("554  RTSP — the video stream itself", "medium", (255, 178, 36)),
+            ("80  HTTP — the admin page", "medium", (255, 178, 36)),
+            ("TALKING TO", None, None),
+            ("telemetry.example-cam.net  ·  blocked 214", "blocked", (229, 72, 77)),
+            ("ntp.example.org  ·  allowed 48", "allowed", (70, 167, 88)),
+        )
+        head_h = 174 * s
+        d.rounded_rectangle((0, top, w, h + 40 * s), radius=22 * s, fill=(14, 17, 23))
+        # the body is drawn on its own surface and pasted into the card, so a scrolled
+        # row can never appear above the card the way it would on a real phone
+        body = Image.new("RGB", (w, h), (14, 17, 23))
+        bd = ImageDraw.Draw(body)
+        y = top + head_h - scroll * s
+        for text, tag, col in rows:
+            if tag is None:
+                bd.text((22 * s, y + 10 * s), text, font=_font(11 * s, True), fill=(120, 128, 148))
+                y += 38 * s
+                continue
+            bd.rounded_rectangle((16 * s, y, 374 * s, y + 46 * s), radius=10 * s, fill=(22, 26, 36))
+            bd.rectangle((16 * s, y + 10 * s, 19 * s, y + 36 * s), fill=col)
+            bd.text((30 * s, y + 15 * s), text, font=f_sm, fill=(226, 230, 242))
+            y += 54 * s
+        cut = top + head_h
+        im.paste(body.crop((0, cut, w, h)), (0, cut))
+        d.rounded_rectangle((0, top, w, cut), radius=22 * s, fill=(14, 17, 23))
+        d.rounded_rectangle((150 * s, top + 12 * s, 240 * s, top + 18 * s), radius=3 * s,
+                            fill=(70, 78, 98))
+        d.text((22 * s, top + 40 * s), "Hallway camera", font=f_big, fill=(236, 238, 246))
+        d.text((22 * s, top + 72 * s), "192.168.1.142  ·  unknown vendor",
+               font=f_sm, fill=(150, 156, 172))
+        bar_y = top + 100 * s
+        for i, col in enumerate(((229, 72, 77), (247, 107, 21), (255, 178, 36), (70, 167, 88))):
+            d.rounded_rectangle((22 * s + i * 88 * s, bar_y, 22 * s + i * 88 * s + 80 * s,
+                                 bar_y + 6 * s), radius=3 * s, fill=col)
+        d.text((22 * s, bar_y + 20 * s), "Two critical problems: Telnet is open, and the",
+               font=f_sm, fill=(226, 230, 242))
+        d.text((22 * s, bar_y + 40 * s), "admin page needs no password.",
+               font=f_sm, fill=(226, 230, 242))
+    im.save(path)
+
+
+def selftest_phone(build: Path, keep: bool = True) -> Path:
+    """Render a synthetic Lens clip: a PhonePair, a Tap, a PhoneScroll and a dissolve in.
+
+    Like :func:`selftest`, it draws its own fixtures rather than needing capture.py,
+    ``video/phone.py`` or a Lens server, and leaves probe PNGs to look at.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    root = build / "selftest"
+    shots = root / "shots"
+    shots.mkdir(parents=True, exist_ok=True)
+
+    pair_png = shots / "00-phone_0.png"
+    pair_scene = shots / "00-phone_0_scene.png"
+    card_png = shots / "00-phone_1.png"
+    card_scrolled = shots / "00-phone_2.png"
+    desk_png = shots / "00-phone_desk.png"
+    _fake_lens_screen(pair_png, "scan")
+    _fake_scene_png(pair_scene)
+    _fake_lens_screen(card_png, "card", 0)
+    _fake_lens_screen(card_scrolled, "card", 260)
+    _fake_shot(desk_png, 2, 0)
+    print(f"synthetic phone fixtures written to {shots}")
+    print(f"  phone.py available: {phone_module() is not None}")
+
+    class Phone:
+        def __init__(self, state: str, scroll: int = 0, path: str = "/lens") -> None:
+            self.path, self.state, self.scroll = path, state, scroll
+
+    class PhonePair:
+        def __init__(self, scene_png: str, phone_state: str) -> None:
+            self.scene_png, self.phone_state = scene_png, phone_state
+
+    class PageSequence:
+        def __init__(self, shots_: tuple[object, ...], ats: tuple[float, ...] = ()) -> None:
+            self.shots, self.ats = shots_, ats
+
+    class Tap:
+        def __init__(self, at: float, xy: tuple[float, float]) -> None:
+            self.at, self.xy = at, xy
+
+    class PhoneScroll:
+        def __init__(self, to_y: int, at: float, seconds: float = 1.1) -> None:
+            self.to_y, self.at, self.seconds = to_y, at, seconds
+
+    class Scene:
+        id = "00-phone"
+        caption = "Lens"
+        shot = PageSequence(
+            (
+                PhonePair(scene_png=pair_scene.as_posix(), phone_state="scan"),
+                Phone("card"),
+                Phone("card", 260),
+            ),
+            (0.0, 0.34, 0.64),
+        )
+        actions = [
+            Tap(at=0.28, xy=(195.0, 470.0)),
+            Tap(at=0.48, xy=(195.0, 640.0)),
+            PhoneScroll(to_y=260, at=0.64, seconds=1.1),
+        ]
+
+    states = [
+        # aim: where the fixture's own sticker sits, the way capture.py will record
+        # where scene_render.py put the real one
+        ShotState(pair_png, 0.0, "phone_pair", "/lens", "scan", pair_scene, (0.505, 0.497)),
+        ShotState(card_png, 0.0, "phone", "/lens", "card"),
+        ShotState(card_scrolled, 260.0, "phone", "/lens", "card"),
+    ]
+    plan = build_plan(Scene(), states, 11.6, {}, strict=True)
+    print(
+        f"plan: {plan.n_frames} frames / {plan.duration:.2f}s  taps={len(plan.taps)} "
+        f"swaps={len(plan.swaps)} phone_states={sorted(plan.phone_states)} "
+        f"cursor={plan.show_cursor}"
+    )
+    for sw in plan.swaps:
+        print(f"  swap {sw.frm}->{sw.to} {sw.kind:6s} {sw.t0:5.2f}s..{sw.t1:5.2f}s dy={sw.dy_css:.0f}")
+
+    prev = compose_canvas(load_page(desk_png))
+    out = root / "00-phone.mp4"
+    probe = root / "probe_phone"
+    shutil.rmtree(probe, ignore_errors=True)
+    res = render_scene(plan, out, prev_frame=prev, probe_dir=probe, probe_every=5)
+    print(
+        f"rendered {res.frames} frames in {res.elapsed:.1f}s "
+        f"({res.frames / res.elapsed:.0f} fps) -> {out} ({out.stat().st_size / 1e6:.2f} MB)"
+    )
+    print(f"probe frames: {len(list(probe.glob('*.png')))} in {probe}")
+    if not keep:
+        shutil.rmtree(root, ignore_errors=True)
+    return out
 
 
 def selftest(build: Path, keep: bool = True) -> Path:
@@ -2017,6 +3401,8 @@ def selftest(build: Path, keep: bool = True) -> Path:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Home SOC video compositor")
     ap.add_argument("--selftest", action="store_true", help="render a synthetic 10s test clip")
+    ap.add_argument("--selftest-phone", action="store_true",
+                    help="render a synthetic Lens clip: PhonePair, Tap, PhoneScroll, dissolve")
     ap.add_argument(
         "--build",
         type=Path,
@@ -2024,8 +3410,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="build directory",
     )
     args = ap.parse_args(argv)
+    ran = False
     if args.selftest:
         selftest(args.build)
+        ran = True
+    if args.selftest_phone:
+        selftest_phone(args.build)
+        ran = True
+    if ran:
         return 0
     ap.print_help()
     return 0

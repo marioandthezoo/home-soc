@@ -99,6 +99,28 @@
     </div>
   </section>
   <section class="card card-fill">
+    <div class="card-head"><h2>Load-bearing devices</h2><a class="link" href="/map">Dependency map →</a></div>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Device</th><th class="num">Depend on it</th><th>Why</th></tr></thead>
+      <tbody>
+        {% for r in load_bearing %}
+        <tr>
+          <td class="wrap"><a href="/devices/{{ r.device_id }}">{{ r.label }}</a></td>
+          <td class="num">{{ r.dependents }}</td>
+          <td class="wrap muted small">{{ r.why or '' }}</td>
+        </tr>
+        {% else %}<tr><td colspan="3" class="empty">{% if topology_available %}Nothing on this network
+          has other devices depending on it yet.{% else %}No dependency graph yet — it is built by the
+          topology job, which runs after discovery.{% endif %}</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
+    <p class="muted small push-down">Home SOC cannot see traffic between devices — it has no packet visibility.
+      This ranking is built from what it observed or can reasonably infer —
+      <a class="link" href="/map">see the map</a>.</p>
+  </section>
+  <section class="card card-fill">
     <div class="card-head"><h2>Latest events</h2><a class="link" href="/telemetry">All telemetry →</a></div>
     <ul class="events" id="events-list">
       {% for e in s.events %}

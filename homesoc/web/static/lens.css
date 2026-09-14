@@ -256,6 +256,34 @@ body.lens .fix-steps { margin: 2px 0 12px; padding-left: 22px; font-size: 14.5px
 body.lens .fix-steps li { margin: 6px 0; overflow-wrap: anywhere; }
 body.lens .refs { margin: 0 0 10px; padding-left: 22px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
 
+/* If this fails — the dependency map's best use on a phone (SPEC C7): point it at a box and
+   read what the house loses without it. Sized for the 390px card. */
+body.lens .blast-headline { margin: 2px 0 10px; font-size: 15px; line-height: 1.45; }
+body.lens .blast-stats { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+body.lens .blast-stat {
+  display: flex; align-items: baseline; gap: 6px; padding: 7px 11px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+  font-size: 13px; color: var(--muted);
+}
+body.lens .blast-stat b { font-size: 19px; font-weight: 720; line-height: 1; color: var(--fg); }
+body.lens .blast-stat.is-offline b { color: var(--sev-high); }
+body.lens .blast-stat.is-degraded b { color: var(--sev-medium); }
+/* The confidence chip prints the actual level, and the left border repeats it — so how strong
+   the claim is never depends on colour alone. */
+body.lens .blast-evidence {
+  margin: 0 0 8px; padding: 8px 10px; font-size: 13px; line-height: 1.5; color: var(--muted);
+  border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 10px;
+}
+body.lens .blast-evidence.conf-observed { border-left-color: var(--sev-low); border-left-style: solid; }
+body.lens .blast-evidence.conf-mixed { border-left-color: var(--sev-medium); border-left-style: solid; }
+body.lens .blast-evidence.conf-inferred { border-left-style: dashed; }
+body.lens .blast-evidence.conf-assumed { border-left-style: dotted; }
+body.lens .blast-conf {
+  font-weight: 700; color: var(--fg); text-transform: uppercase;
+  font-size: 11px; letter-spacing: .06em;
+}
+body.lens .blast-note { margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+
 /* Talking to — the payoff section, so it gets the weight. */
 body.lens .dns-hero {
   display: flex; align-items: center; gap: 14px; padding: 12px; margin: 4px 0 12px;

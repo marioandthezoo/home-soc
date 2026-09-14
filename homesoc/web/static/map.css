@@ -1,0 +1,254 @@
+/* map.css — styles for /map only, linked from map.html alone so nothing here can collide with
+   the shared stylesheet. Tokens (--panel, --line, --sev-*) come from style.css, so both themes
+   work without a second palette. No inline styles anywhere: CSP is default-src 'self'. */
+
+/* ---- the honesty note. Persistent, at the top, never collapsible, never small print. ---- */
+.map-note {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--sev-info);
+  border-radius: var(--radius);
+  padding: 11px 14px;
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.map-note-mark {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--sev-info);
+  color: var(--sev-info);
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 15px;
+  text-align: center;
+}
+.map-hubnote {
+  margin: 10px 0 0;
+  padding: 9px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+/* ---- page layout: graph left, panel right; stacked when there is no room ---- */
+.map-layout { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; align-items: start; }
+@media (max-width: 1180px) { .map-layout { grid-template-columns: minmax(0, 1fr); } }
+.map-card { margin-bottom: 0; min-width: 0; }
+.map-head { margin-bottom: 10px; }
+.map-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.map-window { display: flex; gap: 6px; align-items: center; margin: 0; }
+.map-window label { color: var(--muted); font-size: 12px; }
+.map-window select {
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.btn-small { padding: 4px 9px; font-size: 12px; }
+.map-unavailable {
+  margin: 6px 0 0;
+  padding: 26px 18px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  text-align: center;
+}
+.map-hint { margin: 10px 0 0; }
+
+/* ---- the canvas. Fixed layout, so the picture is identical at every window size; the box
+       scrolls instead of reflowing. ---- */
+.map-canvas {
+  overflow: auto;
+  max-height: min(76vh, 720px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 4px;
+}
+/* Scales to the panel instead of overflowing it. The min-width is a legibility floor: below it
+   the container scrolls rather than shrinking the labels into illegibility. */
+.map-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-width: 680px;
+}
+.map-col-title {
+  fill: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+/* ---- edges: confidence is carried by the dash pattern first, colour only reinforces it ---- */
+.map-edge { fill: none; stroke: var(--muted); stroke-width: 1.3; opacity: .55; }
+.map-edge.conf-observed { stroke: var(--sev-low); stroke-width: 1.5; opacity: .7; }
+.map-edge.conf-inferred { stroke-dasharray: 6 3.5; opacity: .5; }
+.map-edge.conf-assumed { stroke-dasharray: 1 4; stroke-linecap: round; opacity: .45; }
+/* A lookup the DNS filter refused is not a dependency (C2 rule 4): thin, muted, and never in the
+   "observed dependency" green, however well observed the refusal itself was. */
+.map-edge.is-blocked { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 5; opacity: .32; }
+.map-edge:hover { opacity: 1; stroke-width: 2.4; }
+.map-edge.is-affected { opacity: 1; stroke-width: 2.4; }
+.map-edge.is-dim { opacity: .1; }
+
+/* legend swatches use the same three patterns */
+.legend-stroke { stroke: var(--muted); stroke-width: 1.6; fill: none; }
+.legend-stroke.conf-observed { stroke: var(--sev-low); stroke-width: 2; }
+.legend-stroke.conf-inferred { stroke-dasharray: 6 3.5; }
+.legend-stroke.conf-assumed { stroke-dasharray: 1 4; stroke-linecap: round; }
+.legend-stroke.legend-blocked { stroke-dasharray: 2 5; stroke-width: 1; opacity: .5; }
+
+/* ---- nodes ---- */
+.map-node { cursor: pointer; }
+.map-shape { fill: var(--muted); stroke: var(--muted); stroke-width: 1.5; }
+.map-node.sev-critical .map-shape { fill: var(--sev-critical); stroke: var(--sev-critical); }
+.map-node.sev-high .map-shape { fill: var(--sev-high); stroke: var(--sev-high); }
+.map-node.sev-medium .map-shape { fill: var(--sev-medium); stroke: var(--sev-medium); }
+.map-node.sev-low .map-shape { fill: var(--sev-low); stroke: var(--sev-low); }
+.map-node.sev-info .map-shape { fill: var(--sev-info); stroke: var(--sev-info); }
+.map-node.sev-none .map-shape { fill: var(--panel); stroke: var(--muted); }
+
+/* offline: hollow with a broken outline. The drawn label reads "<name> (offline)" and the
+   tooltip and accessible name say so too, so this is never the only way to tell. */
+.map-node.is-offline .map-shape { fill: var(--panel-2); stroke-dasharray: 3 2.5; stroke-width: 2; }
+
+.map-node-letter { fill: #ffffff; font-weight: 700; text-anchor: middle; pointer-events: none; }
+.map-node.sev-medium .map-node-letter { fill: #1a1d27; }
+.map-node.sev-none .map-node-letter { fill: var(--muted); }
+.map-node.is-offline .map-node-letter { fill: var(--fg); }
+
+.map-label {
+  fill: var(--fg);
+  font-size: 11.5px;
+  paint-order: stroke;
+  stroke: var(--panel-2);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.map-node.is-offline .map-label { fill: var(--muted); }
+
+.map-sublabel { fill: var(--muted); font-size: 9px; paint-order: stroke; stroke: var(--panel-2); stroke-width: 2.5px; stroke-linejoin: round; pointer-events: none; }
+
+/* A service nothing was observed using: drawn as an outline, because "offered" and "used" are
+   different claims and only one of them has evidence behind it. */
+.map-node.is-orphan .map-shape { fill: none; stroke-dasharray: 4 3; }
+.map-node.is-orphan .map-label { fill: var(--muted); }
+.map-node.kind-cloud.is-blocked .map-shape { fill: none; stroke: var(--muted); stroke-dasharray: 2 3; }
+
+.map-focus-ring { fill: none; stroke: none; stroke-width: 2; }
+.map-node:focus { outline: none; }
+.map-node:focus .map-focus-ring { stroke: var(--accent); stroke-width: 2.5; }
+.map-node:hover .map-focus-ring { stroke: var(--line); }
+
+/* blast-radius mode */
+.map-node.is-dim { opacity: .22; }
+.map-node.is-affected .map-label { font-weight: 600; }
+.map-node.is-source .map-focus-ring { stroke: var(--fg); stroke-width: 3; }
+.map-node.is-affected:not(.is-source) .map-focus-ring { stroke: var(--sev-high); stroke-width: 2.5; }
+/* Degraded is the milder outcome and gets the milder ring — more specific than the rule above so
+   it actually wins. The panel spells both out in words; the ring only reinforces them. */
+.map-node.is-affected.is-degraded:not(.is-source) .map-focus-ring { stroke: var(--sev-medium); }
+/* A service that dies with the box hosting it. Distinct from a degraded *device*, which keeps
+   working and loses something: this one stops existing, so it gets the strongest ring. It used
+   to be dimmed as unaffected while the panel beside it listed it under "what the house loses". */
+.map-node.is-affected.is-lost:not(.is-source) .map-focus-ring { stroke: var(--sev-critical); stroke-width: 2.5; }
+
+/* ---- legend ---- */
+.map-legend {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+  gap: 8px 22px;
+  margin-top: 12px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+}
+.map-legend h3 { margin: 0 0 6px; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.legend-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.legend-list li { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; line-height: 1.45; }
+.legend-line { flex: 0 0 34px; align-self: center; }
+.legend-key {
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg);
+  letter-spacing: .12em;
+}
+/* Shape swatches drawn the way the map draws them, rather than with glyphs a font may not have. */
+.legend-shape { flex: 0 0 34px; align-self: center; }
+.legend-fill { fill: var(--muted); }
+.legend-hollow { fill: none; stroke: var(--muted); stroke-width: 2; stroke-dasharray: 3 2.5; }
+.legend-dashed { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 4 3; }
+
+/* ---- side panel ---- */
+.map-panel { margin-bottom: 0; position: sticky; top: 14px; max-height: calc(100vh - 28px); overflow-y: auto; }
+@media (max-width: 1180px) { .map-panel { position: static; max-height: none; } }
+.map-panel h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 0 6px; }
+.map-panel-kind { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 10px; }
+.map-headline { font-size: 14.5px; line-height: 1.45; margin: 0 0 12px; }
+.map-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.map-stat {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 9px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.map-stat b { font-size: 19px; line-height: 1.1; }
+.map-stat span { font-size: 11.5px; }
+.map-stat .muted { font-size: 10.5px; line-height: 1.3; }
+.map-evidence {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.map-evidence.conf-box-observed { border-left-color: var(--sev-low); }
+.map-evidence.conf-box-mixed { border-left-color: var(--sev-medium); }
+/* All four levels the panel can print get a rule. 'assumed' had none, so the weakest evidence
+   in the vocabulary silently borrowed the neutral border of the strongest — while the panel
+   also mislabelled it "Inferred". The dashes echo the legend's dotted-line convention. */
+.map-evidence.conf-box-inferred { border-left-color: var(--muted); border-left-style: dashed; }
+.map-evidence.conf-box-assumed { border-left-color: var(--muted); border-left-style: dotted; }
+.map-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; }
+.map-list li { display: flex; flex-wrap: wrap; gap: 5px; align-items: baseline; line-height: 1.4; }
+.map-links li { border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+.map-links li:last-child { border-bottom: none; }
+.map-link-name { font-weight: 600; }
+.map-conf {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 6px;
+  color: var(--muted);
+}
+.map-conf.conf-tag-observed { color: var(--sev-low); border-color: var(--sev-low); }
+.map-rank { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.map-rank-name { font-weight: 600; display: block; }
+
+/* The device panel and the overview card deliberately use nothing from this file — map.css is
+   linked from map.html only, so those pages are built from the shared stylesheet's own classes
+   and cannot be broken by a change made here. */
+
+/* The click target: transparent, but it must actually take the pointer, which `fill: none`
+   would not. Sized around the node and its label, so aiming at the name works. */
+.map-hit { fill: transparent; }

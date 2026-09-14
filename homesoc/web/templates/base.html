@@ -6,6 +6,7 @@
 <meta name="color-scheme" content="dark light">
 <title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+{% block head %}{% endblock %}
 </head>
 <body data-page="{{ page }}" data-refresh="{{ refresh or 15 }}">
 <div class="layout">
@@ -39,5 +40,6 @@
 </div>
 <script src="{{ url_for('static', filename='charts.js') }}" defer></script>
 <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+{% block scripts %}{% endblock %}
 </body>
 </html>

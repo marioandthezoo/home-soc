@@ -57,7 +57,7 @@ with a known-exploited CVE.
    definitions               scanners                        findings
    ───────────               ────────                        ────────
    CISA KEV        ┐         discovery  who is here    ┐
-   NVD / EPSS      ├───────► services   what listens   ├────►  88 rules
+   NVD / EPSS      ├───────► services   what listens   ├────►  92 rules
    OUI vendors     │         vulns      known CVEs     │       severity
    DNS blocklists  │         host       this PC        │       score + fix steps
    VirusTotal *    ┘         exposure   your WAN IP    ┘            │
@@ -150,6 +150,7 @@ under `[web] token`; set it to `""` if you want no login at all on a single-user
 | **Summary** (`/summary`) | The "what was found and what got fixed" report: score trend, found-vs-remediated bars per severity, the remediated table with how long each issue stayed open, and the still-open worklist as expandable cards with numbered remediation steps. Export it as Markdown or JSON, or print it. |
 | **Findings** (`/findings`) | Every issue Home SOC has ever raised, filterable by status, severity, category and text. Each row opens into the plain-English explanation, the evidence behind it, the fix steps and reference links; you can acknowledge, resolve or suppress from here. |
 | **Devices** (`/devices`) | The inventory: name, IP, MAC, vendor, guessed device kind, online state, when it was first and last seen, how many open ports and findings it has, and whether you have marked it trusted. Click any device for its services, sightings, vulnerabilities and findings, and to rescan just that one. |
+| **Map** (`/map`) | What each device depends on, what depends on it, and what stops working when it fails. Click a node for its blast radius: what goes down, what merely loses internet, and what carries on. Every edge is labelled with how it was established — watched, inferred from the network's shape, or only assumed. |
 | **Vulnerabilities** (`/vulns`) | Every CVE matched to a real service on a real device, with a KEV badge, CVSS, EPSS probability, which device and service it came from and what the match was based on. Filter to KEV-only or by minimum CVSS to see what genuinely matters first. |
 | **Host posture** (`/host`) | This computer's own health: Microsoft Defender status and the threats it handled in the last 30 days, Windows Update state and outdated apps, the grouped posture checks (firewall, accounts, encryption, network), autostart entries and what is listening on the network. Checks that need administrator rights are labelled, not failed. |
 | **DNS filter** (`/dns`) | Queries, blocks and clients over 24 hours, a queries-per-hour chart with blocks in red, the top blocked domains and busiest clients, which blocklists are loaded and how big they are, your allow/deny overrides, a live query log and the reputation cache. Empty until you enable the resolver. |
@@ -207,6 +208,34 @@ devices instead.
 
 The full walkthrough — router-by-router, per-device fallback, IPv6, what to do when it breaks — is in
 [docs/NETWORK_DNS_SETUP.md](docs/NETWORK_DNS_SETUP.md).
+
+## The dependency map — what breaks if this dies?
+
+The **Map** page (`/map`) draws what each device depends on, what depends on it, and what stops working when it fails.
+Click a node and the map highlights its blast radius, with a sentence you can act on:
+
+> If Living-room router fails, 5 devices lose their internet connection. They stay on the local network and can still
+> reach each other.
+
+The distinction in that sentence is the useful part. **Degraded** means a device keeps running and stays reachable but
+loses something — your laptop with the router unplugged is still on the Wi-Fi and still printing, it has just lost the
+way out. **Offline** means genuinely unreachable. On a flat home network a gateway failure degrades nearly everything
+and offlines almost nothing, which is not what most people expect.
+
+**Home SOC has no packet visibility**, and the map is built around admitting it. It is a program on a PC, not your
+router: when the laptop copies a file to the NAS, those packets never come near it. So this is not a live traffic
+diagram, every edge is labelled with how it was established — *observed* (a DNS query, an mDNS advertisement, a UPnP
+mapping, devices that dropped off together in a real outage), *inferred* (everything reaches the internet through the
+gateway), or *assumed* — and **it would rather show fewer links than invent one**. A printer advertising
+`_printer._tcp` becomes a provider node marked *no confirmed consumers* rather than sprouting lines to every device
+that might plausibly print. When there is an edge, something real is behind it.
+
+The best edges are learned rather than reasoned: when a group of devices disappears and returns together, Home SOC
+records an outage, and after the second time it says so in dates (`NET-DEP-002`). "Together" honestly means *in the
+same discovery cycle* — ten minutes by default, not seconds — and every screen that shows an outage says so.
+
+Full guide, including the three blind spots and what would lift the map from inference to measurement:
+[docs/TOPOLOGY.md](docs/TOPOLOGY.md).
 
 ## Lens — point your phone at a device
 
@@ -292,7 +321,7 @@ Global options, valid before any command:
 |---|---|---|
 | `init` | Create the data dir, `config.toml`, the database schema, and fetch the first feeds. | `--no-feeds` — skip the first feed download. |
 | `update` | Update definition feeds. | `--feeds a,b` — comma-separated feed names (default: all enabled). `--force` — ignore ETag/age and re-download. |
-| `scan` | Run scans now. | `--quick` — discovery + quick service scan + vulns + wifi. `--full` — every step (the default when `--quick` is absent). `--only a,b` — comma-separated steps: `discovery,services,vulns,host,exposure,wifi,files`. |
+| `scan` | Run scans now. | `--quick` — discovery + quick service scan + vulns + wifi. `--full` — every step (the default when `--quick` is absent). `--only a,b` — comma-separated steps: `discovery,services,vulns,topology,host,exposure,wifi,files`. |
 | `serve` | Dashboard only (jobs run only when you press a button). | `--host H`, `--port P`, `--tls` — serve over HTTPS with the Lens certificate. |
 | `dns` | DNS resolver only, in the foreground. | `--port P`. |
 | `run` | Dashboard + scheduler + resolver. This is normal mode, and what `run.bat` / `run.sh` call. | `--tls` — serve over HTTPS (see `lens cert`). |
@@ -304,6 +333,7 @@ Global options, valid before any command:
 | `feed` | Plain-text activity feed for the terminal. | `--limit N` (default 50), `--kinds a,b`, `--since AGE` — `30m`, `24h`, `7d`, `2w` or an ISO timestamp. |
 | `defender` | Windows Defender actions. | `--quick-scan` or `--update` (exactly one is required). |
 | `dns-test DOMAIN` | Show the policy decision and the upstream answer for one domain. | — |
+| `blast DEVICE` | What stops working if this device fails: the one-sentence headline, what is degraded, what genuinely goes offline, what is unaffected, and the evidence behind it. `DEVICE` is an IP, a MAC, or a nickname/hostname. | — |
 | `lens` | Pair a phone with [Lens](#lens--point-your-phone-at-a-device), list or revoke its tokens, manage the HTTPS certificate. | `pair [--host H] [--port P] [--invert]`, `tokens`, `revoke <id> \| --all`, `cert [--regenerate] [--hosts a,b]`. |
 
 A few things worth trying on day one:
@@ -313,6 +343,7 @@ python -m homesoc status                     # is everything running and current
 python -m homesoc findings --severity high   # the short list that actually matters
 python -m homesoc report --days 30 --out report.md
 python -m homesoc dns-test googlesyndication.com   # allow or block, and which list decided
+python -m homesoc blast 192.168.1.1                # what stops working if the router dies
 ```
 
 ## Configuration
@@ -425,9 +456,10 @@ Home_SOC/
     scanners/                  discovery, ports, services, host posture, Defender,
                                updates, persistence, exposure, files, ps/*.ps1
     vulns/                     CPE handling, KEV/NVD/EPSS matching and enrichment
-    findings/                  the 88-rule catalog, the lifecycle engine and the score
+    findings/                  the 92-rule catalog, the lifecycle engine and the score
     notify/                    ntfy, Discord, webhook and Windows toast
     dnsfilter/                 the resolver: policy, upstreams, cache, reputation, query log
+    topology/                  the dependency graph, outage learning and blast radius
     web/                       Flask app, JSON API, feed and summary builders, templates, static,
                                and Lens: lens.py, tls.py, qr.py (a dependency-free QR encoder)
   scripts/                     install.ps1  install.sh  enable-lan-dns.ps1  enable-lens.ps1
@@ -453,6 +485,8 @@ They are offline and fixture-driven; tests that would touch the real network are
   you use this tool.
 - [docs/NETWORK_DNS_SETUP.md](docs/NETWORK_DNS_SETUP.md) — the full LAN DNS walkthrough, router by router.
 - [docs/LENS_SETUP.md](docs/LENS_SETUP.md) — Lens: certificates, pairing a phone, stickers, and the honest limits.
+- [docs/TOPOLOGY.md](docs/TOPOLOGY.md) — the dependency map: where every edge comes from, how blast radius is worked
+  out, what Home SOC structurally cannot see, and what would make the map dramatically better.
 - [docs/PLAYBOOKS.md](docs/PLAYBOOKS.md) — what to do about each kind of finding.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the pieces fit together, for anyone reading the code.
 - [docs/SPEC.md](docs/SPEC.md) and [docs/SPEC_ADDENDUM.md](docs/SPEC_ADDENDUM.md) — the build contract this was written

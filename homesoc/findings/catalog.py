@@ -32,15 +32,26 @@ _PREFERRED_FIELDS: tuple[str, ...] = (
 # know the value, a truthful default).
 _ALIASES: dict[str, tuple[str, ...]] = {
     # WIN-DEF-011 comes from defender.evaluate_threats as "threat_name"; WIN-PER-* uses "name".
-    "name": ("threat_name", "feed", "job", "hostname", "nickname"),
+    # "label" is what topology/graph.py calls a node's display string for the same idea.
+    "name": ("threat_name", "feed", "job", "hostname", "nickname", "label"),
     # SOC-SYS-004 (cli.soc_health_drafts) carries both spellings; keep working if one is dropped.
     "job": ("key",),
-    "failures": ("consecutive_failures",),
+    # NET-DEP-003 counts lookups that did not produce a usable answer; its emitter may call them
+    # blocked (Home SOC's own filter sinkholed them) or failed (no upstream ever answered).
+    "failures": ("consecutive_failures", "blocked", "failed", "failed_lookups"),
     # NET-WAN-001/002 (exposure) name the address "public_ip"; NET-DNS-001 uses "listen".
     "ip": ("public_ip", "internal_client", "listen"),
     "port": ("external_port",),
     # WIN-FW-002 (host_windows) reports every profile whose default action is Allow.
     "profile": ("profiles",),
+    # --- topology (NET-DEP-*). The emitter names a device by its friendliest label; "name" above
+    # already falls back to hostname/nickname, and the graph calls the same string "label".
+    "dependents": ("dependent_count", "dependents_count", "weight"),
+    # topology/__init__.py calls the co-dropped count "devices"; outages.py calls it "member_count".
+    "affected": ("devices", "member_count", "members", "affected_count"),
+    "outages": ("outage_count", "occurrences", "times"),
+    "dates": ("outage_dates", "when", "observed_on"),
+    "domain": ("qname", "endpoint", "registrable_domain"),
 }
 # Truthful stand-ins for placeholders a second emitter cannot supply.
 # feeds.updater.health_findings only knows that the 48 h threshold was crossed, while
@@ -161,6 +172,9 @@ _CF_DNS = "https://developers.cloudflare.com/1.1.1.1/setup/"
 _QUAD9 = "https://quad9.net/"
 _TAILSCALE_SERVE = "https://tailscale.com/kb/1312/serve"
 _SECURE_CONTEXTS = "https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts"
+_SPOF = "https://en.wikipedia.org/wiki/Single_point_of_failure"
+_RFC2182 = "https://www.rfc-editor.org/rfc/rfc2182"
+_FTC_IOT = "https://consumer.ftc.gov/articles/securing-your-internet-connected-devices-home"
 
 # --- reusable click paths ------------------------------------------------------------------------
 _OPEN_WINSEC = "Open Start, type 'Windows Security' and press Enter."
@@ -1158,6 +1172,97 @@ _SPECS: list[FindingSpec] = [
             "PowerShell (admin): New-NetFirewallRule -DisplayName \"Home SOC DNS\" -Direction Inbound -Protocol UDP -LocalPort 53 -Action Allow -Profile Private",
         ],
         [_FW_DOCS], "dns", False,
+    ),
+    # ------------------------------------------------------------------ Dependencies / blast radius
+    # These three are the only findings whose evidence is about *the rest of the network* rather
+    # than the subject device. Their wording has to survive the feature's defining limit: Home SOC
+    # has no packet visibility, so it never knows that two devices talk to each other. Every claim
+    # below is either something it watched (a DNS query, an advertisement, devices dropping in the
+    # same discovery cycle) or something the shape of the network forces (everything reaches the
+    # internet through the gateway). Nothing here may read as "we saw traffic".
+    _spec(
+        "NET-DEP-001", "info", "{name} has become load-bearing: {dependents} devices now depend on it",
+        "Nothing is wrong with this device. The point is that it quietly grew important: the dependency map "
+        "now counts {dependents} others whose network path or whose services run through it, which is more than "
+        "the threshold in your settings. A box that started as 'the thing in the cupboard' is now the thing that "
+        "takes half the house with it when it reboots — and because that happens slowly, nobody notices until "
+        "the evening it fails and the failure looks like five unrelated problems at once.",
+        [
+            "Open the Map page (/map) and click {name}. The side panel names every device that depends on it and "
+            "says, in one sentence, what the house loses if it stops — that sentence is the thing worth knowing.",
+            "Check the confidence marks on its edges before you act on them: solid means Home SOC watched it "
+            "happen, dashed means it follows from the network's shape, dotted means it is only assumed. "
+            "Dotted edges are a prompt to check, not a fact.",
+            "If this device now carries several roles at once (router and DNS and file shares and a smart-home "
+            "hub), consider moving one of them somewhere else. Splitting roles is what turns a total outage into "
+            "a partial one.",
+            "Give it a nickname on the Devices page so it is recognisable in an outage, and note where it is "
+            "physically plugged in. During a failure you want to know which box and which socket, not which IP.",
+            "If it must stay this important, treat it accordingly: mains-filtered or UPS-backed power, a shelf "
+            "with airflow, and firmware updates you actually apply.",
+        ],
+        [_SPOF, _NSA_HOME, _CISA_HOME], "topology", True,
+    ),
+    _spec(
+        "NET-DEP-002", "medium",
+        "{name} is a single point of failure: {affected} devices have gone offline with it on {outages} separate occasions",
+        "This one is not modelled, it is remembered. On {dates}, {affected} devices dropped off the network in the "
+        "same discovery cycle as {name} and came back with it. Home SOC only says this after watching it happen at "
+        "least twice, so it is a pattern rather than a coincidence. There is nothing to patch here: the finding is "
+        "that the house has no second path for whatever this device provides, and that when it next fails you will "
+        "spend the first twenty minutes rebooting the wrong things.",
+        [
+            "Read the blast radius first: open the Map page (/map), click {name}, and note the sentence and the "
+            "list of what goes with it. That list is your outage checklist. The dates this already happened on: "
+            "{dates}.",
+            "Write that checklist down somewhere that works when the network does not — a card taped inside the "
+            "cupboard door, or a note in your phone: 'if the internet, printing or music stops, check {name} first', "
+            "with the room it is in. A troubleshooting list that lives behind the failing device is useless.",
+            "Now remove the single point where you can. If this device is the resolver, put a public resolver "
+            "(1.1.1.1 or 9.9.9.9) in the router's *secondary* DNS field so a failure degrades into unfiltered "
+            "internet instead of no internet — and know the honest caveat: clients fail over slowly and "
+            "inconsistently, so a secondary softens an outage, it does not erase it.",
+            "If it is the only route to the internet, your redundancy is a phone hotspot you have actually tested "
+            "once, not a second router you have never configured.",
+            "Split the roles it carries. A spare Raspberry Pi running the DNS resolver is the cheapest version of "
+            "this: it removes DNS from the list of things that die with this device, and it makes the map far "
+            "richer, because every device's lookups become visible. docs/TOPOLOGY.md has the details; the Map "
+            "page links to it.",
+            "Check the boring physical causes before buying anything: the power strip it shares, a failing PSU, a "
+            "hot shelf, a half-seated cable. Repeated whole-group outages are far more often power than firmware.",
+            "Rehearse it once on a quiet afternoon: unplug it for two minutes and note what actually stops. Where "
+            "reality and the map disagree, trust reality — Home SOC cannot see traffic between devices, so the map "
+            "is the floor of what depends on this, never the ceiling.",
+        ],
+        [_SPOF, _RFC2182, _CF_DNS, _QUAD9, _NSA_HOME], "topology", True,
+    ),
+    _spec(
+        "NET-DEP-003", "info",
+        "{name} keeps trying to reach {domain} and never gets through ({failures} lookups, every one blocked)",
+        "This device depends on {domain} for something, and across the whole window every single lookup was blocked "
+        "and not one was ever answered. The device will not tell you that. Cameras, doorbells, plugs, televisions and "
+        "speakers route their features through a vendor's cloud, and when that path is cut they usually keep their "
+        "lights on and go quiet: the app still lists the device, but notifications stop arriving, recordings stop "
+        "uploading, schedules stop firing, or it quietly stops fetching its own firmware updates. Often that is "
+        "exactly what you wanted — a television's advertising endpoints belong on a blocklist. Sometimes it is a "
+        "feature you believe you still have. This finding is how you get to decide which, instead of finding out in "
+        "six months.",
+        [
+            "Decide first whether you want this connection at all. If {domain} is analytics or advertising for a "
+            "device that works perfectly well without it, this is the filter doing its job: nothing to fix.",
+            "If the device is meant to use it, open the DNS page (/dns), filter the query log to this device and "
+            "search for {domain}. The 'reason' column names the blocklist that matched.",
+            "Check it from this computer too:  python -m homesoc dns-test {domain}   — it prints the policy decision "
+            "and the upstream's answer, which separates 'we blocked it' from 'it is genuinely gone'.",
+            "To let it through, add an 'allow' override for {domain} on the DNS page, then power-cycle the device so "
+            "it retries instead of sitting on a cached failure.",
+            "Then actually test the feature that depends on it — press the doorbell, ask for a recording, check the "
+            "notification reaches your phone. Nothing else is going to tell you whether it came back.",
+            "If the endpoint is gone for good (a discontinued product, a vendor that shut the service down), that is "
+            "worth knowing on its own: the device will probably never get another firmware update, which changes how "
+            "much you should trust it on the main network rather than on a guest/IoT one.",
+        ],
+        [_FTC_IOT, _CISA_HOME], "topology", True,
     ),
     # ------------------------------------------------------------------ SOC health
     _spec(

@@ -93,3 +93,10 @@ tag_learning = true                # allow unknown codes to be bound to a device
 allow_actions = false              # when true, a paired phone may trigger a rescan / acknowledge a finding
 token_ttl_days = 90                # paired-phone tokens expire after this; 0 = never
 max_tokens = 10                    # how many phones may be paired at once
+
+[topology]                         # dependency map and blast radius (see docs/SPEC_TOPOLOGY.md)
+enabled = true
+window_hours = 168                 # how far back to read DNS and sightings when building the graph
+include_cloud = true               # show external endpoints as nodes
+min_outage_members = 3             # devices that must drop together before it counts as an outage
+criticality_alert = 5              # dependents before NET-DEP-001 fires

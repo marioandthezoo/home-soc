@@ -49,6 +49,7 @@ NAV: list[tuple[str, str, str]] = [
     ("summary", "/summary", "Summary"),
     ("findings", "/findings", "Findings"),
     ("devices", "/devices", "Devices"),
+    ("map", "/map", "Dependency map"),
     ("vulns", "/vulns", "Vulnerabilities"),
     ("host", "/host", "Host posture"),
     ("dns", "/dns", "DNS filter"),
@@ -439,7 +440,9 @@ def _register_pages(app: Flask) -> None:
     @app.get("/")
     def overview():
         c: api.WebContext = g.homesoc
-        return _page("overview.html", "overview", "Overview", summary=api.summary(c))
+        graph = map_view(c.conn, c.cfg)
+        return _page("overview.html", "overview", "Overview", summary=api.summary(c),
+                     load_bearing=load_bearing(graph, 3), topology_available=graph["available"])
 
     @app.get("/feed")
     def feed_page():
@@ -485,7 +488,64 @@ def _register_pages(app: Flask) -> None:
         d = api.device_detail(c.conn, device_id)
         if d is None:
             abort(404)
-        return _page("device_detail.html", "devices", d["display_name"], device=d)
+        graph = map_view(c.conn, c.cfg)
+        return _page("device_detail.html", "devices", d["display_name"], device=d,
+                     dep=device_dependencies(c.conn, c.cfg, device_id, graph))
+
+    @app.get("/map")
+    def map_page():
+        """The dependency map (SPEC addendum C7).
+
+        The graph is handed to the page as JSON rather than fetched, so the first paint needs no
+        round trip and the page still draws if the API half is ever absent. Blast radii are
+        embedded too — but only when nothing has registered ``/api/map/blast``, since fetching one
+        per click beats shipping one per device.
+        """
+        c: api.WebContext = g.homesoc
+        default_hours = api._int_or_none(api.cfg_get(c.cfg, "topology.window_hours", api.DEFAULT_MAP_HOURS)) or api.DEFAULT_MAP_HOURS
+        hours = _int_arg("hours", default_hours, 1, api.MAX_MAP_HOURS)
+        cloud_arg = request.args.get("cloud")
+        cloud = api._bool(api.cfg_get(c.cfg, "topology.include_cloud", True)) if cloud_arg is None else api._bool(cloud_arg)
+        graph = map_view(c.conn, c.cfg, hours=hours, cloud=cloud)
+        if graph["available"] and not _has_blast_api(app):
+            graph["blast"] = {
+                str(n["device_id"]): blast
+                for n in graph["nodes"]
+                if n.get("device_id") is not None
+                for blast in [map_blast(c.conn, c.cfg, int(n["device_id"]), graph.get("_engine_graph"))]
+                if blast is not None
+            }
+        return _page(
+            "map.html", "map", "Dependency map",
+            mapdata={k: v for k, v in graph.items() if not k.startswith("_")},
+            available=graph["available"],
+            reason=graph["reason"],
+            note=api.MAP_NOTE,
+            doc=TOPOLOGY_DOC,
+            legend=graph["legend"]["confidence"],
+            hours=graph.get("window_hours", hours),
+            cloud=cloud,
+            load_bearing=load_bearing(graph, 3),
+        )
+
+    @app.get("/docs/<name>")
+    def docs_page(name: str):
+        """Serve the one document the map's honesty note links to, as plain text.
+
+        Allowlisted by exact name — no path joining of anything the caller sent — so this cannot
+        be walked into a file-read primitive.
+        """
+        filename = DOC_PAGES.get(name)
+        if filename is None:
+            abort(404)
+        path = Path(__file__).resolve().parents[2] / "docs" / filename
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = DOC_MISSING
+        resp = make_response(text)
+        resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+        return resp
 
     @app.get("/vulns")
     def vulns():
@@ -540,6 +600,174 @@ def _register_pages(app: Flask) -> None:
         for it in items:
             sections.setdefault(it["section"], []).append(it)
         return _page("settings.html", "settings", "Settings", sections=sections)
+
+
+# --------------------------------------------------------------------------- topology (addendum C)
+#
+# The page half of dependencies and blast radius. The graph itself comes from
+# ``homesoc.topology`` through ``api.map_graph``/``map_blast``/``map_criticality`` — the same
+# normalisation the JSON API serves, so the picture and the API can never disagree about what was
+# observed and what was inferred, and an edge this layer would have to invent simply is not there.
+#
+# The one thing every surface below keeps straight: Home SOC has no packet visibility. It cannot
+# know that the laptop is talking to the NAS, so the note below is rendered on every one of these
+# surfaces, never collapsed, and never as small print.
+
+TOPOLOGY_DOC = "/docs/TOPOLOGY.md"
+#: Why there is no picture, in the user's words. Never "None": an empty map means either "this has
+#: not run yet" or "there is nothing to draw", and those need different next steps.
+TOPOLOGY_EMPTY = (
+    "There is nothing on the dependency graph yet. It is built by the topology job, which runs "
+    "after discovery — run a scan, or start Home SOC with the scheduler attached."
+)
+
+
+def map_view(conn: sqlite3.Connection, cfg: Any, *, hours: int | None = None, cloud: bool | None = None) -> dict[str, Any]:
+    """The ``/api/map`` payload for a page, or one that explains why there is no picture.
+
+    Always returns a dict with ``nodes``/``edges``/``legend``/``note`` so the template never has
+    to guard every field: ``available`` says whether there is a graph, ``reason`` is the sentence
+    to print instead of one.
+    """
+    hours = api.DEFAULT_MAP_HOURS if hours is None else hours
+    include_cloud = api._bool(api.cfg_get(cfg, "topology.include_cloud", True)) if cloud is None else bool(cloud)
+    empty: dict[str, Any] = {
+        "nodes": [], "edges": [], "legend": api.map_legend(), "note": api.MAP_NOTE,
+        "window_hours": hours, "include_cloud": include_cloud, "criticality": [],
+        "available": False, "reason": TOPOLOGY_EMPTY, "_engine_graph": None,
+    }
+    # The engine's own (nodes, edges), kept so the ranking below — and the blast radius on
+    # /devices/<id> — reuse this build instead of each starting another. One page used to run
+    # the whole dependency graph two or three times, which on a week of DNS is most of its time.
+    built: list[Any] = []
+    try:
+        graph = api.map_graph(conn, hours=hours, include_cloud=include_cloud, engine_out=built)
+    except api.TopologyUnavailable as exc:
+        empty["reason"] = str(exc) or api.TOPOLOGY_MISSING
+        return empty
+    except Exception:  # pragma: no cover - a broken engine explains itself instead of 500-ing
+        logger.exception("building the dependency graph failed")
+        empty["reason"] = "The dependency graph could not be built. The details are in the event log."
+        return empty
+    engine_graph = built[0] if built else None
+    # The engine drops the cloud column from a handed-in graph, so this build can be reused
+    # whichever way ``include_cloud`` went: the ranking is identical either way (external
+    # endpoints are sinks, so nothing depends on them) and the page pays for one build.
+    edges_for_ranking = engine_graph[1] if engine_graph else None
+    try:
+        graph["criticality"] = api.map_criticality(conn, 10, engine_edges=edges_for_ranking)
+    except (api.TopologyUnavailable, Exception):  # ranking is a bonus; the graph stands without it
+        graph["criticality"] = []
+    graph["available"] = bool(graph.get("nodes"))
+    graph["reason"] = "" if graph["available"] else TOPOLOGY_EMPTY
+    # Underscored, and stripped before the payload is serialised for the page: these are the
+    # engine's own dataclasses, useful only to the engine and not JSON at all.
+    graph["_engine_graph"] = engine_graph if include_cloud else None
+    return graph
+
+
+def map_blast(conn: sqlite3.Connection, cfg: Any, device_id: int, engine_graph: Any = None) -> dict[str, Any] | None:
+    """One device's blast radius, or None when the engine cannot produce it.
+
+    ``engine_graph`` is the ``(nodes, edges)`` the page already built. ``blast_radius`` wants the
+    cloud-inclusive graph, which is what ``map_view`` stores, so passing it is safe only when
+    that build included cloud — ``map_view`` sets the key to None otherwise.
+    """
+    try:
+        return api.map_blast(conn, int(device_id), cfg=cfg, engine_graph=engine_graph)
+    except api.TopologyUnavailable as exc:
+        logger.debug("no blast radius for device %s: %s", device_id, exc)
+        return None
+    except Exception:  # pragma: no cover
+        logger.exception("blast radius failed for device %s", device_id)
+        return None
+
+
+def device_dependencies(conn: sqlite3.Connection, cfg: Any, device_id: int, graph: dict[str, Any]) -> dict[str, Any]:
+    """The "Depends on / Depended on by / If this fails" slice for one device (SPEC C7)."""
+    node_id = f"device:{int(device_id)}"
+    by_id = {str(n.get("id")): n for n in graph.get("nodes") or []}
+    me = by_id.get(node_id)
+
+    def side(edge: dict[str, Any], end: str) -> dict[str, Any]:
+        other = by_id.get(str(edge.get(end))) or {"id": edge.get(end), "label": edge.get(end), "kind": "unknown"}
+        row = {k: other.get(k) for k in ("id", "label", "kind", "device_id", "online")}
+        row.update({k: edge.get(k) for k in ("edge_type", "protocol", "confidence", "evidence", "observed_count")})
+        return row
+
+    edges = graph.get("edges") or []
+    return {
+        "available": bool(graph.get("available")) and me is not None,
+        "reason": graph.get("reason") or "This device is not on the dependency graph yet.",
+        "node": me,
+        "depends_on": [side(e, "dst") for e in edges if e.get("src") == node_id],
+        "dependents": [side(e, "src") for e in edges if e.get("dst") == node_id],
+        "blast": map_blast(conn, cfg, device_id, graph.get("_engine_graph")) if graph.get("available") else None,
+        "note": api.MAP_NOTE,
+        "doc": TOPOLOGY_DOC,
+    }
+
+
+def load_bearing(graph: dict[str, Any], limit: int = 3) -> list[dict[str, Any]]:
+    """Top devices by criticality for the overview card and the map's idle panel (SPEC C7)."""
+    ranked = [dict(r) for r in (graph.get("criticality") or []) if r.get("device_id") is not None]
+    if not ranked:
+        # No ranking from the engine: fall back to the nodes' own criticality rather than an
+        # empty card, ordered the same way the API would have ordered it.
+        ranked = [
+            {"device_id": n["device_id"], "label": n["label"], "dependents": n.get("depended_on_by", n.get("criticality", 0)),
+             "weight": n.get("criticality", 0), "why": ""}
+            for n in (graph.get("nodes") or [])
+            if n.get("device_id") is not None and (n.get("depended_on_by") or n.get("criticality"))
+        ]
+        ranked.sort(key=lambda r: (-int(r.get("weight") or 0), -int(r.get("dependents") or 0), str(r.get("label") or "").lower()))
+    return ranked[:limit]
+
+
+def _has_blast_api(app: Flask) -> bool:
+    """True when ``/api/map/blast/<id>`` is registered.
+
+    When it is, the map fetches one blast radius per click. When it is not — an install without
+    that half of the API — the page carries the ones it needs, so /map works either way.
+    """
+    return any(str(rule.rule).startswith("/api/map/blast") for rule in app.url_map.iter_rules())
+
+
+#: The one document the map's note links to. Served as plain text because Home SOC ships no
+#: Markdown renderer and will not grow a dependency for one page. Allowlisted by exact name, so
+#: this can never be walked into a file-read primitive.
+DOC_PAGES: dict[str, str] = {"TOPOLOGY.md": "TOPOLOGY.md"}
+DOC_MISSING = """Home SOC — why the dependency map is not a traffic diagram
+=========================================================
+
+docs/TOPOLOGY.md is not installed next to this copy of Home SOC, so here is the short version.
+
+Home SOC watches a home network from one ordinary machine on it. It is not the router, it is not
+a managed switch mirroring a port, and it has no packet capture. Traffic between two devices on
+the LAN — your laptop opening a file on the NAS, your phone printing — never reaches it. It
+therefore cannot know those conversations happened, and it will not draw an arrow saying they did.
+
+What it can honestly say:
+
+  observed  It saw the thing itself: a DNS lookup arriving from that device at its own resolver,
+            a service the device advertised over mDNS, or a set of devices that went offline in
+            the same discovery cycle.
+  inferred  It follows from how the network is shaped: every device on the gateway's own subnet
+            reaches the internet through it.
+  assumed   A reasonable default nothing has confirmed, such as a LAN device being reachable
+            through the gateway when there is no route data at all.
+
+So a printer advertising _printer._tcp appears as something that offers printing, with no
+confirmed consumers — not with a line to every device in the house that might plausibly print.
+A hub's Zigbee, Z-Wave, Thread or Bluetooth children are not on the IP network and are invisible
+here; the map never pretends to know how many there are.
+
+What would make this map dramatically better: a managed switch's bridge table over SNMP, conntrack
+from an OpenWrt or pfSense router, a passive listener on a spare machine, or a reader for UPnP
+port mappings, SSDP advertisements and the DHCP lease file — none of which Home SOC has today. Running the resolver
+on a spare Raspberry Pi would also remove DNS as a single point of failure and make every device's
+lookups visible, which is most of the missing evidence.
+"""
 
 
 # --------------------------------------------------------------------------- lens (addendum B)

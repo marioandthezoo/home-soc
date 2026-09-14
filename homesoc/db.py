@@ -1,10 +1,21 @@
 """SQLite access layer and the complete schema for every package.
 
 One connection is shared by the scheduler thread, the DNS server threads and
-Flask request threads. SQLite serialises statements on a connection, but
-``execute`` + ``commit`` pairs are not atomic across threads, so every write
-goes through :func:`write`/:func:`writemany` under a module-level lock. Reads
-are lock-free (WAL mode lets them proceed while a write is in flight).
+Flask request threads, so **every** statement — read or write — goes through
+the helpers here under a module-level ``RLock``.
+
+Reads are not exempt, and this is the part that is easy to get wrong. WAL lets
+separate *connections* read during a write, but this process has one connection,
+and ``sqlite3`` keeps statement state on the connection object. Two threads
+calling ``conn.execute`` concurrently do not politely queue: they tread on each
+other's cursors. That showed up as ``InterfaceError('no more rows available')``
+and ``('bad parameter or other API misuse')`` and, far worse, as :func:`one`
+returning ``None`` for a row that plainly exists — a silent wrong answer rather
+than a crash. A stress harness of eight threads over 120 trials went from ~160
+failures to zero once reads took the lock.
+
+So do not "optimise" the lock out of :func:`query`/:func:`one`. If read
+throughput ever genuinely matters, give each thread its own connection instead.
 """
 
 from __future__ import annotations
@@ -31,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 _WRITE_LOCK = threading.RLock()
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # Complete schema (spec §4). Column order and names are normative — other packages
 # write INSERTs against them. Keep DDL idempotent so init_schema can run at every start.
@@ -314,15 +325,120 @@ CREATE TABLE IF NOT EXISTS lens_tags (
 CREATE INDEX IF NOT EXISTS idx_lens_tags_device ON lens_tags(device_id);
 """
 
+# Version 3 (SPEC addendum C5): dependencies and blast radius. Owned by homesoc/topology/.
+#
+# ``dep_edges`` is a *cache*, not a record: every row can be recomputed from devices,
+# device_sightings, services and dns_queries by ``topology.graph.refresh()``. Deleting the
+# table's contents must therefore be harmless — tests/test_topology.py proves it — which is
+# why nothing else references it and why it carries its own first_seen/last_seen rather than
+# being the authority on when a dependency was first observed.
+#
+# ``outages`` and ``outage_members`` are the opposite: they are watched history that cannot be
+# recomputed once the sightings behind them are purged, so they are written once and never
+# rebuilt. ``cycle_seconds`` is part of the row because the honest resolution of "dropped
+# together" is one discovery cycle, and that interval changes when the owner edits
+# schedule.discovery_minutes — a reader in six months must see the interval that was in force
+# then, not today's.
+SCHEMA_V3 = """
+CREATE TABLE IF NOT EXISTS dep_edges (
+    id             INTEGER PRIMARY KEY,
+    src            TEXT NOT NULL,
+    dst            TEXT NOT NULL,
+    edge_type      TEXT NOT NULL,
+    protocol       TEXT,
+    confidence     TEXT NOT NULL,
+    evidence       TEXT,
+    observed_count INTEGER NOT NULL DEFAULT 0,
+    first_seen     TEXT NOT NULL,
+    last_seen      TEXT NOT NULL,
+    UNIQUE(src, dst, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_dep_edges_src ON dep_edges(src);
+CREATE INDEX IF NOT EXISTS idx_dep_edges_dst ON dep_edges(dst);
+
+CREATE TABLE IF NOT EXISTS outages (
+    id                INTEGER PRIMARY KEY,
+    started_at        TEXT NOT NULL,
+    ended_at          TEXT,
+    cycle_seconds     INTEGER NOT NULL,
+    trigger_device_id INTEGER REFERENCES devices(id),
+    trigger_kind      TEXT NOT NULL,
+    member_count      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outages_started ON outages(started_at);
+
+CREATE TABLE IF NOT EXISTS outage_members (
+    outage_id   INTEGER NOT NULL REFERENCES outages(id),
+    device_id   INTEGER NOT NULL REFERENCES devices(id),
+    dropped_at  TEXT NOT NULL,
+    returned_at TEXT,
+    PRIMARY KEY(outage_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_outage_members_device ON outage_members(device_id);
+"""
+
+# Version 4: give the outage tables the ON DELETE behaviour they should have shipped with.
+#
+# ``connect()`` sets PRAGMA foreign_keys=ON, and v3's plain ``REFERENCES devices(id)`` therefore
+# *blocks* deleting any device that has ever been in an outage — verified on a migrated v3
+# database: DELETE FROM devices WHERE id = 2 raises "FOREIGN KEY constraint failed". Nothing
+# deletes devices today, so this is latent; the first "forget this device" feature would meet it
+# as a crash. ``lens_tags`` above documents having avoided exactly this trap.
+#
+# A table rebuild rather than an edit to SCHEMA_V3, because v3 has shipped: a database created
+# before this migration exists and has to be brought forward, and a database created after it
+# runs v3 then v4 and lands in the same place. The rebuild preserves every row, and rebuilding
+# ``outages`` first means ``outage_members``'s own rebuild sees the final parent table.
+#
+# ``PRAGMA foreign_keys`` cannot be changed inside a transaction, and executescript commits, so
+# the legacy_alter_table dance is not needed: the new tables are populated by explicit INSERT
+# ... SELECT and the old ones dropped only once the copy is in place.
+SCHEMA_V4 = """
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE IF NOT EXISTS outages_v4 (
+    id                INTEGER PRIMARY KEY,
+    started_at        TEXT NOT NULL,
+    ended_at          TEXT,
+    cycle_seconds     INTEGER NOT NULL,
+    -- The outage is still a fact once the device is gone; it just no longer has a named trigger.
+    trigger_device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    trigger_kind      TEXT NOT NULL,
+    member_count      INTEGER NOT NULL
+);
+INSERT INTO outages_v4(id, started_at, ended_at, cycle_seconds, trigger_device_id, trigger_kind, member_count)
+    SELECT id, started_at, ended_at, cycle_seconds, trigger_device_id, trigger_kind, member_count FROM outages;
+DROP TABLE outages;
+ALTER TABLE outages_v4 RENAME TO outages;
+CREATE INDEX IF NOT EXISTS idx_outages_started ON outages(started_at);
+
+CREATE TABLE IF NOT EXISTS outage_members_v4 (
+    outage_id   INTEGER NOT NULL REFERENCES outages(id) ON DELETE CASCADE,
+    -- A membership row is *about* a device; with the device gone it says nothing, so it goes too.
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    dropped_at  TEXT NOT NULL,
+    returned_at TEXT,
+    PRIMARY KEY(outage_id, device_id)
+);
+INSERT INTO outage_members_v4(outage_id, device_id, dropped_at, returned_at)
+    SELECT outage_id, device_id, dropped_at, returned_at FROM outage_members;
+DROP TABLE outage_members;
+ALTER TABLE outage_members_v4 RENAME TO outage_members;
+CREATE INDEX IF NOT EXISTS idx_outage_members_device ON outage_members(device_id);
+
+PRAGMA foreign_keys=ON;
+"""
+
 # Ordered list of (version, ddl). Future schema changes append here; init_schema
 # applies every version newer than the highest recorded in schema_migrations.
-MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2)]
+MIGRATIONS: list[tuple[int, str]] = [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4)]
 
 TABLES: tuple[str, ...] = (
     "schema_migrations", "settings", "feeds", "devices", "device_sightings", "services", "vulns",
     "host_checks", "software", "persistence", "file_checks", "findings", "finding_events", "scans",
     "events", "metrics", "dns_queries", "dns_hourly", "dns_overrides", "reputation", "notifications", "jobs",
     "lens_tokens", "lens_tags",
+    "dep_edges", "outages", "outage_members",
 )
 
 

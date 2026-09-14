@@ -605,6 +605,98 @@ the guest/IoT network so it can reach the internet but not your laptop.
 The **Scan this device now** button re-runs a service scan against just this device, so you can verify
 each fix in a few seconds rather than waiting for the 24-hour cycle.
 
+### Map (`/map`) — "what breaks if this dies?"
+
+The Devices page answers *what is on my network*. The Map answers the question you only ever ask
+during an outage: **what depends on this, and what stops working without it?**
+
+The graph runs left to right — internet, gateway, then the infrastructure (the resolver, any hubs,
+anything offering a service), then the leaf devices, with external endpoints folded into a single
+"external services" node on the right until you open it. Node colour is the worst open finding, node
+size is how many things depend on it, and a hollow node is one that is currently offline.
+
+**Click a node and the map enters blast-radius mode.** Everything that would fail lights up,
+everything unaffected dims, and a side panel gives you one sentence. On a six-device test network,
+clicking the router produces:
+
+> If Living-room router fails, 5 devices lose their internet connection. They stay on the local
+> network and can still reach each other.
+
+That sentence is the point of the whole page, and the distinction inside it is the part most network
+diagrams get wrong. **Degraded** means the device keeps running and stays reachable but loses
+something — your laptop with the router unplugged is still on the Wi-Fi, still printing, still
+reaching the NAS, it has just lost the door to the outside. **Offline** means genuinely unreachable
+by anything. On a flat home network a gateway failure degrades nearly everything and offlines almost
+nothing, which surprises people the first time they see it. The cases that really do produce
+*offline* are narrow: the children behind a failed smart-home hub, and the Wi-Fi clients of a failed
+access point.
+
+**Every edge is labelled with how it was established**, and this is not decoration. Solid means Home
+SOC watched it happen — a DNS query in the log, an mDNS advertisement, a UPnP mapping, or devices
+that dropped off together in a recorded outage. Dashed means it follows from the shape of the network
+(everything reaches the internet through the gateway). Dotted means it is assumed and unconfirmed —
+treat a dotted edge as a prompt to go and check, not as a fact.
+
+The reason for that three-way split is printed on the page itself, permanently, and you should read
+it before you read the graph:
+
+> Home SOC cannot see traffic between devices — it has no packet visibility. These links are what it
+> has observed or can reasonably infer.
+
+Home SOC is a program on a PC, not the router. When your laptop copies a file to the NAS those
+packets never come near it. So the map is **not** a live traffic diagram, and the discipline that
+falls out of that is the feature's whole value: *it would rather show you fewer links than invent
+one*. A printer advertising `_printer._tcp` becomes a **provider** node marked *no confirmed
+consumers* — it does not sprout lines to every device in the house that might plausibly print, even
+though that would look far more impressive. When you see an edge here, something real is behind it.
+
+That shows up in the sentences. Clicking the speaker on the same test network gives:
+
+> If speaker fails, the network loses airplay audio, but nothing has been seen using it, so no other
+> device is known to be affected.
+
+which is exactly as much as Home SOC can honestly say. The service really does stop; who that hurts
+is not something it can see.
+
+The strongest edges on the page are not reasoned at all, they are **remembered**. Discovery already
+records who it can see every ten minutes; when a group of devices vanishes and returns together,
+Home SOC records that as an outage, and after it has seen the same group drop together twice it
+promotes the edge to *observed* and raises `NET-DEP-002` citing the dates. The honest caveat comes
+with it everywhere it is displayed: "together" means **in the same discovery cycle**, which by
+default is a ten-minute window, not within seconds. Home SOC was not watching in between. Devices
+that are routinely offline — the phone that goes to work every morning — are excluded, so your
+weekday commute does not turn into a fake dependency.
+
+Two smaller surfaces carry the same data. The Overview grows a **load-bearing devices** card with the
+top three by criticality, and every device page grows a **Depends on / Depended on by / If this
+fails** section. Lens gets it too, which is arguably the best use of the feature: point the phone at
+a box in a cupboard and read what the house loses without it, while you are standing in front of it.
+
+There is a terminal version as well, which takes an IP, a MAC or a nickname:
+
+```
+$ python -m homesoc blast 192.168.1.254
+Living-room router   192.168.1.254  aa:bb:cc:00:00:01
+
+If Living-room router fails, 6 devices lose their internet connection. They stay on the
+local network and can still reach each other.
+...
+Services lost
+  - internet access for 6 devices
+  - DNS for 2 devices
+```
+
+The map itself is refreshed by a scheduled job (`topology`), which runs after discovery and only
+re-reads what discovery and the DNS filter already wrote — it scans nothing of its own. To rebuild
+it on demand: `python -m homesoc scan --only topology`.
+
+The blind spots are real and worth knowing before you trust the picture: device-to-device traffic
+(invisible), anything behind a Zigbee/Z-Wave/Thread hub (those twenty bulbs are not on the IP network
+at all, so the hub shows as one device and never guesses a child count), and any device using a DNS
+resolver that is not Home SOC. [docs/TOPOLOGY.md](TOPOLOGY.md) covers all of it, plus the three
+things that would lift the map from inference to measurement — a managed switch read over SNMP,
+`conntrack` from an OpenWrt/pfSense router, or a passive listener on a spare machine.
+
 ### Vulnerabilities (`/vulns`) — CVEs matched to real services
 
 ![The Vulnerabilities page: a table of CVEs with KEV badge, CVSS, EPSS probability, the device and service they came from, what the match was based on, and links out to NVD](images/08-vulnerabilities.png)

@@ -662,6 +662,13 @@
       if (posture.headline) { cardBody.appendChild(el('p', { className: 'headline', text: String(posture.headline) })); }
       cardBody.appendChild(severityStrip(counts, posture));
 
+      /* SPEC C7 calls this the single best use of the dependency map: point the phone at a box
+         and learn what the house loses without it. The server has always computed it — and Lens
+         paid for a full build_graph on every identification to do so — but renderCard never
+         appended it, so the section the CHANGELOG tells users about did not exist on screen. */
+      var blast = blastSection(payload.blast);
+      if (blast) { cardBody.appendChild(blast); }
+
       cardBody.appendChild(problemsSection(payload.findings || [], payload.actions || {}, d));
       cardBody.appendChild(exposedSection(payload.services || []));
       cardBody.appendChild(vulnSection(payload.vulns || []));
@@ -702,6 +709,60 @@
       if (open) { node.setAttribute('open', 'open'); }
       return node;
     }
+
+    /* The four confidence levels ``blast_radius`` can report, each with the word for it. They
+       are not synonyms: 'inferred' means the network's shape implies it, 'assumed' means
+       nothing has confirmed it at all, and printing one for the other is the kind of small
+       overstatement this whole feature is built to avoid. */
+    var BLAST_CONF = {
+      observed: 'Observed', mixed: 'Partly observed', inferred: 'Inferred', assumed: 'Assumed'
+    };
+
+    /* "If this fails" (SPEC C7). Three states the payload already distinguishes:
+         - key absent or null: the topology package is not installed on this Home SOC, so there
+           is nothing to say and no section is rendered at all;
+         - both counts zero: nothing else is known to stop working, which is an answer;
+         - populated: the headline, the counts, how it was established and the evidence line. */
+    function blastSection(blast) {
+      if (!blast || !blast.headline) { return null; }
+      var offline = Number(blast.offline_count) || 0;
+      var degraded = Number(blast.degraded_count) || 0;
+      var sec = section('If this fails', offline + degraded, true);
+      sec.appendChild(el('p', { className: 'blast-headline', text: String(blast.headline) }));
+
+      if (offline || degraded) {
+        var stats = el('div', { className: 'blast-stats' });
+        if (offline) {
+          stats.appendChild(el('span', { className: 'blast-stat is-offline' },
+            el('b', { text: num(offline) }),
+            el('span', { text: plural(offline, 'device') + ' unreachable' })));
+        }
+        if (degraded) {
+          stats.appendChild(el('span', { className: 'blast-stat is-degraded' },
+            el('b', { text: num(degraded) }),
+            el('span', { text: plural(degraded, 'device') + ' degraded' })));
+        }
+        sec.appendChild(stats);
+      } else {
+        sec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing else is known to stop working.' }));
+      }
+
+      var conf = String(blast.confidence || 'inferred');
+      var row = el('p', { className: 'blast-evidence conf-' + conf },
+        el('span', { className: 'blast-conf', text: BLAST_CONF[conf] || 'Inferred' }));
+      row.appendChild(el('span', {
+        text: ' ' + (blast.evidence ||
+          'Nothing like this has actually been recorded — this follows from what Home SOC can see of the network.')
+      }));
+      sec.appendChild(row);
+
+      /* The packet-visibility note, on the phone especially: a card headed "if this fails" is
+         exactly where someone would otherwise read the map as a live traffic diagram. */
+      if (blast.note) { sec.appendChild(el('p', { className: 'blast-note', text: String(blast.note) })); }
+      return sec;
+    }
+
+    function plural(n, word) { return Number(n) === 1 ? word : word + 's'; }
 
     function problemsSection(findings, actions, device) {
       var sorted = findings.slice().sort(function (a, b) { return sevRank(a.severity) - sevRank(b.severity); });

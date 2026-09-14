@@ -1,6 +1,6 @@
 """Capture stage of the Home SOC walkthrough video.
 
-Owns a throwaway dashboard process (``python -m homesoc serve --port 8899`` against
+Owns a throwaway dashboard process (``homesoc serve --tls --port 8899`` against
 ``video/demo_data``), drives it with Playwright + the *installed* Google Chrome, and writes
 everything the compositor needs to draw frames:
 
@@ -24,6 +24,56 @@ everything the compositor needs to draw frames:
 ``video/build/shots_manifest.json``
     Per-scene list of the captured states, in order, with the page/scroll each came from.
 
+Lens, and why the dashboard is now served over TLS
+--------------------------------------------------
+CONTRACT_V2 adds an act about Lens, the phone app. Browsers hand out ``getUserMedia`` only
+in a secure context, and Lens refuses to serve a phone over plain HTTP, so the demo
+dashboard is started with ``--tls`` and everything — desktop pages included — is captured
+from ``https://127.0.0.1:8899``. The certificate is self-signed, which is the product's
+documented path, and both browser contexts are created with ``ignore_https_errors``.
+
+Three new shot kinds come from ``script.py`` and are handled here:
+
+``Phone(path="/lens", state=..., scroll=...)``
+    A 390x844 @3x phone screen, captured by :mod:`phone` in its own mobile context and
+    saved at 1170x2532. Tap targets are resolved in the 390x844 space and land in
+    ``geometry.json`` under the phone scene's id, exactly like cursor targets.
+
+``PhonePair(scene_png=..., phone_state=...)``
+    Scene 18: the illustrated scene from ``scene_render.py`` beside the phone. Only the
+    phone half is captured here; the manifest records where the scene still lives.
+
+``Tap`` / ``PhoneScroll``
+    Phone choreography. A ``Tap``'s target is resolved on the phone state that is on
+    screen when it fires; ``PhoneScroll`` scrolls the card's own body, not the document.
+
+Two substitutions, both stated out loud
+---------------------------------------
+1. **The decoder** (CONTRACT_V2 V3). Desktop Chrome on Windows has no ``BarcodeDetector``,
+   so for scene 18 this module starts ``video/decode_sidecar.py`` (zxing-cpp), launches
+   Chrome with ``--use-file-for-fake-video-capture`` pointed at the Y4M that
+   ``video/scene_render.py`` drew, and injects a ``BarcodeDetector`` shim that hands the
+   frame to the sidecar and returns the real decoded value. The pixels are genuinely
+   decoded; only the decoder sits beside the browser instead of inside it. If the shim
+   does not produce the camera's sticker token, capture **fails** — the narration calls it
+   a scan, so it has to be one, and quietly falling back to the manual picker would make
+   the video lie.
+
+2. **The machine's identity**. ``cli.lens_hosts`` builds the TLS certificate's subject and
+   subjectAltNames out of ``socket.gethostname()`` and the real LAN address, and
+   ``/lens/pair`` prints both, along with a pairing URL built from them. That would put the
+   author's real hostname and LAN address on screen, which CONTRACT_V2 V5 forbids. The
+   demo dashboard is therefore launched through ``build/serve_demo.py``, a generated
+   wrapper that rebinds ``util.local_hostname``/``util.default_interface_ip`` to the
+   fiction the rest of the video already uses (``home-pc``, ``192.168.1.20`` — the address
+   seed_demo.py gives HOME-PC in the inventory) and records
+   the bind address the documented invocation produces (``192.168.1.20:8443``, from
+   ``serve --tls --host 0.0.0.0 --port 8443``). The socket still listens on loopback only,
+   so nothing is exposed. Nothing under ``homesoc/`` is modified; the wrapper lives in
+   ``build/`` and exists for the length of one capture. The precedent is the resolver fix
+   below: where the capture harness contradicts what a real ``run.bat`` instance shows,
+   the harness is what gets corrected.
+
 Nothing here writes to the real ``data/`` directory or ``config.toml``. The dashboard runs
 with ``HOMESOC_DATA``/``HOMESOC_CONFIG`` pointing at a generated, token-free config under
 ``build/`` and at ``build/demo_data_run`` — a throwaway copy of ``video/demo_data`` made at
@@ -35,6 +85,7 @@ Usage::
 
     python video/capture.py                    # slides + every scene
     python video/capture.py --only 06-findings
+    python video/capture.py --only 18-lens-scan   # the scan rig, end to end
     python video/capture.py --slides-only
     python video/capture.py --headed           # watch it work
 """
@@ -47,17 +98,19 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Callable, Final
 
 HERE: Final[Path] = Path(__file__).resolve().parent
 PROJECT_ROOT: Final[Path] = HERE.parent
@@ -73,9 +126,63 @@ DASHBOARD_LOG: Final[Path] = BUILD / "dashboard.log"
 DEMO_CONFIG: Final[Path] = BUILD / "demo_config.toml"
 #: Throwaway copy of demo_data that the dashboard is allowed to write to.
 WORK_DATA: Final[Path] = BUILD / "demo_data_run"
+#: Generated wrapper that starts the dashboard with a fictional machine identity.
+SERVE_LAUNCHER: Final[Path] = BUILD / "serve_demo.py"
+SIDECAR_LOG: Final[Path] = BUILD / "decode_sidecar.log"
 
-PORT: Final[int] = 8899
-BASE_URL: Final[str] = f"http://127.0.0.1:{PORT}"
+def _pick_port(preferred: int, *, tries: int = 24) -> int:
+    """``preferred`` if loopback is free there, else the next free port above it.
+
+    A fixed port is a liability on a machine that is doing more than one thing: a stale
+    ``homesoc serve`` left on 8899 by something else answered the readiness probe over
+    *plain HTTP*, and this module's TLS probe failed with ``WRONG_VERSION_NUMBER`` sixty
+    seconds later with nothing useful to say. Picking a free one costs a bind and a close.
+    """
+    for candidate in range(preferred, preferred + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+        if candidate != preferred:
+            # `logger` is defined below this block, so ask for it by name.
+            logging.getLogger("homesoc.video.capture").warning(
+                "port %d is busy; using %d instead", preferred, candidate
+            )
+        return candidate
+    return preferred
+
+
+PORT: Final[int] = _pick_port(8899)
+#: Lens needs a secure context, so the whole capture — desktop pages included — is https.
+BASE_URL: Final[str] = f"https://127.0.0.1:{PORT}"
+
+#: The fiction the rest of the video already tells, extended to the machine itself so no
+#: frame can show the author's hostname or LAN address. See the module docstring.
+#:
+#: These must agree with the machine seed_demo.py puts in the inventory, because the video
+#: shows both: /lens/pair prints this address, and /devices lists every address in the
+#: household two scenes earlier. seed_demo.py's device 2 is hostname HOME-PC, nickname
+#: "Home PC", notes "The machine Home SOC itself runs on", at 192.168.1.20. An earlier take
+#: used 192.168.1.50 here, which in that same inventory is device 12, the Epson printer — so
+#: scene 16 announced that Home SOC was serving from the printer. Re-check against the
+#: devices table if the seed's addressing ever changes.
+DEMO_HOSTNAME: Final[str] = "home-pc"
+DEMO_LAN_IP: Final[str] = "192.168.1.20"
+DEMO_LAN_PORT: Final[int] = 8443
+
+#: The phone this capture pairs with itself, so ``/lens`` renders as a paired phone.
+LENS_TOKEN_LABEL: Final[str] = "Pixel in the hallway"
+
+#: The scan rig (CONTRACT_V2 V3). Owned by other packages; this module starts them.
+SCENE_RENDER_SCRIPT: Final[Path] = HERE / "scene_render.py"
+SIDECAR_SCRIPT: Final[Path] = HERE / "decode_sidecar.py"
+SIDECAR_PORT: Final[int] = _pick_port(max(8901, PORT + 1))
+#: Scenes whose narration calls the identification a *scan*, so it has to be a real one.
+SCAN_SCENES: Final[frozenset[str]] = frozenset({"18-lens-scan"})
+#: Where the phone screens land, next to the desktop shots.
+PHONE_DIR: Final[Path] = BUILD / "shots"
+
 VIEWPORT_W: Final[int] = 1600
 VIEWPORT_H: Final[int] = 900
 SCALE: Final[int] = 2
@@ -97,6 +204,11 @@ class CaptureError(RuntimeError):
     """Anything that stops the capture, always naming the scene and selector at fault."""
 
 
+#: The demo certificate is self-signed on purpose — that is the path SPEC B3 documents and
+#: scene 16 explains. Nothing here is a trust decision: it is this machine dialling itself.
+_TLS_CTX: Final[ssl.SSLContext] = ssl._create_unverified_context()
+
+
 # --------------------------------------------------------------------------- injected assets
 
 #: Kills every source of between-run jitter that is not the data itself.
@@ -112,6 +224,25 @@ FREEZE_CSS: Final[str] = """
 html { scrollbar-width: none !important; }
 ::-webkit-scrollbar { width: 0 !important; height: 0 !important; }
 *:focus, *:focus-visible { outline: none !important; }
+
+/* Long reference URLs.
+   In a browser you scroll a clipped URL, or hover it, or click it. In a video it just sits
+   there chopped: the finding detail in scene 6 parked
+   "...CSI_BEST_PRACTICES_FOR_SECURING_YOUR_H" against the right edge of the remediation
+   panel, with no ellipsis and no wrap, for sixteen seconds. Wrapping is what the page
+   would do at a narrower width anyway - nothing is hidden and nothing is invented. */
+.detail a, .detail li, .refs a, .refs li {
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+
+/* NOT fixed here, on purpose: the empty band inside "Fix these first" and "Last scans".
+   It is not a min-height the video may quietly drop - those are `.card-fill` cards in a
+   `.grid`, so CSS grid stretches them to their taller neighbour and `.push-down` pins the
+   footnote to the bottom of the stretched box. Overriding either would be the video
+   redrawing the product's layout to flatter it, and seeding more finding types to fill the
+   card would move every figure the narration speaks. It is the page's own behaviour on a
+   small network, and it stays. */
 """
 
 #: Pins the one string the dashboard rewrites from the wall clock every refresh tick.
@@ -218,18 +349,20 @@ class State:
 
     scene_id: str
     index: int
-    kind: str  # "slide" | "page"
+    kind: str  # "slide" | "page" | "phone" | "phone_pair"
     path: str  # url path, or the slide name
     scroll: int = 0
     png: Path | None = None
     produced_by: str = "shot"
+    #: Phone states only — everything the compositor needs to frame and caption one.
+    phone: dict[str, Any] | None = None
 
     @property
     def filename(self) -> str:
         return f"{self.scene_id}_{self.index}.png"
 
     def as_json(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "index": self.index,
             "kind": self.kind,
             "path": self.path,
@@ -237,6 +370,9 @@ class State:
             "png": self.png.as_posix() if self.png else None,
             "produced_by": self.produced_by,
         }
+        if self.phone is not None:
+            out["phone"] = self.phone
+        return out
 
 
 def _attr(obj: object, *names: str, default: Any = None) -> Any:
@@ -257,7 +393,21 @@ def is_slide(shot: object) -> bool:
     return _kind_of(shot) == "Slide" or (hasattr(shot, "html_fn") and not hasattr(shot, "path"))
 
 
+def is_phone(shot: object) -> bool:
+    """``Phone(path="/lens", state="scan"|"card"|"picker"|"unknown", scroll=0)``."""
+    return _kind_of(shot) == "Phone" or (
+        hasattr(shot, "state") and hasattr(shot, "path") and not hasattr(shot, "scene_png")
+    )
+
+
+def is_phone_pair(shot: object) -> bool:
+    """``PhonePair(scene_png=..., phone_state=...)`` — the illustrated scene plus a phone."""
+    return _kind_of(shot) == "PhonePair" or hasattr(shot, "phone_state") or hasattr(shot, "scene_png")
+
+
 def is_page(shot: object) -> bool:
+    if is_phone(shot) or is_phone_pair(shot):
+        return False
     return _kind_of(shot) == "Page" or hasattr(shot, "path") or hasattr(shot, "url")
 
 
@@ -291,6 +441,40 @@ def page_scroll(shot: object) -> int:
     return int(_attr(shot, "scroll", "scroll_y", "y", default=0) or 0)
 
 
+def phone_path(shot: object) -> str:
+    path = str(_attr(shot, "path", "url", "route", default="/lens") or "/lens")
+    return path if path.startswith("/") else "/" + path
+
+
+def phone_state(shot: object, scene_id: str) -> str:
+    """The screen a phone shot wants, normalised and checked against :data:`phone.STATES`."""
+    state = str(_attr(shot, "state", "phone_state", "screen", default="") or "").strip().lower()
+    if not state:
+        raise CaptureError(f"{scene_id}: phone shot {shot!r} declares no state")
+    if state not in _phone().STATES:
+        raise CaptureError(
+            f"{scene_id}: unknown phone state {state!r}; expected one of "
+            f"{', '.join(_phone().STATES)}"
+        )
+    return state
+
+
+def pair_scene_png(shot: object) -> str:
+    """The illustrated still ``scene_render.py`` drew, as declared by a ``PhonePair``."""
+    return str(_attr(shot, "scene_png", "scene", "still", default="") or "")
+
+
+def _phone() -> Any:
+    """``video/phone.py``, imported late so ``--slides-only`` never needs Pillow's phone kit."""
+    try:
+        import phone  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise CaptureError(
+            f"cannot import {HERE / 'phone.py'} - the phone rig must exist before capture ({exc})"
+        ) from exc
+    return phone
+
+
 _XY_RE = re.compile(r"^xy\s*=\s*\(?\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)?$", re.I)
 
 
@@ -313,14 +497,28 @@ def _offscreen(rect: list[float]) -> str:
     return " and ".join(sides)
 
 
+#: Actions that move nothing and point at nothing, so have no selector to resolve.
+_TARGETLESS: Final[frozenset[str]] = frozenset({"Click", "Scroll", "Zoom", "PhoneScroll"})
+
+
 def action_selector(action: object) -> str | None:
-    """The selector string an action points at, exactly as written in the script."""
+    """The selector string an action points at, exactly as written in the script.
+
+    ``Tap`` carries its target in ``xy``, which may be a literal ``(x, y)`` in the phone's
+    390x844 space rather than a string; normalising it to ``"xy=(x, y)"`` here means the
+    compositor reads one spelling out of ``geometry.json`` whatever the script wrote.
+    """
     kind = _kind_of(action)
     if kind == "Move":
         return _attr(action, "to", "target", "sel", "selector")
     if kind == "Highlight":
         return _attr(action, "sel", "selector", "to", "target")
-    return _attr(action, "sel", "selector") if kind not in {"Click", "Scroll", "Zoom"} else None
+    if kind == "Tap":
+        target = _attr(action, "xy", "to", "sel", "selector", "target")
+        if isinstance(target, (tuple, list)) and len(target) == 2:
+            return f"xy=({target[0]}, {target[1]})"
+        return target
+    return _attr(action, "sel", "selector") if kind not in _TARGETLESS else None
 
 
 def action_at(action: object) -> float:
@@ -353,7 +551,131 @@ enabled = false
 
 [notify]
 windows_toast = false
+
+# Lens is off by default in the product (SPEC B10) and has to be turned on deliberately.
+# The video turns it on for the demo database only; `act` stays off, so the phone in the
+# video is strictly read-only.
+[lens]
+{lens}
 """
+
+#: The Lens policy the video is captured under, in one place. ``config.load`` merges the
+#: ``settings`` table *over* config.toml, so writing only the file is not enough: a stale
+#: ``lens.allow_actions`` row left in the seeded database would silently win and put action
+#: buttons on the phone card. Both are written from this dict, so they cannot disagree.
+DEMO_LENS: Final[dict[str, Any]] = {
+    "enabled": True,
+    "require_https": True,
+    "tag_learning": True,
+    "allow_actions": False,
+    "token_ttl_days": 90,
+    "max_tokens": 12,
+}
+
+
+def _toml_value(value: Any) -> str:
+    return "true" if value is True else "false" if value is False else str(value)
+
+
+def apply_lens_settings(data_dir: Path) -> None:
+    """Pin ``lens.*`` in the working copy's settings table to :data:`DEMO_LENS`.
+
+    Also clears any outstanding pairing code the seed left behind: they are single-use and
+    five minutes old, so the only thing a stale one can do is make ``/lens/pair`` render a
+    QR that has already expired.
+    """
+    db_path = data_dir / "homesoc.db"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        conn.execute("DELETE FROM settings WHERE key LIKE 'lens.pairing.%'")
+        for key, value in DEMO_LENS.items():
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+                (f"lens.{key}", _toml_value(value).lower(), now),
+            )
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise CaptureError(f"could not set the demo Lens policy in {db_path}: {exc}") from exc
+    finally:
+        conn.close()
+
+#: The wrapper the demo dashboard is started through. It patches nothing in the installed
+#: product — it rebinds two lookups *in its own process* before the CLI runs, so the
+#: certificate, the pairing URL and every "this machine" string in the dashboard describe
+#: the fictional household instead of the author's PC. See the module docstring.
+SERVE_LAUNCHER_PY: Final[str] = '''\
+"""Generated by video/capture.py. Do not edit; do not ship. One capture's lifetime.
+
+Starts the demo dashboard with a fictional machine identity so no frame of the video can
+show the author's real hostname or LAN address (CONTRACT_V2 V5). The socket still binds
+loopback only — the recorded bind address is the one the documented invocation
+(`serve --tls --host 0.0.0.0 --port 8443`) produces, which is what /lens/pair is for.
+"""
+import sys
+
+sys.path.insert(0, {project!r})
+
+from homesoc import util
+
+util.local_hostname = lambda: {hostname!r}
+util.default_interface_ip = lambda: {lan_ip!r}
+
+from homesoc import cli
+
+_record = cli.record_bind_state
+cli.record_bind_state = lambda conn, host, port: _record(conn, {lan_ip!r}, {lan_port!r})
+
+sys.exit(cli.main(sys.argv[1:]))
+'''
+
+
+def write_serve_launcher() -> Path:
+    SERVE_LAUNCHER.parent.mkdir(parents=True, exist_ok=True)
+    SERVE_LAUNCHER.write_text(
+        SERVE_LAUNCHER_PY.format(
+            project=str(PROJECT_ROOT), hostname=DEMO_HOSTNAME,
+            lan_ip=DEMO_LAN_IP, lan_port=DEMO_LAN_PORT,
+        ),
+        encoding="utf-8",
+    )
+    return SERVE_LAUNCHER
+
+
+def mint_lens_token(data_dir: Path, *, label: str = LENS_TOKEN_LABEL) -> str:
+    """Pair this capture's phone with the demo database and return the secret.
+
+    ``lens_tokens`` stores only a SHA-256, so the plaintext exists exactly once, at mint
+    time — the seed cannot hand one over. This is the same code path ``/api/lens/claim``
+    runs; it just skips the pairing code, which no browser is here to scan.
+    """
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    previous = os.environ.get("HOMESOC_DATA")
+    os.environ["HOMESOC_DATA"] = str(data_dir)
+    try:
+        from homesoc import db  # imported late: the product is a read-only dependency here
+
+        conn = db.connect()
+        try:
+            row = db.lens_mint_token(conn, label=label, scopes="read", ttl_days=90, max_tokens=64)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - without a token /lens renders "not paired"
+        raise CaptureError(
+            f"could not mint a Lens token in {data_dir}: {type(exc).__name__}: {exc}"
+        ) from exc
+    finally:
+        if previous is None:
+            os.environ.pop("HOMESOC_DATA", None)
+        else:
+            os.environ["HOMESOC_DATA"] = previous
+    token = str(row.get("token") or "")
+    if not token:
+        raise CaptureError("lens_mint_token returned no token")
+    logger.info("paired a demo phone (%s) with the working copy", label)
+    return token
 
 
 def make_working_copy(source: Path) -> Path:
@@ -376,6 +698,11 @@ def make_working_copy(source: Path) -> Path:
     # write-ahead log, and copying the .db alone would silently lose them.
     shutil.copytree(source, dest, dirs_exist_ok=True)
     _checkpoint(dest / "homesoc.db")
+    # Any certificate already in demo_data was minted against whatever machine made it, so
+    # its subject and SANs carry that machine's real name. Drop it: the launcher's
+    # fictional identity regenerates a clean one on the first --tls start.
+    shutil.rmtree(dest / "tls", ignore_errors=True)
+    apply_lens_settings(dest)
     logger.info("serving a working copy of %s from %s", source, dest)
     return dest
 
@@ -403,6 +730,7 @@ class Dashboard:
 
     data_dir: Path
     port: int = PORT
+    tls: bool = True
     proc: subprocess.Popen[bytes] | None = None
     _log: Any = None
 
@@ -415,7 +743,10 @@ class Dashboard:
 
     def _write_config(self) -> Path:
         DEMO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        DEMO_CONFIG.write_text(DEMO_CONFIG_TOML.format(port=self.port), encoding="utf-8")
+        lens = "\n".join(f"{key} = {_toml_value(value)}" for key, value in DEMO_LENS.items())
+        DEMO_CONFIG.write_text(
+            DEMO_CONFIG_TOML.format(port=self.port, lens=lens), encoding="utf-8"
+        )
         return DEMO_CONFIG
 
     def start(self) -> None:
@@ -429,11 +760,13 @@ class Dashboard:
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         cmd = [
-            sys.executable, "-m", "homesoc",
+            sys.executable, str(write_serve_launcher()),
             "--data", str(self.data_dir),
             "--config", str(config),
             "serve", "--host", "127.0.0.1", "--port", str(self.port),
         ]
+        if self.tls:
+            cmd.append("--tls")
         DASHBOARD_LOG.parent.mkdir(parents=True, exist_ok=True)
         self._log = DASHBOARD_LOG.open("wb")
         logger.info("starting dashboard: %s", " ".join(cmd))
@@ -453,7 +786,7 @@ class Dashboard:
                     f"Its output is in {DASHBOARD_LOG}:\n{self._tail_log()}"
                 )
             try:
-                with urllib.request.urlopen(f"{BASE_URL}/", timeout=3) as resp:
+                with urllib.request.urlopen(f"{BASE_URL}/", timeout=3, context=_TLS_CTX) as resp:
                     if resp.status == 200:
                         logger.info("dashboard ready on %s", BASE_URL)
                         return
@@ -499,6 +832,418 @@ class Dashboard:
             with suppress(OSError):
                 self._log.close()
             self._log = None
+
+
+# --------------------------------------------------------------------------- the scan rig
+
+
+@dataclass(frozen=True)
+class DemoCamera:
+    """The device the Lens act is about, and the sticker token stuck to it."""
+
+    device_id: int
+    ip: str
+    name: str
+    code: str
+
+
+def demo_camera(data_dir: Path) -> DemoCamera:
+    """Find the camera and its sticker token in the working copy, rather than hard-coding.
+
+    ``seed_demo.py`` mints the sticker tokens, ``scene_render.py`` draws one of them into
+    the scene, and this is the one place that has to agree with both. The camera is
+    identified the way the script identifies it — the device at ``CAMERA_IP`` — falling
+    back to "whatever has Telnet open", which is the only device in the seed that does.
+    """
+    wanted_ip = ""
+    with suppress(Exception):
+        import script  # type: ignore[import-not-found]
+
+        wanted_ip = str(getattr(script, "CAMERA_IP", "") or "")
+
+    db_path = data_dir / "homesoc.db"
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error as exc:
+        raise CaptureError(f"cannot read {db_path}: {exc}") from exc
+    conn.row_factory = sqlite3.Row
+    try:
+        row = None
+        if wanted_ip:
+            row = conn.execute("SELECT * FROM devices WHERE ip = ?", (wanted_ip,)).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT d.* FROM devices d JOIN services s ON s.device_id = d.id "
+                "WHERE s.port = 23 ORDER BY d.id LIMIT 1"
+            ).fetchone()
+        if row is None:
+            raise CaptureError(
+                "no camera to point Lens at: the seeded database has no device at "
+                f"{wanted_ip or '(script.CAMERA_IP unset)'} and none with Telnet open."
+            )
+        tag = conn.execute(
+            "SELECT code FROM lens_tags WHERE device_id = ? AND kind = 'sticker' "
+            "ORDER BY id LIMIT 1", (row["id"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    if tag is None:
+        raise CaptureError(
+            f"device {row['id']} ({row['ip']}) has no sticker tag in lens_tags. "
+            "video/seed_demo.py must mint one (CONTRACT_V2 V4) before the Lens act can be "
+            "captured — the scene render encodes exactly that token."
+        )
+    name = str(row["nickname"] or row["hostname"] or row["ip"] or "")
+    return DemoCamera(int(row["id"]), str(row["ip"] or ""), name, str(tag["code"]))
+
+
+def _free_port(preferred: int) -> int:
+    with closing(socket.socket()) as sock:
+        try:
+            sock.bind(("127.0.0.1", preferred))
+            return preferred
+        except OSError:
+            pass
+    with closing(socket.socket()) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def qr_png(payload: str, *, module_px: int = 8, quiet: int = 4) -> bytes:
+    """A PNG of ``payload`` as a QR code, drawn with the product's own encoder.
+
+    Used only to prove the decode sidecar works before scene 18 depends on it: if this
+    round-trips, the sidecar really is reading pixels.
+    """
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from io import BytesIO
+
+    from PIL import Image
+
+    from homesoc.web import qr as qrmod
+
+    matrix = [list(row) for row in qrmod.to_matrix(payload)]
+    size = len(matrix)
+    side = (size + quiet * 2) * module_px
+    img = Image.new("L", (side, side), 255)
+    pixels = img.load()
+    for y, row in enumerate(matrix):
+        for x, cell in enumerate(row):
+            if not cell:
+                continue
+            for dy in range(module_px):
+                for dx in range(module_px):
+                    pixels[(x + quiet) * module_px + dx, (y + quiet) * module_px + dy] = 0
+    buffer = BytesIO()
+    img.convert("RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+#: Where a loopback decoder might listen. The sidecar is another package's file, so its
+#: exact route is discovered rather than assumed — and then proved with a known QR.
+_SIDECAR_ROUTES: Final[tuple[str, ...]] = ("/decode", "/", "/api/decode", "/decode.json", "/barcode")
+
+
+@dataclass
+class DecodeSidecar:
+    """``video/decode_sidecar.py``: a loopback zxing-cpp decoder, owned and always stopped.
+
+    zxing-cpp is a capture-time tool. It is imported by the sidecar, never by the product,
+    and must not appear in ``requirements.txt`` or ``pyproject.toml`` (CONTRACT_V2 V3.3).
+    """
+
+    script: Path = SIDECAR_SCRIPT
+    port: int = SIDECAR_PORT
+    proc: subprocess.Popen[bytes] | None = None
+    route: str = ""
+    _log: Any = None
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}{self.route}"
+
+    def __enter__(self) -> DecodeSidecar:
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def start(self) -> None:
+        # Absolute, because the sidecar is started with cwd=video/: a relative path would be
+        # resolved against that and land on video/video/decode_sidecar.py.
+        self.script = Path(self.script).expanduser().resolve()
+        if not self.script.is_file():
+            raise CaptureError(
+                f"{self.script} does not exist. Scene 18 decodes the scene's real pixels with "
+                "zxing-cpp in a loopback sidecar (CONTRACT_V2 V3.3); without it there is no "
+                "honest way to produce the scan, and faking it is not an option."
+            )
+        self.port = _free_port(self.port)
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        SIDECAR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        self._log = SIDECAR_LOG.open("wb")
+        attempts = (
+            [sys.executable, str(self.script), "--host", "127.0.0.1", "--port", str(self.port)],
+            [sys.executable, str(self.script), "--port", str(self.port)],
+            [sys.executable, str(self.script), str(self.port)],
+        )
+        errors: list[str] = []
+        for cmd in attempts:
+            logger.info("starting decode sidecar: %s", " ".join(cmd))
+            self.proc = subprocess.Popen(
+                cmd, cwd=str(HERE), env=env,
+                stdout=self._log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            )
+            try:
+                self._discover()
+                return
+            except CaptureError as exc:
+                errors.append(f"{' '.join(cmd[1:])}: {exc}")
+                self._kill()
+        raise CaptureError(
+            "the decode sidecar never answered with a usable decode.\n  "
+            + "\n  ".join(errors)
+            + f"\nIts output is in {SIDECAR_LOG}:\n{self._tail()}"
+        )
+
+    def _discover(self) -> None:
+        """Find the route that decodes a known QR. Readiness and protocol in one check."""
+        probe = "hs1:" + "capture-selftest-0001"
+        payload = _data_url(qr_png(probe))
+        deadline = time.monotonic() + 25.0
+        last = "no response"
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise CaptureError(f"it exited with code {self.proc.returncode}")
+            for route in _SIDECAR_ROUTES:
+                self.route = route
+                try:
+                    values = [h.get("rawValue") for h in self._post(payload)]
+                except Exception as exc:  # noqa: BLE001 - wrong route, not yet up, wrong shape
+                    last = f"{route}: {type(exc).__name__}: {exc}"
+                    continue
+                if probe in values:
+                    logger.info("decode sidecar ready on %s (self-test decoded %r)", self.url, probe)
+                    return
+                last = f"{route}: decoded {values!r}, expected {probe!r}"
+            time.sleep(0.4)
+        raise CaptureError(last)
+
+    def _post(self, data_url: str) -> list[dict[str, Any]]:
+        # Several key spellings in one body, because the sidecar is another package's file
+        # and this must work against whichever one it reads.
+        body = json.dumps({
+            "image": data_url, "data_url": data_url, "dataUrl": data_url,
+            "png": data_url, "frame": data_url,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{self.route}", data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read()
+        return _normalise_decode(json.loads(raw.decode("utf-8")))
+
+    def decode(self, data_url: str) -> dict[str, Any]:
+        """The callback the ``BarcodeDetector`` shim reaches through a Playwright binding."""
+        try:
+            return {"results": self._post(data_url)}
+        except Exception as exc:  # noqa: BLE001 - reported through the shim's error bus
+            logger.warning("sidecar decode failed: %s: %s", type(exc).__name__, exc)
+            return {"results": [], "error": f"{type(exc).__name__}: {exc}"}
+
+    def _tail(self, lines: int = 20) -> str:
+        with suppress(OSError):
+            if self._log is not None:
+                self._log.flush()
+            text = SIDECAR_LOG.read_text(encoding="utf-8", errors="replace")
+            return "\n".join(text.splitlines()[-lines:])
+        return "(no log)"
+
+    def _kill(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.poll() is None:
+            with suppress(OSError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with suppress(OSError):
+                    proc.kill()
+
+    def stop(self) -> None:
+        self._kill()
+        if self._log is not None:
+            with suppress(OSError):
+                self._log.close()
+            self._log = None
+
+
+def _data_url(png: bytes) -> str:
+    import base64
+
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _normalise_decode(payload: Any) -> list[dict[str, Any]]:
+    """Whatever the sidecar answers -> ``[{rawValue, format, boundingBox}, ...]``."""
+    if isinstance(payload, dict):
+        for key in ("results", "barcodes", "codes", "decodes", "hits"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+        else:
+            single = payload.get("rawValue") or payload.get("raw_value") or payload.get("text")
+            payload = [payload] if single else []
+    if not isinstance(payload, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in payload:
+        if isinstance(item, str):
+            value, box, fmt = item, {}, "qr_code"
+        elif isinstance(item, dict):
+            value = str(
+                item.get("rawValue") or item.get("raw_value") or item.get("text")
+                or item.get("value") or ""
+            )
+            raw_box = item.get("boundingBox") or item.get("bounding_box") or item.get("box") or {}
+            box = raw_box if isinstance(raw_box, dict) else {}
+            fmt = re.sub(r"[\s-]+", "_", str(item.get("format") or item.get("type") or "qr_code").lower())
+        else:
+            continue
+        if not value:
+            continue
+        out.append({
+            "rawValue": value,
+            "format": fmt or "qr_code",
+            "boundingBox": {
+                "x": float(box.get("x", 0) or 0), "y": float(box.get("y", 0) or 0),
+                "width": float(box.get("width", box.get("w", 0)) or 0),
+                "height": float(box.get("height", box.get("h", 0)) or 0),
+            },
+        })
+    return out
+
+
+@dataclass(frozen=True)
+class SceneAssets:
+    """What ``video/scene_render.py`` produced: the still, and the drifting camera clip."""
+
+    y4m: Path | None
+    png: Path | None
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.y4m and self.y4m.is_file())
+
+
+#: Module attributes ``scene_render.py`` might expose. Tried in order; the first that
+#: yields an existing .y4m wins. It is another package's file, so this asks rather than
+#: assumes — and says exactly what it looked for when it finds nothing.
+_SCENE_BUILDERS: Final[tuple[str, ...]] = ("ensure_assets", "ensure", "build", "render", "main")
+_SCENE_Y4M_ATTRS: Final[tuple[str, ...]] = ("Y4M_PATH", "SCENE_Y4M", "CLIP_PATH", "Y4M", "CLIP")
+_SCENE_PNG_ATTRS: Final[tuple[str, ...]] = ("PNG_PATH", "SCENE_PNG", "STILL_PATH", "PNG", "STILL")
+
+
+def scene_assets(*, y4m: Path | None = None, png: Path | None = None) -> SceneAssets:
+    """The fake-camera clip and the illustrated still, built if they are not there yet."""
+    if y4m is not None or png is not None:
+        return SceneAssets(y4m if y4m and y4m.is_file() else None,
+                           png if png and png.is_file() else None)
+
+    found_y4m: Path | None = None
+    found_png: Path | None = None
+    if SCENE_RENDER_SCRIPT.is_file():
+        module: Any = None
+        with suppress(Exception):
+            import scene_render  # type: ignore[import-not-found]
+
+            module = scene_render
+        if module is not None:
+            result: Any = None
+            for name in _SCENE_BUILDERS:
+                fn = getattr(module, name, None)
+                if callable(fn):
+                    with suppress(Exception):
+                        result = fn()
+                        break
+            if isinstance(result, dict):
+                found_y4m = _as_path(result.get("y4m") or result.get("clip"))
+                found_png = _as_path(result.get("png") or result.get("still"))
+            elif isinstance(result, (str, Path)) and str(result).endswith(".y4m"):
+                found_y4m = _as_path(result)
+            found_y4m = found_y4m or _first_attr(module, _SCENE_Y4M_ATTRS)
+            found_png = found_png or _first_attr(module, _SCENE_PNG_ATTRS)
+        else:
+            with suppress(Exception):
+                subprocess.run([sys.executable, str(SCENE_RENDER_SCRIPT)], cwd=str(HERE),
+                               check=False, timeout=180)
+
+    if found_y4m is None:
+        found_y4m = next(iter(sorted(BUILD.rglob("*.y4m"))), None)
+    if found_png is None:
+        found_png = next(iter(sorted(BUILD.rglob("scene*.png"))), None)
+    return SceneAssets(found_y4m if found_y4m and found_y4m.is_file() else None,
+                       found_png if found_png and found_png.is_file() else None)
+
+
+def resolve_scene_png(name: str, assets: SceneAssets) -> Path | None:
+    """Turn a ``PhonePair``'s ``scene_png`` *name* into the file on disk.
+
+    ``script.py`` names the illustration ("shelf", one of ``SCENE_RENDERS``);
+    ``scene_render.py`` decides what to call the file. ``compose.py`` needs the path, so
+    the translation happens here — the one place that has both.
+    """
+    name = str(name or "").strip()
+    if name:
+        direct = _as_path(name)
+        if direct is not None:
+            return direct
+        module: Any = None
+        with suppress(Exception):
+            import scene_render  # type: ignore[import-not-found]
+
+            module = scene_render
+        if module is not None:
+            for attr in ("scene_png_for", "png_for", "still_for"):
+                fn = getattr(module, attr, None)
+                if callable(fn):
+                    with suppress(Exception):
+                        found = _as_path(fn(name))
+                        if found is not None:
+                            return found
+            registry = getattr(module, "SCENE_RENDERS", None) or getattr(module, "RENDERS", None)
+            if isinstance(registry, dict) and name in registry:
+                found = _as_path(registry[name])
+                if found is not None:
+                    return found
+        for candidate in (f"scene_{name}.png", f"{name}.png", f"scene_camera_{name}.png"):
+            found = _as_path(BUILD / candidate)
+            if found is not None:
+                return found
+    # One illustration, many names for it: with a single render, the name is decoration.
+    return assets.png
+
+
+def _as_path(value: Any) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = (HERE / path).resolve()
+    return path if path.is_file() else None
+
+
+def _first_attr(module: Any, names: tuple[str, ...]) -> Path | None:
+    for name in names:
+        path = _as_path(getattr(module, name, None))
+        if path is not None:
+            return path
+    return None
 
 
 # --------------------------------------------------------------------------- browser
@@ -715,11 +1460,22 @@ def load_scenes() -> list[Any]:
 
 @dataclass(frozen=True)
 class Target:
-    """What is on screen for one state: a slide, or a dashboard page at a scroll offset."""
+    """What is on screen for one state.
 
-    kind: str  # "slide" | "page"
+    ``kind`` is ``"slide"`` (a slide name in ``ref``), ``"page"`` (a dashboard path at a
+    scroll offset), ``"phone"`` (``/lens`` showing ``state``) or ``"phone_pair"`` (the same
+    phone beside the illustrated still named by ``scene``).
+    """
+
+    kind: str
     ref: str  # slide name, or url path
     scroll: int = 0
+    state: str = ""     # phone screen: scan | card | picker | unknown
+    scene: str = ""     # phone_pair: the illustrated still from scene_render.py
+
+    @property
+    def is_phone(self) -> bool:
+        return self.kind in ("phone", "phone_pair")
 
 
 @dataclass
@@ -739,6 +1495,21 @@ MERGE_WINDOW: Final[float] = 0.10
 def _target_of(shot: object, scene_id: str, *, current_path: str | None) -> Target:
     if is_slide(shot):
         return Target("slide", slide_name(shot, scene_id))
+    if is_phone_pair(shot):
+        inner = _attr(shot, "phone", "phone_shot")
+        state = (
+            phone_state(inner, scene_id) if inner is not None
+            else str(_attr(shot, "phone_state", "state", default="scan") or "scan").lower()
+        )
+        return Target(
+            "phone_pair",
+            phone_path(inner if inner is not None else shot),
+            int(_attr(shot, "scroll", default=0) or 0),
+            state,
+            pair_scene_png(shot),
+        )
+    if is_phone(shot):
+        return Target("phone", phone_path(shot), page_scroll(shot), phone_state(shot, scene_id))
     if is_sequence(shot):
         items = sequence_items(shot)
         if not items:
@@ -787,14 +1558,17 @@ def plan_states(scene: Any) -> list[Planned]:
 
     for action in sorted(getattr(scene, "actions", None) or [], key=action_at):
         kind = _kind_of(action)
-        if kind == "Click":
+        if kind in ("Click", "Tap"):
+            # A Tap with a `then_shot` is the phone's Click: a real press that changes the
+            # screen (scene 19 opens the card's Vulnerabilities section with one).
             then_shot = _attr(action, "then_shot", "then", "after")
             if then_shot is None:
                 continue
-            declared.append((action_at(action), then_shot, "click"))
-        elif kind == "Scroll":
+            declared.append((action_at(action), then_shot, kind.lower()))
+        elif kind in ("Scroll", "PhoneScroll"):
             to_y = int(_attr(action, "to_y", "y", "scroll", default=0) or 0)
-            declared.append((action_at(action), _ScrollTo(to_y), "scroll"))
+            declared.append((action_at(action), _ScrollTo(to_y),
+                             "scroll" if kind == "Scroll" else "phone-scroll"))
 
     declared.sort(key=lambda entry: entry[0])
 
@@ -803,24 +1577,336 @@ def plan_states(scene: Any) -> list[Planned]:
     current = first
     for frac, payload, produced_by in declared:
         if isinstance(payload, _ScrollTo):
-            if current.kind != "page":
+            if current.kind == "slide":
                 raise CaptureError(
                     f"{scene_id}: Scroll at {frac:.2f} has no page on screen to scroll "
                     f"(the shot at that point is the slide {current.ref!r})"
                 )
-            target = Target("page", current.ref, payload.to_y)
+            target = Target(current.kind, current.ref, payload.to_y, current.state, current.scene)
         else:
             target = _target_of(payload, scene_id, current_path=current.ref)
         previous = plan[-1]
         if target == previous.target and frac - previous.at <= MERGE_WINDOW:
             previous.produced_by = f"{previous.produced_by}+{produced_by}"
+            if produced_by in ("click", "tap"):
+                # Not two declarations of one state: a press changes the screen. Both
+                # planners (here and compose.plan_transitions) still merge them, so the
+                # scene gets one image — and it is the *after* image, because `then_shot`
+                # says explicitly what has to be on screen. The press is therefore visible
+                # before the finger arrives, which is a script timing bug, not a capture one.
+                logger.warning(
+                    "%s: the %s at %.3f produces a state indistinguishable from the one at "
+                    "%.3f, so they merge into a single shot and the change appears early. "
+                    "Move its `at` more than %.2f after that state (or the state earlier).",
+                    scene_id, produced_by, frac, previous.at, MERGE_WINDOW,
+                )
             continue
         plan.append(Planned(frac, target, produced_by))
         current = target
     return plan
 
 
-def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any]) -> SceneResult:
+@dataclass
+class PhoneRig:
+    """Everything a phone shot needs: a paired token, a camera to point at, a decoder."""
+
+    token: str
+    camera: DemoCamera
+    data_dir: Path
+    assets: SceneAssets
+    sidecar: DecodeSidecar | None = None
+    clock: datetime | None = None
+    #: The driver ``capture()`` is already inside — the sync API cannot be nested, so the
+    #: phone's own Chrome (it needs different launch flags) is started from this one.
+    playwright: Any = None
+    headed: bool = False
+
+    @property
+    def decoding(self) -> bool:
+        return self.sidecar is not None
+
+    def launch_args(self) -> list[str]:
+        """Chrome's fake camera, pointed at the clip ``scene_render.py`` drew."""
+        if self.assets.usable:
+            return [f"--use-file-for-fake-video-capture={self.assets.y4m}"]
+        return []
+
+    def decode(self) -> Callable[[str], Any] | None:
+        return self.sidecar.decode if self.sidecar is not None else None
+
+
+def scene_wants_scan(scene: Any, plan: list[Planned]) -> bool:
+    """Does this scene's narration call the identification a scan?
+
+    Three ways to say so, any of which arms the rig and makes a failed decode fatal: the
+    scene is one of :data:`SCAN_SCENES`, it uses a ``PhonePair`` (which exists only for
+    scene 18), or one of its phone shots asks for ``via="scan"`` explicitly.
+    """
+    scene_id = str(getattr(scene, "id", "") or "")
+    if scene_id in SCAN_SCENES:
+        return True
+    if any(p.target.kind == "phone_pair" for p in plan):
+        return True
+    for shot in _all_shots(scene):
+        if (is_phone(shot) or is_phone_pair(shot)) and str(_attr(shot, "via", default="")) == "scan":
+            return True
+    return False
+
+
+def _forget_tag(db_path: Path, code: str) -> Callable[[], None]:
+    """Temporarily un-learn a sticker, and hand back the undo.
+
+    This is how the "new code — which device is this?" sheet is produced honestly: the
+    phone decodes the *same real sticker* off the *same real pixels*, but Home SOC has not
+    been told about it yet, so ``/api/lens/identify`` genuinely answers "unknown" with a
+    genuinely ranked picker. It is the first scan of a new sticker, which is exactly what
+    the screen is for.
+    """
+    conn = sqlite3.connect(db_path, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM lens_tags WHERE code = ?", (code,)).fetchone()
+        if row is None:
+            conn.close()
+            return lambda: None
+        saved = dict(row)
+        conn.execute("DELETE FROM lens_tags WHERE code = ?", (code,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    def restore() -> None:
+        back = sqlite3.connect(db_path, timeout=15)
+        try:
+            columns = ", ".join(saved)
+            marks = ", ".join("?" for _ in saved)
+            back.execute(
+                f"INSERT OR REPLACE INTO lens_tags({columns}) VALUES ({marks})",
+                tuple(saved.values()),
+            )
+            back.commit()
+        finally:
+            back.close()
+
+    return restore
+
+
+def _phone_shots(scene: Any, plan: list[Planned], rig: PhoneRig) -> list[dict[str, Any]]:
+    """Turn the phone states of one scene into :func:`phone.capture_phone` shot dicts.
+
+    Selectors are assigned to the state that is on screen when their action fires — the
+    same rule the desktop path uses, and the reason a ``Tap`` on the card's Problems
+    section is measured on the card rather than on the viewfinder behind it.
+    """
+    scene_id = str(getattr(scene, "id", "") or "scene")
+    wants_scan = scene_wants_scan(scene, plan)
+    members = sequence_items(scene.shot) if is_sequence(scene.shot) else [scene.shot]
+
+    shots: list[dict[str, Any]] = []
+    member_at = 0
+    for index, planned in enumerate(plan):
+        # Walk the PageSequence in step with the plan: a member takes over when the plan
+        # says "sequence"; a scroll or a click stays on the member already on screen.
+        if index and "sequence" in planned.produced_by:
+            member_at = min(member_at + 1, len(members) - 1)
+        target = planned.target
+        if not target.is_phone:
+            continue
+        # The script's own shot object, when it is the one this state came from, so per-shot
+        # overrides (via=, code=, device=, mode=, hold=) work without script.py needing them.
+        declared = members[member_at] if member_at < len(members) else None
+        if declared is None or not (is_phone(declared) or is_phone_pair(declared)):
+            declared = None
+        elif _target_of(declared, scene_id, current_path=None).state != target.state:
+            declared = None
+
+        state = target.state
+        if state in ("card", "unknown"):
+            via = str(_attr(declared, "via", default="") or "").lower()
+            if not via:
+                via = "scan" if (wants_scan and rig.decoding) else "pick"
+            if state == "unknown":
+                via = "scan"   # the sheet only exists after a decode; there is no other way
+        else:
+            via = ""           # scan and picker are reached by tapping, not by identifying
+
+        shot: dict[str, Any] = {
+            "id": f"{scene_id}_{index}",
+            "path": target.ref,
+            "state": state,
+            "scroll": target.scroll,
+            "via": via,
+            "mode": str(_attr(declared, "mode", default="pick") or "pick"),
+            "hold": bool(_attr(declared, "hold", default=True)),
+            "device": str(_attr(declared, "device", default=rig.camera.ip) or rig.camera.ip),
+            "selectors": [],
+            "taps": [],
+        }
+        # Where in the illustration the phone is pointed, if the script says. compose.py
+        # draws the view cone from it; it is carried through untouched.
+        aim = _attr(declared, "aim")
+        if isinstance(aim, (tuple, list)) and len(aim) == 2:
+            shot["aim"] = [float(aim[0]), float(aim[1])]
+        # A burst state: several screenshots of the same screen, so the viewfinder's
+        # handheld drift survives into the film instead of being frozen by one PNG.
+        burst = int(_attr(declared, "burst", default=0) or 0)
+        if burst > 1:
+            shot["burst"] = {
+                "frames": burst,
+                "interval_ms": int(_attr(declared, "burst_ms", default=66) or 66),
+            }
+        # The moment of recognition: a `scan` screen photographed while its own lookup is in
+        # flight, so the green reticle the narration names is actually on screen.
+        if bool(_attr(declared, "hit", default=False)):
+            shot["hit"] = True
+            shot["hit_ms"] = int(_attr(declared, "hit_ms", default=2600) or 2600)
+            shot["hold"] = False
+        if via == "scan" or shot.get("hit"):
+            shot["code"] = str(_attr(declared, "code", default=rig.camera.code) or rig.camera.code)
+        if state == "unknown":
+            # Forget the sticker for the length of this one screenshot, then put it back.
+            holder: dict[str, Callable[[], None]] = {}
+            code = shot["code"]
+            db_path = rig.data_dir / "homesoc.db"
+            shot["before"] = lambda holder=holder, code=code, db_path=db_path: holder.__setitem__(
+                "undo", _forget_tag(db_path, code)
+            )
+            shot["after"] = lambda holder=holder: holder.pop("undo", lambda: None)()
+            shot["note"] = "the sticker is un-learned for this shot, so the decode is a first sight"
+        shots.append(shot)
+
+    by_index = {int(str(s["id"]).rsplit("_", 1)[1]): s for s in shots}
+
+    # A Tap with a `then_shot` is performed for real, on the shot its press produces: either
+    # the state the plan gave it, or — when the two were close enough to merge — the state
+    # it was merged into. Pressing before that screenshot is what makes the after-state real
+    # (scene 19's Vulnerabilities section is a <details> the finger opens).
+    for action in sorted(getattr(scene, "actions", None) or [], key=action_at):
+        if _kind_of(action) != "Tap" or _attr(action, "then_shot", "then", "after") is None:
+            continue
+        target = action_selector(action)
+        if not target:
+            continue
+        produced = _state_index_at(plan, action_at(action), prefer="tap")
+        shot = by_index.get(produced)
+        if shot is not None and str(target) not in shot["taps"]:
+            shot["taps"].append(str(target))
+
+    # Every action's target belongs to the newest state at or before it, so a selector that
+    # only exists once a press has opened something is measured on the opened screen.
+    for action in sorted(getattr(scene, "actions", None) or [], key=action_at):
+        selector = action_selector(action)
+        if not selector:
+            continue
+        shot = by_index.get(_state_index_at(plan, action_at(action)))
+        if shot is not None and str(selector) not in shot["selectors"]:
+            shot["selectors"].append(str(selector))
+    return shots
+
+
+def _state_index_at(plan: list[Planned], at: float, *, prefer: str = "") -> int | None:
+    """Which planned state is on screen at ``at``.
+
+    ``prefer`` names a producer ("tap") whose own state should win when it sits within a
+    hair of ``at`` — a press's ``then_shot`` is declared at the press's own moment, and
+    floating point should not decide whether it lands on its own state or the previous one.
+    """
+    current: int | None = None
+    for index, planned in enumerate(plan):
+        if planned.at > at + 1e-9:
+            break
+        if prefer and prefer in planned.produced_by and abs(planned.at - at) < 1e-9:
+            return index
+        current = index
+    return current
+
+
+def _capture_phone_scene(scene: Any, plan: list[Planned], rig: PhoneRig,
+                         result: SceneResult) -> dict[int, dict[str, Any]]:
+    """Capture every phone state of one scene in a single mobile session."""
+    scene_id = str(getattr(scene, "id", "") or "scene")
+    phone = _phone()
+    shots = _phone_shots(scene, plan, rig)
+    if not shots:
+        return {}
+    wants_scan = scene_wants_scan(scene, plan)
+    if wants_scan and not rig.decoding:
+        raise CaptureError(
+            f"{scene_id} narrates a scan, but the decode rig is not running. "
+            "Start video/decode_sidecar.py and render the scene clip with "
+            "video/scene_render.py — capture.py will not quietly fall back to the manual "
+            "picker and let the voice call it a scan."
+        )
+    if wants_scan and not rig.assets.usable:
+        raise CaptureError(
+            f"{scene_id} narrates a scan, but there is no camera clip to scan. "
+            "video/scene_render.py must produce the .y4m that Chrome plays back through "
+            "--use-file-for-fake-video-capture (CONTRACT_V2 V3.2)."
+        )
+
+    try:
+        out = _run_phone(phone, shots, rig)
+    except phone.PhoneError as exc:
+        # One exception type leaves this module, so render.py's caller sees one failure mode.
+        raise CaptureError(f"{scene_id}: {exc}") from exc
+
+    by_index = {i: p for i, p in enumerate(plan)}
+    captured: dict[int, dict[str, Any]] = {}
+    for shot, screen in zip(shots, out["shots"]):
+        index = int(str(shot["id"]).rsplit("_", 1)[1])
+        screen = dict(screen)
+        screen["via"] = shot["via"]
+        screen["expected_code"] = shot.get("code")
+        screen["clip"] = rig.assets.y4m.as_posix() if rig.assets.usable else None
+        if shot.get("taps"):
+            screen["taps"] = list(shot["taps"])
+        target = by_index[index].target
+        if target.kind == "phone_pair":
+            still = resolve_scene_png(target.scene, rig.assets)
+            if still is None:
+                raise CaptureError(
+                    f"{scene_id}: state {index} is a PhonePair naming the illustration "
+                    f"{target.scene!r}, but scene_render.py produced no still to go beside "
+                    "the phone. Run `python video/scene_render.py` and try again."
+                )
+            screen["scene_png"] = still.as_posix()
+        if shot.get("aim") is not None:
+            screen["aim"] = shot["aim"]
+        captured[index] = screen
+    for _shot_id, geometry in (out.get("geometry") or {}).items():
+        result.geometry.update(geometry)
+
+    if wants_scan:
+        decoded = [s.get("decoded") for s in out["shots"] if s.get("decoded")]
+        if rig.camera.code not in decoded:
+            raise CaptureError(
+                f"{scene_id}: the BarcodeDetector shim never returned the camera's sticker "
+                f"token. Expected {rig.camera.code!r}, got {decoded!r}. The scan in this "
+                "scene has to be a real decode of the scene's real pixels — check that "
+                "video/scene_render.py encoded this token and that the sticker is inside "
+                "the frame for long enough."
+            )
+        print(f"  [{scene_id}] scan rig decoded {rig.camera.code} from the camera feed", flush=True)
+    return captured
+
+
+def _run_phone(phone: Any, shots: list[dict[str, Any]], rig: PhoneRig) -> dict[str, Any]:
+    return phone.capture_phone(
+        shots[0].get("path") or "/lens",
+        token=rig.token,
+        shots=shots,
+        out_dir=PHONE_DIR,
+        base_url=BASE_URL,
+        playwright=rig.playwright,
+        headless=not rig.headed,
+        launch_args=rig.launch_args(),
+        decode=rig.decode(),
+        clock=rig.clock,
+    )
+
+
+def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any],
+                  rig: PhoneRig | None = None) -> SceneResult:
     """Capture every state a scene passes through and resolve every selector it names.
 
     States and actions are walked together in ``at`` order, so a selector that only exists
@@ -830,6 +1916,19 @@ def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any]) -> SceneR
     scene_id = str(getattr(scene, "id", "") or "scene")
     result = SceneResult(scene_id=scene_id)
     plan = plan_states(scene)
+
+    # The phone states of a scene are captured together, in one mobile session, before the
+    # desktop walk: a card only exists after the scan that opened it, so they cannot be
+    # produced one at a time out of order.
+    phone_indices = {i for i, p in enumerate(plan) if p.target.is_phone}
+    phone_screens: dict[int, dict[str, Any]] = {}
+    if phone_indices:
+        if rig is None:
+            raise CaptureError(
+                f"{scene_id} has phone shots but no phone rig was prepared "
+                "(no Lens token / no demo camera). This is a capture.py bug."
+            )
+        phone_screens = _capture_phone_scene(scene, plan, rig, result)
 
     # Actions first at equal `at`: a Click must fire before the state it produces lands.
     timeline: list[tuple[float, int, str, Any]] = [
@@ -841,10 +1940,23 @@ def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any]) -> SceneR
 
     index = -1
     cursor: tuple[float, float] | None = None
+    on_phone = False
 
     for _frac, _prio, kind, payload in timeline:
         if kind == "state":
             index += 1
+            on_phone = index in phone_indices
+            if on_phone:
+                state = _phone_state(scene_id, payload, index, phone_screens)
+                result.states.append(state)
+                print(
+                    f"  [{scene_id}] state {state.index} at {payload.at:.2f} "
+                    f"phone:{payload.target.state}"
+                    f"{' @' + str(state.scroll) if state.scroll else ''} "
+                    f"({state.produced_by}) -> {Path(state.png).name if state.png else '?'}",
+                    flush=True,
+                )
+                continue
             state = _realise(cap, scene_id, payload, index, registry)
             state.png = cap.shoot(SHOTS_DIR / state.filename)
             result.states.append(state)
@@ -860,6 +1972,16 @@ def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any]) -> SceneR
         action = payload
         action_kind = _kind_of(action)
         selector = action_selector(action)
+
+        if on_phone:
+            # Resolved against the phone, in the 390x844 space, by the pass above.
+            if selector and str(selector) not in result.geometry and not parse_xy(str(selector)):
+                raise CaptureError(
+                    f"{scene_id}: {action_kind} target {selector!r} was not resolved on any "
+                    "phone state of this scene. Check that its `at` falls inside the state "
+                    "it belongs to."
+                )
+            continue
 
         if selector:
             xy = parse_xy(str(selector))
@@ -912,6 +2034,30 @@ def capture_scene(cap: Capturer, scene: Any, registry: dict[str, Any]) -> SceneR
     return result
 
 
+def _phone_state(scene_id: str, planned: Planned, index: int,
+                 screens: dict[int, dict[str, Any]]) -> State:
+    """Fold one already-captured phone screen back into the scene's state list."""
+    screen = screens.get(index)
+    if screen is None:
+        raise CaptureError(
+            f"{scene_id}: phone state {index} ({planned.target.state}) was planned but not "
+            "captured - the phone session and the state plan disagree."
+        )
+    target = planned.target
+    phone_meta = dict(screen)
+    phone_meta["state"] = target.state
+    if target.kind == "phone_pair":
+        # The illustrated half is scene_render.py's output; only the phone was shot here.
+        # compose.py wants a path it can open, so the script's *name* is resolved to one.
+        phone_meta["scene_name"] = target.scene
+        resolved = screen.get("scene_png")
+        phone_meta["scene_png"] = str(resolved) if resolved else None
+    return State(
+        scene_id, index, target.kind, target.ref, int(screen.get("scroll") or 0),
+        png=Path(str(screen["png"])), produced_by=planned.produced_by, phone=phone_meta,
+    )
+
+
 def _realise(
     cap: Capturer, scene_id: str, planned: Planned, index: int, registry: dict[str, Any]
 ) -> State:
@@ -957,10 +2103,17 @@ def capture(
     slides_only: bool = False,
     no_slides: bool = False,
     headed: bool = False,
+    scenes: list[Any] | None = None,
+    scene_y4m: Path | None = None,
+    scene_png: Path | None = None,
+    sidecar_script: Path = SIDECAR_SCRIPT,
 ) -> tuple[dict[str, SceneResult], dict[str, Path]]:
     from playwright.sync_api import sync_playwright
 
-    scenes = [] if slides_only else load_scenes()
+    if scenes is None:
+        scenes = [] if slides_only else load_scenes()
+    elif slides_only:
+        scenes = []
     if only:
         wanted = {s.strip() for s in only.split(",") if s.strip()}
         known = {str(getattr(s, "id", "")) for s in scenes}
@@ -990,13 +2143,49 @@ def capture(
     results: dict[str, SceneResult] = {}
     slide_pngs: dict[str, Path] = {}
     needs_dashboard = any(not is_slide(sh) for s in scenes for sh in _all_shots(s))
+    phone_scenes = [
+        s for s in scenes
+        if any(is_phone(sh) or is_phone_pair(sh) for sh in _all_shots(s))
+    ]
+    # A decoder is needed when a scene calls it a scan, and whenever the unrecognised-code
+    # sheet is on the list: that screen only exists after a decode.
+    needs_decode = any(
+        scene_wants_scan(s, plan_states(s))
+        or any(p.target.is_phone and p.target.state == "unknown" for p in plan_states(s))
+        for s in phone_scenes
+    )
 
     with ExitStack() as stack:
+        work_data = make_working_copy(data_dir) if needs_dashboard else data_dir
+        rig: PhoneRig | None = None
+        if phone_scenes:
+            assets = scene_assets(y4m=scene_y4m, png=scene_png)
+            sidecar = None
+            if needs_decode:
+                sidecar = stack.enter_context(DecodeSidecar(script=sidecar_script))
+            rig = PhoneRig(
+                token=mint_lens_token(work_data),
+                camera=demo_camera(work_data),
+                data_dir=work_data,
+                assets=assets,
+                sidecar=sidecar,
+                clock=now,
+                headed=headed,
+            )
+            print(
+                f"  phone rig: camera {rig.camera.ip} (device {rig.camera.device_id}), "
+                f"sticker {rig.camera.code}, clip "
+                f"{rig.assets.y4m.name if rig.assets.usable else 'NONE'}, "
+                f"decoder {'on' if rig.decoding else 'off'}",
+                flush=True,
+            )
+
         dashboard = (
-            stack.enter_context(Dashboard(data_dir=make_working_copy(data_dir)))
-            if needs_dashboard else None
+            stack.enter_context(Dashboard(data_dir=work_data)) if needs_dashboard else None
         )
         p = stack.enter_context(sync_playwright())
+        if rig is not None:
+            rig.playwright = p
         browser = None
         try:
             browser = p.chromium.launch(channel="chrome", headless=not headed)
@@ -1005,6 +2194,7 @@ def capture(
                 device_scale_factor=SCALE,
                 color_scheme="dark",
                 reduced_motion="reduce",
+                ignore_https_errors=True,   # the demo certificate is self-signed by design
                 base_url=BASE_URL,
             )
             context.set_default_timeout(NAV_TIMEOUT_MS)
@@ -1020,7 +2210,7 @@ def capture(
             for i, scene in enumerate(scenes, start=1):
                 scene_id = str(getattr(scene, "id", f"scene-{i:02d}"))
                 started = time.monotonic()
-                results[scene_id] = capture_scene(cap, scene, registry)
+                results[scene_id] = capture_scene(cap, scene, registry, rig)
                 print(
                     f"  [{i:02d}/{len(scenes)}] {scene_id:<22} "
                     f"{len(results[scene_id].states)} state(s), "
@@ -1087,10 +2277,19 @@ def _write_outputs(results: dict[str, SceneResult], slide_pngs: dict[str, Path])
         "viewport": [VIEWPORT_W, VIEWPORT_H],
         "device_scale_factor": SCALE,
         "shot_size": [SHOT_W, SHOT_H],
+        "base_url": BASE_URL,
         "slides": {name: path.as_posix() for name, path in sorted(slide_pngs.items())},
         "scenes": {sid: [s.as_json() for s in res.states] for sid, res in results.items()},
         "warnings": {sid: res.warnings for sid, res in results.items() if res.warnings},
     }
+    # The phone half of the geometry: every rect under a phone scene id is in this space,
+    # not the 1600x900 one, and every phone PNG is this size. Optional, because a capture
+    # that never touched a phone should not need video/phone.py to exist.
+    with suppress(CaptureError):
+        phone = _phone()
+        manifest["phone_viewport"] = [phone.PHONE_W, phone.PHONE_H]
+        manifest["phone_device_scale_factor"] = phone.PHONE_SCALE
+        manifest["phone_shot_size"] = [phone.SCREEN_W, phone.SCREEN_H]
     if MANIFEST_PATH.is_file():
         with suppress(Exception):
             existing = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -1118,6 +2317,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-slides", action="store_true", help="skip the slides, capture pages only")
     parser.add_argument("--headed", action="store_true", help="show the browser window")
     parser.add_argument("--data", metavar="DIR", default=str(DEMO_DATA), help="demo data directory")
+    parser.add_argument("--scene-y4m", metavar="FILE",
+                        help="the fake-camera clip for the scan rig (default: from scene_render.py)")
+    parser.add_argument("--scene-png", metavar="FILE",
+                        help="the illustrated still that goes beside the phone in scene 18")
+    parser.add_argument("--sidecar", metavar="FILE", default=str(SIDECAR_SCRIPT),
+                        help="the zxing-cpp decode sidecar to run (capture-time only)")
     parser.add_argument("--verbose", action="store_true", help="debug logging")
     args = parser.parse_args(argv)
 
@@ -1134,8 +2339,16 @@ def main(argv: list[str] | None = None) -> int:
             slides_only=args.slides_only,
             no_slides=args.no_slides,
             headed=args.headed,
+            scene_y4m=Path(args.scene_y4m).expanduser().resolve() if args.scene_y4m else None,
+            scene_png=Path(args.scene_png).expanduser().resolve() if args.scene_png else None,
+            sidecar_script=Path(args.sidecar).expanduser().resolve(),
         )
     except CaptureError as exc:
+        print(f"\ncapture: FAILED\n{exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - phone.PhoneError and anything else, one format
+        if type(exc).__name__ != "PhoneError":
+            raise
         print(f"\ncapture: FAILED\n{exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

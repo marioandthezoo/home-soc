@@ -10,11 +10,19 @@ Pipeline
 1. ``seed_demo.py``  builds ``video/demo_data/homesoc.db`` (never touches ``data/``)
 2. ``narrate.py``    edge-tts -> ``build/audio/*.mp3`` + ``build/timings.json`` + the SRT
 3. ``capture.py``    Playwright -> ``build/shots/*.png`` + ``build/geometry.json``
-                     + ``build/shots_manifest.json``
-4. ``compose.py``    per scene: frames piped to ffmpeg -> ``build/clips/NN-id.mp4``
-5. concat demuxer    the clips, stream-copied into one video track
-6. audio             per-scene silence-padded WAVs, concatenated, muxed as AAC 192k
-7. verify            ffprobe the result and print the summary
+                     + ``build/shots_manifest.json``.  For the Lens act this also drives
+                     the phone context (``phone.py``), the illustrated scene and its
+                     camera clip (``scene_render.py``), and the decode sidecar
+                     (``decode_sidecar.py``) behind the ``BarcodeDetector`` shim.
+4. **scan-rig check** the manifest must record a *real* decode for every scene whose
+                     narration calls the identification a scan (CONTRACT_V2 V3).  This
+                     step fails the render rather than letting a manual pick be narrated
+                     as a scan - and it runs on ``--no-capture`` too, where nothing else
+                     would re-check a reused shot.
+5. ``compose.py``    per scene: frames piped to ffmpeg -> ``build/clips/NN-id.mp4``
+6. concat demuxer    the clips, stream-copied into one video track
+7. audio             per-scene silence-padded WAVs, concatenated, muxed as AAC 192k
+8. verify            ffprobe the result and print the summary
 
 Every scene clip is fingerprinted, so a second run only recomposes what changed.
 Because scenes cross-dissolve into each other, a scene's fingerprint includes the
@@ -58,6 +66,7 @@ OUT_DIR = HERE / "out"
 OUT_MP4 = OUT_DIR / "HomeSOC-walkthrough.mp4"
 OUT_SRT = OUT_DIR / "HomeSOC-walkthrough.srt"
 
+DEMO_DB = HERE / "demo_data" / "homesoc.db"
 TIMINGS = BUILD / "timings.json"
 GEOMETRY = BUILD / "geometry.json"
 MANIFEST = BUILD / "shots_manifest.json"
@@ -65,8 +74,14 @@ TIMELINE = BUILD / "timeline.json"
 
 SEED_TIMEOUT = 900
 NARRATE_TIMEOUT = 1800
-CAPTURE_TIMEOUT = 2400
+#: v2 capture is a longer job than v1: 20 scenes, a second (phone) browser context, the
+#: illustrated scene and its camera clip, and the decode sidecar.
+CAPTURE_TIMEOUT = 3600
 FFMPEG_TIMEOUT = 1800
+
+#: CONTRACT_V2 V1: target length for the finished film.
+TARGET_MIN_SECONDS = 11 * 60
+TARGET_MAX_SECONDS = 14 * 60
 
 AUDIO_RATE = 48000
 AUDIO_CH = 2
@@ -210,22 +225,132 @@ def load_json(path: Path, what: str, required: bool = True) -> dict[str, Any]:
         raise RenderError(f"{what} is not valid JSON ({path}): {exc}") from exc
 
 
+# --------------------------------------------------------------------------
+# the scan rig (CONTRACT_V2 V3) - this gate never degrades, it only fails
+# --------------------------------------------------------------------------
+
+
+def _all_shots(scene: Any) -> list[Any]:
+    """Every shot a scene declares: its own, a sequence's members, and every then_shot."""
+    out: list[Any] = []
+    shot = getattr(scene, "shot", None)
+    if shot is not None:
+        members = list(getattr(shot, "shots", ()) or ()) if hasattr(shot, "shots") else []
+        out.extend(members or [shot])
+    for action in getattr(scene, "actions", None) or []:
+        for name in ("then_shot", "then", "after"):
+            then = getattr(action, name, None)
+            if then is not None:
+                out.append(then)
+                break
+    return out
+
+
+def scene_narrates_a_scan(scene: Any) -> bool:
+    """Mirror of ``capture.scene_wants_scan``, without importing the capture module.
+
+    Any of three things arms the rig: a ``PhonePair`` (which exists only for the scan
+    scene), a phone shot that asks for ``via="scan"``, or a scene id that says so.
+    """
+    if "lens-scan" in str(getattr(scene, "id", "") or ""):
+        return True
+    for shot in _all_shots(scene):
+        if type(shot).__name__ == "PhonePair" or hasattr(shot, "phone_state"):
+            return True
+        if str(getattr(shot, "via", "") or "") == "scan":
+            return True
+    return False
+
+
+def check_scan_rig(script: Any, only: set[str] | None, manifest: dict[str, Any]) -> list[str]:
+    """Prove that every narrated scan was a real decode of the frame on screen.
+
+    ``capture.py`` refuses to record a scan it could not decode.  This is the second
+    half of that promise: on a ``--no-capture`` run, or a run that only recomposed some
+    scenes, nothing else looks at whether the shots on disk came from a decode at all.
+    The manifest's phone metadata carries ``expected_code`` (the sticker token
+    ``scene_render.py`` drew) and ``decoded`` (what the shim handed back through the
+    zxing-cpp sidecar); they have to match.
+
+    Returns the lines to print.  Raises :class:`RenderError` rather than degrading:
+    the narration calls this a scan, so it has to be one.
+    """
+    scenes = [s for s in script.SCENES if scene_narrates_a_scan(s)]
+    if only is not None:
+        scenes = [s for s in scenes if str(s.id) in only]
+    if not scenes:
+        return ["no scene narrates a scan - nothing to check"]
+
+    rows_by_scene = manifest.get("scenes") or {}
+    lines: list[str] = []
+    for scene in scenes:
+        sid = str(scene.id)
+        rows = rows_by_scene.get(sid) or []
+        if not rows:
+            raise RenderError(
+                f"[{sid}] narrates a scan but {MANIFEST.name} has no states for it. "
+                f"Run capture.py for this scene (it drives scene_render.py, the decode "
+                f"sidecar and the BarcodeDetector shim) before composing."
+            )
+        proofs = []
+        for row in rows:
+            meta = row.get("phone") if isinstance(row.get("phone"), dict) else {}
+            expected = str(meta.get("expected_code") or "")
+            decoded = str(meta.get("decoded") or "")
+            if expected or decoded:
+                proofs.append((row.get("index"), expected, decoded, str(meta.get("via") or "")))
+        if not proofs:
+            raise RenderError(
+                f"[{sid}] narrates a scan, but not one of its captured states records a "
+                f"decode. A manual pick must never be narrated as a scan (CONTRACT_V2 V3): "
+                f"re-capture this scene with the decode sidecar running, rather than "
+                f"composing what is on disk."
+            )
+        good = [p for p in proofs if p[1] and p[2] == p[1]]
+        if not good:
+            detail = "; ".join(
+                f"state {idx}: expected {exp or '(none)'}, decoded {dec or '(nothing)'}"
+                f"{f', via {via}' if via else ''}"
+                for idx, exp, dec, via in proofs
+            )
+            raise RenderError(
+                f"[{sid}] the scan rig did not decode the sticker in the frame it filmed - "
+                f"{detail}. The pixels have to be genuinely decoded (CONTRACT_V2 V3); "
+                f"fix the rig and re-capture instead of shipping a scan that never happened."
+            )
+        for idx, expected, _dec, via in good:
+            lines.append(f"[{sid}] state {idx} decoded {expected} from the camera feed"
+                         f"{f' (via {via})' if via else ''}")
+    return lines
+
+
 def fingerprint(job: SceneJob, previous: str) -> str:
     """Everything that can change a scene's pixels, in one hash."""
     h = hashlib.sha256()
     h.update(previous.encode())
-    h.update(str(HERE.joinpath("compose.py").stat().st_mtime_ns).encode())
+    # compose.py owns the look; phone.py draws the phone body a phone shot is framed in,
+    # and it can change without any shot on disk changing.
+    for module in ("compose.py", "phone.py"):
+        path = HERE / module
+        h.update(f"{module}|{path.stat().st_mtime_ns if path.exists() else 0}".encode())
     h.update(f"{job.narration_seconds:.4f}|{job.extra_tail:.3f}".encode())
     for st in job.states:
-        try:
-            s = st.png.stat()
-            h.update(f"{st.png.name}|{s.st_mtime_ns}|{s.st_size}|{st.scroll}|{st.kind}".encode())
-        except OSError:
-            h.update(f"{st.png.name}|missing".encode())
+        for png in (st.png, getattr(st, "scene_png", None)):
+            if png is None:
+                continue
+            try:
+                s = Path(png).stat()
+                h.update(f"{Path(png).name}|{s.st_mtime_ns}|{s.st_size}".encode())
+            except OSError:
+                h.update(f"{Path(png).name}|missing".encode())
+        h.update(
+            f"{st.scroll}|{st.kind}|{getattr(st, 'state', '')}|{getattr(st, 'aim', None)}".encode()
+        )
     plan = job.plan
     if plan is not None:
-        h.update(repr((plan.n_frames, plan.caption, plan.moves, plan.clicks, plan.swaps,
-                       plan.highlights, plan.cameras, plan.fixed)).encode())
+        h.update(repr((plan.n_frames, plan.caption, plan.moves, plan.clicks, plan.taps,
+                       plan.swaps, plan.highlights, plan.cameras, plan.fixed,
+                       sorted(plan.phone_states))).encode())
     return h.hexdigest()
 
 
@@ -447,6 +572,7 @@ def compose_all(
                 )
             fresh = True
 
+        kind = "phone" if job.plan.phone_states else "page"
         if fresh:
             job.reused = True
             if job.last_png.exists():
@@ -462,8 +588,9 @@ def compose_all(
             job.seconds = media_seconds(job.clip)
             done_frames += int(round(job.seconds * C.FPS))
             print(
-                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} "
-                f"{int(round(job.seconds * C.FPS)):5d}f {job.seconds:6.2f}s  reused",
+                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} {kind:<5} "
+                f"{int(round(job.seconds * C.FPS)):5d}f {job.seconds:6.2f}s  reused"
+                f"{' ' * 26}elapsed {time.perf_counter() - wall:6.1f}s",
                 flush=True,
             )
         else:
@@ -485,11 +612,13 @@ def compose_all(
             )
             done_frames += res.frames
             pct = 100.0 * done_frames / max(1, total_frames)
+            spent = time.perf_counter() - wall
+            eta = spent * (total_frames - done_frames) / max(1, done_frames)
             print(
-                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} "
+                f"  [{job.index:02d}/{len(jobs)}] {job.scene_id:<20} {kind:<5} "
                 f"{res.frames:5d}f {res.seconds:6.2f}s  {res.elapsed:6.1f}s "
                 f"({res.frames / max(res.elapsed, 1e-6):5.0f} fps)  {pct:5.1f}%  "
-                f"elapsed {time.perf_counter() - wall:6.1f}s",
+                f"elapsed {spent:6.1f}s  eta {eta:5.0f}s",
                 flush=True,
             )
         cursor = job.plan.cursor_end
@@ -572,6 +701,12 @@ def verify(dest: Path, jobs: Sequence[SceneJob]) -> list[str]:
     expected = sum(j.seconds for j in jobs)
     if abs(dur - expected) > 0.6:
         problems.append(f"duration {dur:.2f}s but the scene clips add up to {expected:.2f}s")
+    # Length is a target, not a contract check: say so, do not fail the render for it.
+    if dur and not TARGET_MIN_SECONDS <= dur <= TARGET_MAX_SECONDS:
+        print(
+            f"  note      {dur / 60:.1f} min is outside CONTRACT_V2's 11-14 minute target - "
+            f"trim or extend the narration in script.py"
+        )
     return problems
 
 
@@ -603,9 +738,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     ap.add_argument("--only", metavar="ID[,ID]", help="recompose only these scene ids")
     ap.add_argument("--no-seed", action="store_true", help="reuse video/demo_data")
+    ap.add_argument(
+        "--reseed", action="store_true",
+        help="rebuild video/demo_data even though it exists. Re-rolls the sticker token and "
+             "every seeded figure, so re-check the numbers script.py speaks afterwards.",
+    )
     ap.add_argument("--no-narrate", action="store_true", help="reuse build/audio + timings.json")
     ap.add_argument("--no-capture", action="store_true", help="reuse build/shots")
     ap.add_argument("--force", action="store_true", help="recompose every scene clip")
+    ap.add_argument(
+        "--no-scan-check", action="store_true",
+        help="skip the CONTRACT_V2 V3 proof that every narrated scan was a real decode. "
+             "For iterating on other scenes only - a render made with this flag must not "
+             "be published.",
+    )
     ap.add_argument("--preset", default="fast", help="x264 preset")
     ap.add_argument("--crf", type=int, default=19, help="x264 CRF")
     ap.add_argument("--probe-every", type=int, default=0, metavar="N",
@@ -637,10 +783,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         py = sys.executable
         if not args.no_seed:
             seed = HERE / "seed_demo.py"
-            if seed.exists():
-                run_step("seed demo data", [py, str(seed)], SEED_TIMEOUT)
-            else:
+            if not seed.exists():
                 log.warning("video/seed_demo.py does not exist yet - skipping the seed step")
+            elif DEMO_DB.exists() and not args.reseed:
+                # Reusing it is the correct default, not a shortcut. seed_demo.py mints a
+                # fresh random sticker token and re-rolls every "relative to now" timestamp
+                # on each run, so re-seeding here would invalidate three things that were
+                # already settled against the current database: the figures narrate.py has
+                # *already spoken* into build/audio (the DNS totals and the camera's block
+                # rate are read off the seed and written into script.py by hand), the shots
+                # capture.py has already taken, and the QR baked into build/scene_camera.*.
+                # A seed is a deliberate act with a re-verification pass after it; a render
+                # is not. Pass --reseed to rebuild, and re-check the spoken figures.
+                print("\n=== seed demo data ===", flush=True)
+                print(f"    reusing {DEMO_DB} (pass --reseed to rebuild it)", flush=True)
+            else:
+                cmd = [py, str(seed)]
+                if DEMO_DB.exists():
+                    cmd.append("--force")
+                run_step("seed demo data", cmd, SEED_TIMEOUT)
         if not args.no_narrate:
             run_step("narrate", [py, str(HERE / "narrate.py")], NARRATE_TIMEOUT)
         if not args.no_capture:
@@ -653,6 +814,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         geometry = load_json(GEOMETRY, "build/geometry.json", required=False)
         if not MANIFEST.exists():
             log.warning("%s is missing - falling back to globbing build/shots", MANIFEST.name)
+
+        print("\n=== scan rig (CONTRACT_V2 V3) ===", flush=True)
+        if args.no_scan_check:
+            print("    !! SKIPPED with --no-scan-check.", flush=True)
+            print("    !! This render may narrate a manual pick as a scan. Do not publish it.",
+                  flush=True)
+        else:
+            manifest = load_json(MANIFEST, "build/shots_manifest.json", required=False)
+            for line in check_scan_rig(script, only, manifest):
+                print(f"    {line}", flush=True)
 
         jobs = collect_jobs(script, only)
         compose_all(jobs, geometry, only, args.force, args.preset, args.crf, args.probe_every)

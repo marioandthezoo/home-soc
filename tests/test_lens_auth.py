@@ -195,9 +195,14 @@ def test_v1_database_upgrades_and_keeps_its_rows(tmp_path: Path) -> None:
 
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == db.SCHEMA_VERSION == 2
+        assert db.schema_version(conn) == db.SCHEMA_VERSION
         versions = [int(r["version"]) for r in db.query(conn, "SELECT version FROM schema_migrations ORDER BY version")]
-        assert versions == [1, 2]
+        # Every migration ran, in order, starting from the one this v1 database already had.
+        # Written against db.MIGRATIONS rather than a literal so that adding migration 3
+        # (SPEC addendum C5) — or 4 — does not break the thing this test is actually about,
+        # which is that a v1 install survives the upgrade with its rows.
+        assert versions == [version for version, _ddl in db.MIGRATIONS]
+        assert versions[:2] == [1, 2]
         # Every pre-existing row is still there, unchanged.
         devices = db.rows_to_dicts(db.query(conn, "SELECT * FROM devices ORDER BY id"))
         assert [d["nickname"] for d in devices] == ["Front room router", "Study printer"]
@@ -213,8 +218,8 @@ def test_v1_database_upgrades_and_keeps_its_rows(tmp_path: Path) -> None:
         assert db.lens_verify_token(conn, token["token"]) is not None
         # Running it again changes nothing (start-up calls init_schema every time).
         db.init_schema(conn)
-        assert db.schema_version(conn) == 2
-        assert db.one(conn, "SELECT COUNT(*) AS n FROM schema_migrations")["n"] == 2
+        assert db.schema_version(conn) == db.SCHEMA_VERSION
+        assert db.one(conn, "SELECT COUNT(*) AS n FROM schema_migrations")["n"] == len(db.MIGRATIONS)
         assert db.one(conn, "SELECT COUNT(*) AS n FROM lens_tags")["n"] == 1
     finally:
         conn.close()

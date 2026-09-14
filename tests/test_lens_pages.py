@@ -262,6 +262,33 @@ def test_lens_javascript_never_builds_markup_from_data():
             assert forbidden not in source, f"{name}: {forbidden}"
 
 
+def test_lens_card_renders_the_if_this_fails_section():
+    """SPEC C7 and CHANGELOG both promise it; the client used to throw the payload away.
+
+    ``lens_device`` has always put a ``blast`` key in the payload - and paid for a full
+    ``build_graph`` on every identification to fill it - but ``renderCard`` appended only
+    problems, exposed, vulns, dns, history and the footer, so the section a user was told to
+    look for did not exist. The word "blast" appeared nowhere in lens.js or lens.css.
+    """
+    source = (STATIC / "lens.js").read_text(encoding="utf-8")
+    css = (STATIC / "lens.css").read_text(encoding="utf-8")
+
+    assert "function blastSection(" in source
+    assert "blastSection(payload.blast)" in source, "renderCard must actually append it"
+    assert "If this fails" in source
+    # It returns early on a missing payload, so an install without the topology package is
+    # unchanged rather than showing an empty section.
+    assert "if (!blast || !blast.headline) { return null; }" in source
+
+    # Every confidence blast_radius can report has a word here and a rule there, so the strength
+    # of the claim is never conveyed by colour alone and 'assumed' never prints as 'Inferred'.
+    for level, word in (("observed", "Observed"), ("mixed", "Partly observed"),
+                        ("inferred", "Inferred"), ("assumed", "Assumed")):
+        assert f"{level}: '{word}'" in source, level
+        assert f".blast-evidence.conf-{level}" in css, level
+    assert ".blast-headline" in css and ".blast-stat" in css and ".blast-note" in css
+
+
 def test_lens_templates_have_no_inline_script_style_or_handlers():
     for name in ("lens.html", "lens_pair.html", "lens_claim.html", "lens_stickers.html"):
         text = (TEMPLATES / name).read_text(encoding="utf-8")

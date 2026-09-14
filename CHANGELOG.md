@@ -40,6 +40,51 @@ to a device picker rather than a dead viewfinder.
 - **`docs/LENS_SETUP.md`** — enabling Lens, the certificate, the two transport options, pairing, stickers, tag
   learning, troubleshooting and the security model, with the limits stated plainly.
 
+**Dependencies and blast radius.** A new **Map** page (`/map`) showing what each device depends on, what depends on it,
+and what stops working when it fails. Click a node and the map highlights its blast radius with one sentence a
+non-expert can act on — *"If Living-room router fails, 5 devices lose their internet connection. They stay on the local
+network and can still reach each other."* — separating **degraded** (still on the LAN, lost the way out or a service) from **offline** (genuinely unreachable),
+which on a flat home network are very different lists. Hand-rolled SVG, deterministic layout, keyboard navigable, no
+libraries.
+
+- **Every edge is labelled with how it was established** — `observed` (a DNS query in the log, an mDNS/SSDP
+  advertisement, a UPnP mapping, devices that dropped off together in a recorded outage), `inferred` (everything
+  reaches the internet through the gateway) or `assumed` — drawn solid, dashed and dotted, with a legend.
+- **Home SOC has no packet visibility, and the feature is built around admitting it.** LAN peer traffic never passes
+  through it, so the map is not a traffic diagram and never claims to be. It would rather show fewer links than invent
+  one: a printer advertising `_printer._tcp` becomes a provider node marked *no confirmed consumers* instead of
+  sprouting edges to every device that might plausibly print. A permanent note on the page says so.
+- **Blast radius learned from real outages.** Groups of devices that disappear and return in the same discovery cycle
+  are recorded as outages with their members and, where one dropped too, which of them is the infrastructure device —
+  an association, never a claim about cause, because a tripped power strip produces the identical record. Repeated
+  co-drops promote an inferred edge to observed, one edge per pair: a single shared outage cannot say *which* of a
+  device's services was involved, so it never claims to. The resolution is stated everywhere it is shown, from the
+  cadence recorded with that outage rather than today's setting: "together" means *in the same discovery cycle* — ten
+  minutes by default, not seconds. Devices whose absence is routine (the
+  phone that leaves every morning) are excluded, so a commute does not become a dependency.
+- **Three new findings.** `NET-DEP-001` (info) a device that has quietly become load-bearing; `NET-DEP-002` (medium) an
+  observed single point of failure that has been offline alongside other devices at least twice, citing the dates — it fires on observed
+  evidence only, never on inference, and its remediation is about redundancy and about what to check first during the
+  next outage rather than about patching anything; `NET-DEP-003` (info) a device depending on a cloud endpoint that is
+  repeatedly blocked or unreachable, so a feature you think you have may have silently stopped working.
+- **The same data in three smaller places**: a "load-bearing devices" card on the Overview, a *Depends on / Depended on
+  by / If this fails* section on each device page, and an "If this fails" line in the Lens card — point the phone at a
+  box and learn what the house loses without it.
+- **New CLI command `blast <device>`** — an IP, MAC or nickname — printing the same headline, the degraded and offline
+  lists, the services lost and the evidence, in the terminal. `scan --only topology` rebuilds the map on demand.
+- **New `[topology]` config section**: `enabled`, `window_hours`, `include_cloud`, `min_outage_members`,
+  `criticality_alert`. New scheduler job `topology` (after `discovery`; it re-reads what discovery and the DNS filter
+  already wrote and scans nothing itself), a new `topology` scan step, and new tables `dep_edges`, `outages`,
+  `outage_members` (schema migrations 3 and 4). `dep_edges` is a cache — deleting it is harmless, and the next
+  refresh rebuilds it with `first_seen` preserved.
+- **`docs/TOPOLOGY.md`** — where every edge comes from, why there are three confidence levels, how blast radius is
+  computed, how outage learning works and at what resolution, the four things Home SOC structurally cannot see
+  (device-to-device traffic, anything behind a Zigbee/Z-Wave/Thread hub, devices using someone else's resolver,
+  unadvertised services), and what would lift the map from inference to measurement: SNMP bridge tables from a managed
+  switch, `conntrack` from an OpenWrt/pfSense router, or a passive listener on a spare machine — with the note that
+  moving the resolver onto a spare Raspberry Pi would both remove the DNS single point of failure and make the
+  dependency data far richer, because every device's lookups would then be visible.
+
 ### Security
 
 - Lens is **off by default**; turning it on is a `config.toml` edit, because it moves the dashboard's reach from
@@ -91,6 +136,55 @@ to a device picker rather than a dead viewfinder.
   normally without it.
 
 ### Fixed
+
+- **The dependency map no longer describes one device's outage as another's.** A device that was merely caught in a
+  large outage reported that outage's size, dates and cadence as its own blast radius — so a NAS that sat inside one
+  twenty-device router failure was shown, at *observed* confidence, as something whose failure takes twenty devices
+  down. Every figure that answers "what happens when this fails" is now built only from outages that device actually
+  headed, and a device that has headed none reports no evidence at all instead of a sentence that contradicts its own
+  headline. This reached the map panel, `/devices/<id>`, the Lens card, `blast` on the CLI and the persisted
+  `NET-DEP-002` finding.
+- **One shared outage now buys one dependency, not one per service.** A NAS offering SMB, SSH, AirPlay and printing
+  turned a single co-drop into four confident claims that a doorbell used each of them. A co-drop is evidence of
+  shared fate: where the device offers exactly one service the edge names it, and where it offers several the edge
+  points at the device and says which service was involved is not known.
+- **A co-drop no longer claims a device becomes unreachable.** A NAS failing does not make a laptop unreachable,
+  whatever they have done together; that is reserved for a hub, an access point or a switch, where there is a path to
+  sever. Everything else is reported as degraded, with the honest reason — they may simply share power or a switch.
+  `NET-DEP-002` says the same thing instead of "has taken other devices down with it".
+- **DNS history follows the device that made it.** Lookups were attributed to whoever holds the address *today*, so a
+  recycled DHCP lease moved one household member's browsing onto another person's device card and minted an
+  *observed* cloud dependency the device never had. Each query is now resolved against the sighting in force at the
+  time, and an address two devices answered on at once is attributed to neither.
+- **Recorded outages report the cadence they were recorded at.** `/api/map/blast` and `/api/map/outages` rebuilt the
+  resolution sentence from today's `schedule.discovery_minutes`, so an outage recorded hourly was reported at
+  ten-minute resolution — in the same payload as evidence that still said sixty. `/api/map/outages` now carries a
+  `resolution` per outage, and the config-derived sentence is `resolution_now`.
+- **A hub needs evidence.** Anything whose vendor or hostname *contained* "bridge", "hue" or "bond" was declared a
+  Zigbee hub with fabricated "advertises itself as a bridge" evidence — "Cambridge Audio" qualified. A hub claimed
+  from a broadcast stays *observed*; one guessed from a name is *assumed*, says so, and now needs a whole word.
+- **The gateway edge checks the subnet it names.** Devices on another RFC1918 range, and stale public addresses, were
+  drawn depending on the gateway under the words "the default route for this subnet".
+- **The map legend describes the evidence that exists.** It advertised UPnP port mappings, SSDP advertisements and a
+  DHCP-assigned resolver; none is implementable today, and all three have moved to docs/TOPOLOGY.md's "what would
+  make this map dramatically better".
+- **Lens shows the "If this fails" section the changelog promised.** The payload carried it and the client never
+  rendered it, so every identification paid for a full graph build and threw the answer away.
+- **The map's own picture matches its panel.** Services hosted on the failing device are highlighted as lost rather
+  than dimmed as unaffected while the panel lists them under "what the house loses"; a blocked domain is no longer
+  counted or sized as something devices depend on ("7 devices depend on it · not a dependency"); an `assumed` blast
+  radius prints as *Assumed* rather than *Inferred* and has its own styling; the C2.6 hub note can render at all
+  (it keyed off a node kind no payload has ever carried); "no confirmed consumers" is legible instead of truncated to
+  "no …"; and the word *offline* really is in an offline node's drawn label, as the legend claims.
+- **Sentences that did not add up.** The outage evidence line counted the device itself among the devices that went
+  down with it and applied the largest outage's size to every date; it said "Seen five times" above three dates; it
+  rendered dates in UTC while the rest of the dashboard renders local time; and a two-device house was told "1 device
+  lose their internet connection".
+- **The overview and device pages build the dependency graph once.** `/`, `/map` and `/devices/<id>` each rebuilt it
+  two or three times per request — under the shared write lock, which stalls the resolver's own writes.
+- **Schema migration 4** gives `outages.trigger_device_id` `ON DELETE SET NULL` and `outage_members.device_id`
+  `ON DELETE CASCADE`. With `PRAGMA foreign_keys=ON`, a device that had ever been in an outage could not be deleted at
+  all.
 
 - **Lens phone app.** A denied camera (or a browser with no `BarcodeDetector`) now leaves a permanent explanation in
   the viewfinder with a way back, instead of a black screen once the dismissible notice had been closed by the very

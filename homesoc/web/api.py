@@ -1466,6 +1466,548 @@ def export_data(c: WebContext, full: bool = False) -> dict:
     return data
 
 
+# --------------------------------------------------------------------------- map (SPEC addendum C)
+#
+# Dependencies and blast radius. The engine itself lives in ``homesoc.topology`` (C3/C4), a
+# package this one does not own, so every call into it is resolved lazily: an install without it
+# serves the rest of the API unchanged and the map routes answer 503 with a sentence that says why.
+#
+# The defining constraint of the whole feature is that Home SOC has **no packet visibility**. LAN
+# traffic between two devices never passes through it, so it cannot know that the laptop is talking
+# to the NAS. Two rules follow, and they are enforced here rather than left to the UI:
+#
+#   * ``note`` rides in every map payload. It is part of the data, not decoration, so a script
+#     polling /api/map inherits the caveat along with the numbers.
+#   * every edge keeps its own ``confidence`` and ``evidence``. This layer never flattens them
+#     away for convenience — a client must be able to tell what was seen from what was worked out,
+#     and an edge claiming to be ``observed`` with nothing behind it is downgraded, never rendered
+#     as though Home SOC had watched it happen.
+
+#: The honest sentence, carried by /api/map, /api/map/blast, /api/map/criticality,
+#: /api/map/outages and the Lens ``blast`` section. Wording from SPEC addendum C7.
+MAP_NOTE = (
+    "Home SOC cannot see traffic between devices — it has no packet visibility. "
+    "These links are what it has observed or can reasonably infer."
+)
+
+#: The three confidence levels of C2, in descending strength. An edge that arrives with anything
+#: else is dropped rather than drawn with a style the legend does not explain.
+MAP_CONFIDENCES: tuple[str, ...] = ("observed", "inferred", "assumed")
+#: ``blast_radius`` may additionally report "mixed" when it used both kinds of evidence.
+BLAST_CONFIDENCES: tuple[str, ...] = MAP_CONFIDENCES + ("mixed",)
+MAP_NODE_KINDS: tuple[str, ...] = ("device", "internet", "resolver", "cloud", "provider")
+
+DEFAULT_MAP_HOURS = 168
+MAX_MAP_HOURS = 24 * 365
+#: Lens fetches its ``blast`` section on every identification, so the strings are capped.
+BLAST_TEXT_LIMIT = 400
+
+# The legend is the user's key for reading the picture, so it describes the evidence that
+# *ships*, not the evidence the design contemplated. It used to promise UPnP port mappings, SSDP
+# advertisements and DHCP-assigned resolvers: there is no UPnP source in EDGE_SOURCES at all,
+# infer.mdns_types reads the "mdns" key and discards "ssdp", and dns_edges' own docstring
+# explains that the DHCP half of C2.3 is deliberately not emitted because Home SOC cannot read
+# DHCP options. Those three belong in docs/TOPOLOGY.md's "what would make this better", and are
+# now there.
+_MAP_LEGEND_CONFIDENCE: tuple[dict[str, str], ...] = (
+    {
+        "key": "observed",
+        "label": "Observed",
+        "style": "solid",
+        "line": "Home SOC saw this happen: a DNS query that arrived from this device at its own "
+                "resolver, a service the device advertised over mDNS, or devices that went offline "
+                "in the same discovery cycle.",
+    },
+    {
+        "key": "inferred",
+        "label": "Inferred",
+        "style": "dashed",
+        "line": "Not seen, but it follows from the shape of the network: every device on this "
+                "subnet reaches the internet through the default gateway.",
+    },
+    {
+        "key": "assumed",
+        "label": "Assumed",
+        "style": "dotted",
+        "line": "A reasonable default that has not been confirmed, such as a device being reachable "
+                "through the gateway when Home SOC has no route data at all.",
+    },
+)
+
+#: kind -> (label, one line). Keyed on MAP_NODE_KINDS so the legend cannot drift from the
+#: vocabulary C4 defines: every node kind the graph can contain is explained here.
+_MAP_KIND_LINES: dict[str, tuple[str, str]] = {
+    "device": ("Device", "Something Home SOC has found on the local network."),
+    "internet": ("Internet", "Everything beyond the gateway, as one node."),
+    "resolver": ("Resolver", "Whatever answers name lookups for the network."),
+    "cloud": ("External service", "A domain devices here look up, grouped by its vendor when one is recognisable."),
+    "provider": (
+        "Service provider",
+        "A device offering a service (printing, AirPlay, file sharing). Without evidence of "
+        "who uses it, it has no confirmed consumers and therefore no consumer edges.",
+    ),
+}
+
+
+class TopologyUnavailable(RuntimeError):
+    """The topology engine is missing or does not provide what the map needs."""
+
+
+TOPOLOGY_MISSING = (
+    "The dependency map is not available on this install: the homesoc.topology package is missing."
+)
+TOPOLOGY_MODULES: tuple[str, ...] = ("homesoc.topology", "homesoc.topology.graph", "homesoc.topology.outages")
+
+
+def _topology_fn(*names: str) -> Any:
+    """First callable named ``names`` anywhere in the topology package.
+
+    Resolved per call, not at import: T1 owns that package and the dashboard must start, serve and
+    be testable without it. Both spellings are tried across ``homesoc.topology`` and its two
+    modules, so a re-export in ``__init__`` and a bare module function both work.
+    """
+    present = False
+    for module_name in TOPOLOGY_MODULES:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        except Exception:  # a broken engine must not take the dashboard with it
+            logger.exception("could not import %s", module_name)
+            continue
+        present = True
+        for name in names:
+            fn = getattr(module, name, None)
+            if callable(fn):
+                return fn
+    if not present:
+        raise TopologyUnavailable(TOPOLOGY_MISSING)
+    raise TopologyUnavailable(f"the topology package does not provide {names[0]}()")
+
+
+def topology_available() -> bool:
+    try:
+        _topology_fn("build_graph")
+    except TopologyUnavailable:
+        return False
+    return True
+
+
+def map_legend() -> dict[str, list[dict[str, str]]]:
+    """A fresh copy, so a caller mutating the payload cannot edit the module's constants."""
+    return {
+        "confidence": [dict(item) for item in _MAP_LEGEND_CONFIDENCE],
+        "kinds": [
+            {"key": kind, "label": _MAP_KIND_LINES[kind][0], "line": _MAP_KIND_LINES[kind][1]}
+            for kind in MAP_NODE_KINDS
+        ],
+    }
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` off a dataclass, a namespace or a dict — the engine's Node/Edge are frozen
+    dataclasses (C4), but a stub or a future JSON cache is a plain dict."""
+    if isinstance(obj, dict):
+        value = obj.get(name, default)
+    else:
+        value = getattr(obj, name, default)
+    return default if value is None else value
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _text(value: Any, limit: int = 400) -> str:
+    return str(value if value is not None else "").strip()[:limit]
+
+
+def map_node(raw: Any) -> dict | None:
+    """One Node (C4) as JSON, or ``None`` when it has no id to hang edges off."""
+    node_id = _text(_field(raw, "id", ""), 200)
+    if not node_id:
+        return None
+    kind = _text(_field(raw, "kind", "device"), 40).lower() or "device"
+    severity = _text(_field(raw, "severity", ""), 20).lower()
+    return {
+        "id": node_id,
+        "kind": kind,
+        "label": _text(_field(raw, "label", ""), 200) or node_id,
+        "sublabel": _text(_field(raw, "sublabel", ""), 200) or None,
+        "device_id": _int_or_none(_field(raw, "device_id")),
+        "criticality": max(0, _int_or_none(_field(raw, "criticality", 0)) or 0),
+        "severity": severity if severity in SEVERITIES else None,
+        "online": _bool(_field(raw, "online", False)),
+    }
+
+
+def map_edge(raw: Any) -> tuple[dict | None, str | None]:
+    """One Edge (C4) as JSON, plus why it was changed or dropped.
+
+    Returns ``(edge, reason)``: ``reason`` is ``None`` when the edge came through untouched,
+    ``"dropped"`` when it is not renderable at all, and ``"downgraded"`` when it claimed to be
+    ``observed`` with neither an evidence line nor a single observation behind it. That last case
+    is the one this feature exists to get right: an edge nobody can justify must not be drawn as
+    something Home SOC watched happen, so it is shown as an inference and says so.
+    """
+    src = _text(_field(raw, "src", ""), 200)
+    dst = _text(_field(raw, "dst", ""), 200)
+    if not src or not dst:
+        return None, "dropped"
+    confidence = _text(_field(raw, "confidence", ""), 20).lower()
+    if confidence not in MAP_CONFIDENCES:
+        # A style the legend cannot explain is worse than a missing edge.
+        logger.warning("dropping topology edge %s->%s with confidence %r", src, dst, confidence)
+        return None, "dropped"
+    evidence = _text(_field(raw, "evidence", ""), 500)
+    observed_count = max(0, _int_or_none(_field(raw, "observed_count", 0)) or 0)
+    reason = None
+    if confidence == "observed" and not evidence and observed_count <= 0:
+        logger.warning("topology edge %s->%s claims 'observed' with no evidence; downgrading", src, dst)
+        confidence = "inferred"
+        evidence = "Reported as observed with nothing recorded behind it, so it is shown as an inference."
+        reason = "downgraded"
+    return (
+        {
+            "src": src,
+            "dst": dst,
+            "edge_type": _text(_field(raw, "edge_type", ""), 40) or "depends",
+            "protocol": _text(_field(raw, "protocol", ""), 40) or None,
+            "confidence": confidence,
+            "evidence": evidence,
+            "observed_count": observed_count,
+        },
+        reason,
+    )
+
+
+def _split_graph(result: Any) -> tuple[list, list]:
+    """``build_graph`` returns ``(nodes, edges)`` (C4); a dict is accepted too."""
+    if isinstance(result, dict):
+        return list(result.get("nodes") or []), list(result.get("edges") or [])
+    if isinstance(result, (tuple, list)) and len(result) == 2:
+        return list(result[0] or []), list(result[1] or [])
+    raise TopologyUnavailable("build_graph did not return (nodes, edges)")
+
+
+def map_graph(conn: sqlite3.Connection, *, hours: int = DEFAULT_MAP_HOURS, include_cloud: bool = True,
+              engine_out: list | None = None) -> dict:
+    """The ``{nodes, edges, legend, generated_at, note}`` payload of C7.
+
+    Node and edge order is the engine's, untouched: C9 requires the same data to produce the same
+    picture, and re-sorting here would hide a non-deterministic engine rather than expose it.
+
+    ``engine_out``, when a list is passed, receives the engine's own ``(nodes, edges)`` so the
+    caller can hand it straight back to :func:`map_criticality` and :func:`map_blast` instead of
+    paying for a second and third ``build_graph``. It is the raw objects rather than the
+    normalised payload on purpose: the engine is the only thing that can consume them, and the
+    payload above is the shape this layer promises everyone else.
+    """
+    build = _topology_fn("build_graph")
+    hours = max(1, min(int(hours or DEFAULT_MAP_HOURS), MAX_MAP_HOURS))
+    include_cloud = bool(include_cloud)
+    try:
+        result = build(conn, hours=hours, include_cloud=include_cloud)
+    except TypeError:  # an engine that takes only the connection
+        logger.debug("build_graph rejected hours/include_cloud; calling it bare", exc_info=True)
+        result = build(conn)
+    if engine_out is not None:
+        engine_out.append(result)
+
+    nodes_raw, edges_raw = _split_graph(result)
+    nodes = [n for n in (map_node(raw) for raw in nodes_raw) if n is not None]
+    known = {n["id"] for n in nodes}
+
+    edges: list[dict] = []
+    dropped = downgraded = 0
+    for raw in edges_raw:
+        edge, reason = map_edge(raw)
+        if edge is None:
+            dropped += 1
+            continue
+        if edge["src"] not in known or edge["dst"] not in known:
+            # An edge to a node that is not in the payload cannot be drawn and cannot be checked.
+            logger.warning("dropping topology edge %s->%s: endpoint missing from the node list", edge["src"], edge["dst"])
+            dropped += 1
+            continue
+        if reason == "downgraded":
+            downgraded += 1
+        edges.append(edge)
+
+    by_confidence = {level: 0 for level in MAP_CONFIDENCES}
+    incoming: dict[str, int] = {}
+    outgoing: dict[str, int] = {}
+    for edge in edges:
+        by_confidence[edge["confidence"]] += 1
+        outgoing[edge["src"]] = outgoing.get(edge["src"], 0) + 1
+        incoming[edge["dst"]] = incoming.get(edge["dst"], 0) + 1
+    for node in nodes:
+        node["depends_on"] = outgoing.get(node["id"], 0)
+        node["depended_on_by"] = incoming.get(node["id"], 0)
+
+    return {
+        "ok": True,
+        "generated_at": now_iso(),
+        # C1/C7: the honesty statement is a field of the payload, so every consumer inherits it.
+        "note": MAP_NOTE,
+        "legend": map_legend(),
+        "window_hours": hours,
+        "include_cloud": include_cloud,
+        "nodes": nodes,
+        "edges": edges,
+        "counts": {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "by_confidence": by_confidence,
+            "edges_dropped": dropped,
+            "edges_downgraded": downgraded,
+            # C2 rule 5: a provider nobody was seen using is reported as exactly that.
+            "providers_without_consumers": sum(
+                1 for n in nodes if n["kind"] == "provider" and n["depended_on_by"] == 0
+            ),
+        },
+    }
+
+
+def _blast_members(raw: Any) -> list[dict]:
+    """``[{device_id, label, why}]`` from whatever the engine listed."""
+    out: list[dict] = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        device_id = _int_or_none(_field(item, "device_id"))
+        label = _text(_field(item, "label", ""), 200)
+        if device_id is None and not label:
+            continue
+        entry = {"device_id": device_id, "label": label or (f"device {device_id}" if device_id else "")}
+        why = _text(_field(item, "why", ""), 300)
+        if why:
+            entry["why"] = why
+        out.append(entry)
+    return out
+
+
+def outage_resolution(cfg: Any = None) -> str:
+    """C3, the *fallback*: the cadence in force right now, phrased in the present tense.
+
+    Only correct when no particular outage is being described. An outage carries the cadence
+    that was actually running when it happened (``outages.cycle_seconds``), and that is what
+    every surface reporting one must state — see :func:`recorded_resolution`. Building this
+    sentence from today's ``schedule.discovery_minutes`` and stamping it over a recorded outage
+    claimed six-times-better resolution than the evidence supported, in the same payload as an
+    evidence line that still said "60-minute discovery cycle".
+    """
+    minutes = _int_or_none(cfg_get(cfg, "schedule.discovery_minutes", 10)) or 10
+    return (
+        f"Home SOC looks for devices every {minutes} minutes, so 'dropped together' means "
+        f"'went offline in the same discovery cycle', not 'within seconds'."
+    )
+
+
+def recorded_resolution(cycle_seconds: Any) -> str | None:
+    """The resolution of one recorded outage, from the cadence stored with it.
+
+    Deliberately a local two-line formatter rather than an import of
+    ``topology.outages.resolution_note``: this module resolves the topology package lazily and
+    per call, and the outage read models here work on a database whose topology package is not
+    installed. The wording is kept identical to the engine's on purpose — a reader must not be
+    able to tell which of the two produced the sentence in front of them.
+    """
+    seconds = _int_or_none(cycle_seconds)
+    if not seconds or seconds <= 0:
+        return None
+    minutes = max(1, int(seconds) // 60)
+    return (f"Discovery ran every {minutes} minute{'s' if minutes != 1 else ''} at the time, so "
+            f"\"dropped together\" means \"went missing in the same {minutes}-minute discovery cycle\", "
+            "not \"within seconds\".")
+
+
+def map_blast(conn: sqlite3.Connection, device_id: int, *, cfg: Any = None, engine_graph: Any = None) -> dict:
+    """The ``blast_radius`` shape of C4, normalised and carrying the honesty note.
+
+    Raises :class:`TopologyUnavailable` when the engine is absent; the caller has already checked
+    that the device exists, so an empty answer from the engine is reported as an empty blast
+    radius rather than a 404.
+
+    ``engine_graph`` is the ``(nodes, edges)`` a caller already built (see ``map_graph``'s
+    ``engine_out``). Engines that do not accept it are called the old way — this layer must keep
+    working with an engine it did not ship with.
+    """
+    fn = _topology_fn("blast_radius")
+    raw = _call_with_graph(fn, conn, int(device_id), graph=engine_graph)
+    if not isinstance(raw, dict):
+        raise TopologyUnavailable("blast_radius did not return a mapping")
+
+    offline = _blast_members(raw.get("offline"))
+    degraded = _blast_members(raw.get("degraded"))
+    unaffected = _blast_members(raw.get("unaffected"))
+    confidence = _text(raw.get("confidence"), 20).lower()
+    evidence = _text(raw.get("evidence"), 600)
+    device = raw.get("device")
+    if not isinstance(device, dict):
+        device = one(conn, "SELECT id, mac, ip, hostname, nickname, kind, vendor, online FROM devices WHERE id=?", (int(device_id),)) or {}
+        device = _device_row(dict(device)) if device else {}
+    return {
+        "ok": True,
+        "generated_at": now_iso(),
+        "note": MAP_NOTE,
+        "device_id": int(device_id),
+        "device": device,
+        "offline": offline,
+        "degraded": degraded,
+        "unaffected": unaffected,
+        "services_lost": [s for s in (_text(x, 200) for x in (raw.get("services_lost") or [])) if s],
+        "headline": _text(raw.get("headline"), 600),
+        "confidence": confidence if confidence in BLAST_CONFIDENCES else None,
+        # None, not "", when nothing has actually been observed (C4).
+        "evidence": evidence or None,
+        # The engine's sentence first: it is built from the cadence recorded with the outage,
+        # which is the only honest resolution for a specific one (C3). Today's config is the
+        # fallback for a radius that rests on no outage at all.
+        "cycle_seconds": _int_or_none(raw.get("cycle_seconds")),
+        "resolution": (_text(raw.get("resolution"), 400)
+                       or (outage_resolution(cfg) if (evidence or confidence in ("observed", "mixed")) else None)),
+        "counts": {"offline": len(offline), "degraded": len(degraded), "unaffected": len(unaffected)},
+    }
+
+
+def blast_summary(conn: sqlite3.Connection, device_id: int, *, cfg: Any = None) -> dict | None:
+    """The small "if this fails" section Lens puts on the device card (C7).
+
+    Headline, the two counts, the confidence and the evidence line — and the packet-visibility
+    note, because the phone is exactly where someone would otherwise read the picture as a live
+    traffic diagram. ``None`` (never an exception) when the topology package is not installed, so
+    the rest of the overlay still renders.
+    """
+    device_id = _int_or_none(device_id) or 0
+    if not (0 < device_id <= 2**63 - 1):
+        return None
+    try:
+        blast = map_blast(conn, device_id, cfg=cfg)
+    except TopologyUnavailable as exc:
+        logger.debug("no blast radius for device %s: %s", device_id, exc)
+        return None
+    except Exception:  # a broken engine must not blank the whole Lens payload
+        logger.exception("blast radius failed for device %s", device_id)
+        return None
+    return {
+        "headline": _text(blast.get("headline"), BLAST_TEXT_LIMIT),
+        "offline_count": int(blast["counts"]["offline"]),
+        "degraded_count": int(blast["counts"]["degraded"]),
+        "confidence": blast.get("confidence"),
+        "evidence": _text(blast.get("evidence"), BLAST_TEXT_LIMIT) or None,
+        "note": MAP_NOTE,
+    }
+
+
+def _call_with_graph(fn: Any, conn: sqlite3.Connection, *args: Any, graph: Any = None, kw: str = "graph") -> Any:
+    """Call an engine function with a pre-built graph, falling back if it does not take one.
+
+    The reuse is worth the guard: /, /map and /devices/<id> each rendered the graph and then a
+    ranking or a radius that silently rebuilt it, so a house with a week of DNS paid for the
+    same expensive ``GROUP BY dns_queries`` two or three times per request — under the shared
+    write lock, which stalls the resolver's own writes while it runs.
+    """
+    if graph is None:
+        return fn(conn, *args)
+    try:
+        return fn(conn, *args, **{kw: graph})
+    except TypeError:
+        logger.debug("engine function %r does not accept %s; rebuilding", getattr(fn, "__name__", fn), kw)
+        return fn(conn, *args)
+
+
+def map_criticality(conn: sqlite3.Connection, limit: int = 50, *, engine_edges: Any = None) -> list[dict]:
+    """``[{device_id, label, dependents, weight, why}]``, most load-bearing first (C4)."""
+    fn = _topology_fn("criticality")
+    raw = _call_with_graph(fn, conn, graph=engine_edges, kw="edges")
+    out: list[dict] = []
+    for item in raw if isinstance(raw, (list, tuple)) else []:
+        device_id = _int_or_none(_field(item, "device_id"))
+        label = _text(_field(item, "label", ""), 200)
+        if device_id is None and not label:
+            continue
+        try:
+            weight = round(float(_field(item, "weight", 0) or 0), 4)
+        except (TypeError, ValueError):
+            weight = 0.0
+        out.append(
+            {
+                "device_id": device_id,
+                "label": label or f"device {device_id}",
+                "dependents": max(0, _int_or_none(_field(item, "dependents", 0)) or 0),
+                "weight": weight,
+                "why": _text(_field(item, "why", ""), 300),
+            }
+        )
+    # The engine returns this descending; sorting again keeps the API's order stable whatever it does.
+    out.sort(key=lambda r: (-r["weight"], -r["dependents"], str(r["label"]).lower()))
+    return out[: max(1, min(int(limit or 1), 500))]
+
+
+def map_outages(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Recorded outages with their members, newest first (C3/C5).
+
+    Read straight from ``outages``/``outage_members`` like every other read model in this file, so
+    it works whether or not the topology package is importable — and answers with an empty list,
+    not a 503, on a database where no outage has ever been recorded.
+    """
+    limit = max(1, min(int(limit or 1), 500))
+    recorded = rows(
+        conn,
+        "SELECT o.id, o.started_at, o.ended_at, o.cycle_seconds, o.trigger_device_id, o.trigger_kind, "
+        "o.member_count, COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS trigger_label "
+        "FROM outages o LEFT JOIN devices d ON d.id=o.trigger_device_id "
+        "ORDER BY o.started_at DESC, o.id DESC LIMIT ?",
+        (limit,),
+    )
+    if not recorded:
+        return []
+    ids = [int(r["id"]) for r in recorded]
+    placeholders = ",".join("?" for _ in ids)
+    members: dict[int, list[dict]] = {}
+    for m in rows(
+        conn,
+        "SELECT m.outage_id, m.device_id, m.dropped_at, m.returned_at, "
+        "COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS label "
+        f"FROM outage_members m LEFT JOIN devices d ON d.id=m.device_id WHERE m.outage_id IN ({placeholders}) "
+        "ORDER BY m.outage_id, m.device_id",
+        ids,
+    ):
+        members.setdefault(int(m["outage_id"]), []).append(
+            {
+                "device_id": _int_or_none(m.get("device_id")),
+                "label": _text(m.get("label"), 200) or f"device {m.get('device_id')}",
+                "dropped_at": m.get("dropped_at"),
+                "returned_at": m.get("returned_at"),
+            }
+        )
+    out = []
+    for r in recorded:
+        outage_id = int(r["id"])
+        listed = members.get(outage_id, [])
+        out.append(
+            {
+                "id": outage_id,
+                "started_at": r.get("started_at"),
+                "ended_at": r.get("ended_at"),
+                "ongoing": not r.get("ended_at"),
+                "cycle_seconds": _int_or_none(r.get("cycle_seconds")),
+                "trigger_device_id": _int_or_none(r.get("trigger_device_id")),
+                "trigger_label": _text(r.get("trigger_label"), 200) or None,
+                "trigger_kind": _text(r.get("trigger_kind"), 40) or "unknown",
+                "member_count": _int_or_none(r.get("member_count")) or len(listed),
+                # Per row, from the cadence recorded with *this* outage. One top-level sentence
+                # built from today's config was stamped over a list whose rows each carry their
+                # own, so a 60-minute-cadence outage was reported at 10-minute resolution.
+                "resolution": recorded_resolution(r.get("cycle_seconds")),
+                "members": listed,
+            }
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- routes
 
 
@@ -1693,6 +2235,150 @@ def api_export():
     body = json.dumps(export_data(ctx(), full), indent=2, default=str)
     name = "homesoc-support-bundle.json" if full else "homesoc-export.json"
     return Response(body, mimetype="application/json", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# --------------------------------------------------------------------------- map routes (C7)
+#
+# Authorisation: these are dashboard API routes and nothing more. They are NOT under
+# ``/api/lens/``, so ``app._auth_and_csrf`` applies the dashboard credential to them exactly as it
+# does to /api/summary or /api/devices, and a Lens token buys no access to them at all.
+#
+# That is deliberate, not an oversight. A Lens token is a long-lived secret carried around on a
+# phone, granted by typing an eight-character code, and its whole point is "tell me about the box I
+# am standing in front of". The map is the opposite shape: one request returns every device, every
+# external service the house talks to and a ranked list of which single boxes take the most of the
+# house down — the most useful page in this product for someone casing the network, and the least
+# recoverable if a phone is lost. So the phone gets the blast radius of the one device it has
+# identified, through ``/api/lens/device/<id>``, bounded and read-only; the map itself stays behind
+# the dashboard credential. ``_map_guard`` enforces that even where the dashboard has no token set
+# (loopback-only, per ``_dashboard_session``), so presenting a Lens token here can never widen
+# access beyond what the same request would get with no token at all.
+
+
+def _map_guard() -> tuple[Response, int] | None:
+    """Refuse a paired phone's token on the map routes; ``None`` when the request may proceed."""
+    if request.headers.get("X-Lens-Token") and not _dashboard_session():
+        return (
+            jsonify(
+                {
+                    "ok": False,
+                    "code": "dashboard_only",
+                    "error": "The dependency map is a dashboard view. A paired phone sees the blast "
+                             "radius of the device it identified at /api/lens/device/<id>.",
+                }
+            ),
+            403,
+        )
+    return None
+
+
+def _map_unavailable(exc: TopologyUnavailable) -> tuple[Response, int]:
+    return jsonify({"ok": False, "code": "topology_unavailable", "error": str(exc), "note": MAP_NOTE}), 503
+
+
+def _map_failed(exc: Exception, what: str) -> tuple[Response, int]:
+    """A broken engine is the map being unavailable, not the dashboard being broken.
+
+    Same judgement the rest of this file makes for findings.score and the scheduler: one package
+    failing degrades its own panel and nothing else. The traceback goes to the log, never to the
+    client.
+    """
+    logger.exception("topology %s failed", what)
+    return (
+        jsonify(
+            {
+                "ok": False,
+                "code": "topology_error",
+                "error": f"The dependency map could not be built: {type(exc).__name__}. See the Home SOC log.",
+                "note": MAP_NOTE,
+            }
+        ),
+        503,
+    )
+
+
+@bp.get("/map")
+def api_map():
+    """The dependency graph: ``{nodes, edges, legend, generated_at, note}`` (C7)."""
+    denial = _map_guard()
+    if denial is not None:
+        return denial
+    c = ctx()
+    default_hours = _int_or_none(cfg_get(c.cfg, "topology.window_hours", DEFAULT_MAP_HOURS)) or DEFAULT_MAP_HOURS
+    default_cloud = _bool(cfg_get(c.cfg, "topology.include_cloud", True))
+    cloud_arg = request.args.get("cloud")
+    try:
+        graph = map_graph(
+            c.conn,
+            hours=_int_arg("hours", default_hours, 1, MAX_MAP_HOURS),
+            include_cloud=default_cloud if cloud_arg is None else _bool(cloud_arg),
+        )
+    except TopologyUnavailable as exc:
+        return _map_unavailable(exc)
+    except Exception as exc:  # noqa: BLE001 - a broken engine must not 500 the dashboard
+        return _map_failed(exc, "build_graph")
+    return jsonify(graph)
+
+
+@bp.get("/map/blast/<int:device_id>")
+def api_map_blast(device_id: int):
+    """What the house loses when this device fails (C4)."""
+    denial = _map_guard()
+    if denial is not None:
+        return denial
+    c = ctx()
+    # Flask's <int:...> converter happily accepts a 20-digit id and SQLite raises OverflowError
+    # rather than simply not matching (the same trap lens_device documents). Out of range is "no
+    # such device", not a traceback.
+    if not (0 < device_id <= 2**63 - 1) or one(c.conn, "SELECT id FROM devices WHERE id=?", (device_id,)) is None:
+        return jsonify({"ok": False, "error": "no such device"}), 404
+    try:
+        return jsonify(map_blast(c.conn, device_id, cfg=c.cfg))
+    except TopologyUnavailable as exc:
+        return _map_unavailable(exc)
+    except Exception as exc:  # noqa: BLE001
+        return _map_failed(exc, "blast_radius")
+
+
+@bp.get("/map/criticality")
+def api_map_criticality():
+    """The load-bearing devices, most dependents first (C4)."""
+    denial = _map_guard()
+    if denial is not None:
+        return denial
+    try:
+        ranked = map_criticality(ctx().conn, _int_arg("limit", 50, 1, 500))
+    except TopologyUnavailable as exc:
+        return _map_unavailable(exc)
+    except Exception as exc:  # noqa: BLE001
+        return _map_failed(exc, "criticality")
+    return jsonify({"ok": True, "generated_at": now_iso(), "note": MAP_NOTE, "criticality": ranked})
+
+
+@bp.get("/map/outages")
+def api_map_outages():
+    """Outages Home SOC actually recorded, with their members (C3).
+
+    ``resolution`` is not decoration either: co-dropping means "in the same discovery cycle", and
+    a consumer of this endpoint must not read the timestamps as second-by-second truth. It sits
+    on each *outage*, built from the ``cycle_seconds`` recorded with that one — a single
+    top-level sentence from today's ``schedule.discovery_minutes`` claimed one resolution for
+    rows that may each have been recorded at a different cadence. ``resolution_now`` is what the
+    cadence is today, which is a different question and is labelled as one.
+    """
+    denial = _map_guard()
+    if denial is not None:
+        return denial
+    c = ctx()
+    return jsonify(
+        {
+            "ok": True,
+            "generated_at": now_iso(),
+            "note": MAP_NOTE,
+            "resolution_now": outage_resolution(c.cfg),
+            "outages": map_outages(c.conn, _int_arg("limit", 20, 1, 500)),
+        }
+    )
 
 
 # --------------------------------------------------------------------------- lens (SPEC addendum B6/B7)
