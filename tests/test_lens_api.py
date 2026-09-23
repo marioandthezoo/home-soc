@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -994,3 +995,203 @@ def test_a_revoked_token_stops_working_immediately(seeded):
     core_db.lens_revoke_token(seeded, int(minted["id"]))
     r = c.get("/api/lens/device/1", headers=phone(minted["token"]), environ_base=LAN)
     assert r.status_code == 401 and r.get_json()["code"] == "unpaired"
+
+
+# ------------------------------------------------ C7: the dependency lists on the Lens card
+#
+# Lens has always carried the *consequence* of a device failing ("If this fails"). These cover
+# the relationships behind it — what the device leans on, and what leans on it — and above all
+# the rule that governs both: no row exists without an edge, and an edge only exists where there
+# is evidence. A printer five devices could plausibly use, and none has been seen using, reads
+# "Nothing is known to depend on this" and has no rows at all.
+
+DEPS_KEYS = {"depends_on", "depends_on_more", "depended_on_by", "depended_on_by_more",
+             "blocked", "blocked_more", "note"}
+ENTRY_KEYS = {"label", "kind", "confidence", "evidence", "device_id"}
+LENS_JS = Path(__file__).resolve().parents[1] / "homesoc" / "web" / "static" / "lens.js"
+
+
+def topology(conn: sqlite3.Connection) -> None:
+    """Give the seeded network a shape: a gateway, a printer that advertises printing and
+    scanning, and a camera with a telemetry domain the DNS filter refuses."""
+    now, old = _now(), _now(60 * 24 * 3)
+    conn.executescript(
+        """
+        INSERT INTO devices(id, mac, ip, hostname, vendor, kind, nickname, trusted, first_seen, last_seen, online)
+        VALUES(4,'00:11:22:00:00:04','192.168.1.1','gateway','Example Networks','router','Home router',1,
+               '{old}','{now}',1);
+        INSERT INTO devices(id, mac, ip, hostname, vendor, kind, nickname, trusted, first_seen, last_seen,
+                            online, mdns_services)
+        VALUES(5,'00:11:22:00:00:05','192.168.1.50','printer','Example Print','printer','Hall printer',1,
+               '{old}','{now}',1,'["_ipp._tcp","_printer._tcp","_scanner._tcp"]');
+        """.format(now=now, old=old)
+    )
+    webapi.set_setting(conn, "network.gateway", "192.168.1.1")
+    # Nine refused lookups: past the engine's minimum, so the graph really does carry the edge,
+    # and every one of them is a `cloud_blocked` — asked for, never depended on.
+    for i in range(9):
+        conn.execute(
+            "INSERT INTO dns_queries(ts, client, qname, qtype, action, reason, ms) VALUES(?,?,?,?,?,?,1.0)",
+            (_now(i * 3 + 1), "192.168.1.64", "telemetry.camvendor.example", "A", "block", "oisd_small"),
+        )
+    conn.commit()
+
+
+@pytest.fixture
+def mapped(seeded):
+    topology(seeded)
+    return seeded
+
+
+def deps_for(conn: sqlite3.Connection, device_id: int) -> dict:
+    payload = lensmod.lens_device(conn, device_id)
+    assert payload["deps"] is not None, "the topology package is installed, so deps must be built"
+    return payload["deps"]
+
+
+def _raise_unavailable(*args, **kwargs):
+    raise webapi.TopologyUnavailable("the homesoc.topology package is missing")
+
+
+def test_the_card_carries_the_dependency_lists_in_the_documented_shape(mapped):
+    body = client_for(mapped).get("/api/lens/device/1").get_json()
+    assert "deps" in body, "the key is always present, so the phone can tell 'none' from 'cannot say'"
+    deps = body["deps"]
+    assert DEPS_KEYS == set(deps)
+    assert isinstance(deps["note"], str) and deps["note"]
+    for entry in deps["depends_on"] + deps["depended_on_by"] + deps["blocked"]:
+        assert ENTRY_KEYS == set(entry), "the phone stays dumb: every entry is the same five fields"
+        assert entry["confidence"] in ("observed", "inferred", "assumed")
+        assert isinstance(entry["label"], str) and entry["label"]
+
+
+def test_deps_is_none_rather_than_empty_when_topology_is_unavailable(mapped, monkeypatch):
+    """Same three-state contract as ``blast``: null means this install cannot answer, and must
+    never be confused with 'nothing depends on this', which is a real fact about the network."""
+    monkeypatch.setattr(webapi, "map_graph", _raise_unavailable)
+    payload = lensmod.lens_device(mapped, 1)
+    assert payload["deps"] is None
+    assert set(payload) >= PAYLOAD_KEYS, "one missing section never blanks the rest of the card"
+
+
+def test_a_device_depends_on_its_gateway_its_resolver_and_the_clouds_it_reaches(mapped):
+    deps = deps_for(mapped, 1)
+    by_kind = {e["kind"]: e for e in deps["depends_on"]}
+    assert set(by_kind) == {"device", "resolver", "cloud"}
+    assert by_kind["device"]["label"] == "Home router" and by_kind["device"]["device_id"] == 4
+    assert by_kind["device"]["confidence"] == "inferred", "a route is inferred, never observed"
+    assert by_kind["resolver"]["confidence"] == "observed"
+    assert by_kind["cloud"]["device_id"] is None, "an external endpoint is not a device here"
+
+
+def test_a_cloud_dependency_names_the_domain_and_counts_the_lookups(mapped):
+    """The most interesting thing this can show someone standing in front of a camera."""
+    cloud = [e for e in deps_for(mapped, 1)["depends_on"] if e["kind"] == "cloud"]
+    assert len(cloud) == 1
+    assert cloud[0]["label"] == "updates.example"
+    assert cloud[0]["confidence"] == "observed"
+    assert "lookups" in cloud[0]["evidence"] and any(ch.isdigit() for ch in cloud[0]["evidence"])
+
+
+def test_a_blocked_domain_is_never_presented_as_a_dependency(mapped):
+    """C2.4: a refused lookup is something the device asks for, not something it relies on."""
+    deps = deps_for(mapped, 1)
+    blocked = {e["label"] for e in deps["blocked"]}
+    # Grouped by registrable domain, exactly as the map groups it.
+    assert "camvendor.example" in blocked
+    assert blocked.isdisjoint({e["label"] for e in deps["depends_on"]})
+    for entry in deps["blocked"]:
+        assert entry["kind"] == "cloud_blocked"
+        assert "blocked" in entry["evidence"] and "not depended on" in entry["evidence"]
+
+
+def test_the_gateway_is_depended_on_by_the_devices_that_route_through_it(mapped):
+    deps = deps_for(mapped, 4)
+    labels = {e["label"] for e in deps["depended_on_by"]}
+    assert {"Hall camera", "Hall printer"} <= labels
+    assert all(e["kind"] == "device" and e["device_id"] for e in deps["depended_on_by"])
+    assert [e["label"] for e in deps["depends_on"]] == ["The internet"]
+
+
+def test_a_printer_nobody_has_been_seen_using_has_no_consumers_and_says_so(mapped):
+    """The negative case this whole feature is built around (SPEC C2 rule 5). Five devices could
+    plausibly print; none has been seen doing it; so there are no rows, and the card says why."""
+    deps = deps_for(mapped, 5)
+    assert deps["depended_on_by"] == [] and deps["depended_on_by_more"] == 0
+    assert "the services it offers (Printing, Scanning)" in deps["note"]
+    assert "Nothing has been seen using" in deps["note"]
+    assert "nothing is listed as depending on it" in deps["note"]
+
+
+def test_the_note_never_lets_the_lists_read_as_a_traffic_log(mapped):
+    for device_id in (1, 4, 5):
+        note = deps_for(mapped, device_id)["note"]
+        assert "cannot see traffic between devices" in note
+        assert "never a record of who talked to whom" in note
+
+
+def test_the_best_evidenced_relationship_is_first(mapped):
+    """Confidence band first, then how much was actually counted — so a 93-lookup cloud edge
+    outranks a 9-lookup one, and both outrank an inferred default route."""
+    order = {"observed": 0, "inferred": 1, "assumed": 2}
+    for device_id in (1, 4, 5):
+        deps = deps_for(mapped, device_id)
+        for name in ("depends_on", "depended_on_by", "blocked"):
+            ranks = [order[e["confidence"]] for e in deps[name]]
+            assert ranks == sorted(ranks), f"{name} on device {device_id} is out of confidence order"
+    counted = [e for e in deps_for(mapped, 1)["depends_on"] if e["confidence"] == "observed"]
+    leading = [int(e["evidence"].split(" ")[0]) for e in counted]
+    assert leading == sorted(leading, reverse=True), "within a band, the strongest evidence leads"
+
+
+def test_each_list_is_capped_with_a_count_of_the_rest(mapped):
+    """A router with twenty clients must not put twenty rows through the air on every scan."""
+    now = _now()
+    for i in range(6, 20):
+        webapi.write(
+            mapped,
+            "INSERT INTO devices(id, mac, ip, hostname, kind, trusted, first_seen, last_seen, online) "
+            "VALUES(?,?,?,?,'iot',1,?,?,1)",
+            (i, f"00:11:22:00:01:{i:02d}", f"192.168.1.{100 + i}", f"plug-{i}", now, now),
+        )
+    deps = deps_for(mapped, 4)
+    assert len(deps["depended_on_by"]) == lensmod.DEPS_LIMIT
+    assert deps["depended_on_by_more"] == 18 - lensmod.DEPS_LIMIT
+    assert len(deps["depends_on"]) <= lensmod.DEPS_LIMIT
+
+
+def test_a_device_that_is_not_on_the_graph_says_so_instead_of_claiming_nothing():
+    """An empty list means "nothing has been established"; it must never be produced for a
+    device the graph does not contain at all, which is a different and much weaker answer."""
+    deps = lensmod.deps_section({"nodes": [], "edges": []}, 1)
+    assert deps["depends_on"] == [] and deps["depended_on_by"] == []
+    assert "not on the dependency graph yet" in deps["note"]
+
+
+def test_the_blast_section_is_identical_with_and_without_a_shared_graph(mapped):
+    """``lens_device`` builds the graph once and hands it to both sections. That reuse is only
+    safe while the cheap path and ``api.blast_summary`` produce exactly the same section."""
+    _graph, engine = lensmod.dependency_graph(mapped)
+    assert engine is not None, "the engine graph is what makes the reuse possible"
+    for device_id in (1, 2, 3, 4, 5):
+        assert lensmod.blast_section(mapped, device_id, engine_graph=engine) == webapi.blast_summary(mapped, device_id)
+
+
+def test_a_hostile_nickname_reaches_the_dependency_lists_as_plain_text(mapped):
+    """The XSS case, on the new rows: lens.js builds every node with textContent, and the API
+    hands it the nickname exactly as the network gave it — escaped by nobody, interpreted by
+    nobody. Anything that HTML-escaped it here would be lying about the device's real name."""
+    webapi.write(mapped, "UPDATE devices SET nickname=? WHERE id=1", ("<img src=x onerror=alert(1)>",))
+    deps = client_for(mapped).get("/api/lens/device/4").get_json()["deps"]
+    labels = [e["label"] for e in deps["depended_on_by"]]
+    assert "<img src=x onerror=alert(1)>" in labels
+    assert not any("&lt;" in label for label in labels), "no HTML escaping inside a JSON payload"
+
+
+def test_the_lens_javascript_builds_every_dependency_node_as_text():
+    """The other half of the same guarantee, pinned in the file that does the rendering."""
+    source = LENS_JS.read_text(encoding="utf-8")
+    body = source[source.index("function depRow("):source.index("return [upSec, downSec];")]
+    assert "innerHTML" not in body and "insertAdjacentHTML" not in body
+    assert body.count("text:") >= 6, "every visible string goes through el()'s textContent path"
+    assert "'Nothing is known to depend on this.'" in body, "an empty list is an answer, not a hidden section"

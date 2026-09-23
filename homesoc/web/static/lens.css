@@ -284,6 +284,38 @@ body.lens .blast-conf {
 }
 body.lens .blast-note { margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
 
+/* Depends on / Depended on by — the relationships behind "If this fails" (SPEC C7). Each row
+   prints its confidence as a word and repeats it in the left border, reusing the blast section's
+   visual language: solid for observed, dashed for inferred, dotted for assumed. Neither colour
+   nor line style is ever the only signal. */
+body.lens .dep-row {
+  margin: 0 0 8px; padding: 8px 10px; background: var(--panel-2);
+  border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 10px;
+}
+body.lens .dep-row.conf-observed { border-left-color: var(--sev-low); border-left-style: solid; }
+body.lens .dep-row.conf-inferred { border-left-style: dashed; }
+body.lens .dep-row.conf-assumed { border-left-style: dotted; }
+/* Blocked lookups sit in their own group and are drawn differently from the rows above them,
+   so a glance can never mistake one for a dependency. */
+body.lens .dep-row.is-blocked { background: none; border-left-color: var(--sev-medium); }
+body.lens .dep-label { font-size: 15px; line-height: 1.35; overflow-wrap: anywhere; }
+body.lens .dep-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 9px; margin-top: 4px; }
+body.lens .dep-conf {
+  font-weight: 700; color: var(--fg); text-transform: uppercase;
+  font-size: 11px; letter-spacing: .06em;
+}
+body.lens .dep-kind { font-size: 12.5px; color: var(--muted); }
+body.lens .dep-evidence {
+  margin: 5px 0 0; font-size: 13px; line-height: 1.5; color: var(--muted); overflow-wrap: anywhere;
+}
+body.lens .dep-more { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+body.lens .dep-sub {
+  margin: 14px 0 2px; font-size: 12.5px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); font-weight: 600;
+}
+body.lens .dep-sub-note { margin: 0 0 8px; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
+body.lens .dep-note { margin-top: 10px; }
+
 /* Talking to — the payoff section, so it gets the weight. */
 body.lens .dns-hero {
   display: flex; align-items: center; gap: 14px; padding: 12px; margin: 4px 0 12px;

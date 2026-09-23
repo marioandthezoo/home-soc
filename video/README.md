@@ -3,7 +3,7 @@
 Everything in this folder exists to produce one file:
 
 ```
-video/out/HomeSOC-walkthrough.mp4      1920x1080 · 30 fps · H.264 + AAC · ~11-14 minutes
+video/out/HomeSOC-walkthrough.mp4      1920x1080 · 30 fps · H.264 + AAC · 16 min 23 s
 video/out/HomeSOC-walkthrough.srt      one cue per sentence, timed to the finished cut
 ```
 

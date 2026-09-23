@@ -153,18 +153,19 @@
 .map-node:focus .map-focus-ring { stroke: var(--accent); stroke-width: 2.5; }
 .map-node:hover .map-focus-ring { stroke: var(--line); }
 
-/* blast-radius mode */
+/* blast-radius mode.
+   ONE ring for everything in the radius, in the accent colour, which means "the panel is
+   talking about this node" and nothing else. It used to be two rings taken straight out of the
+   severity palette — critical red for a lost service, medium amber for a degraded device — so
+   a frame carried red rings, amber rings, red fills and amber fills with two unrelated
+   meanings and a legend that explained only the fills. C7 forbids conveying a distinction by
+   colour alone; the distinction now lives where it can be read: in the node's own tooltip and
+   accessible name (BLAST_WORD in graph.js) and in the panel's UNREACHABLE / DEGRADED lists. */
 .map-node.is-dim { opacity: .22; }
 .map-node.is-affected .map-label { font-weight: 600; }
 .map-node.is-source .map-focus-ring { stroke: var(--fg); stroke-width: 3; }
-.map-node.is-affected:not(.is-source) .map-focus-ring { stroke: var(--sev-high); stroke-width: 2.5; }
-/* Degraded is the milder outcome and gets the milder ring — more specific than the rule above so
-   it actually wins. The panel spells both out in words; the ring only reinforces them. */
-.map-node.is-affected.is-degraded:not(.is-source) .map-focus-ring { stroke: var(--sev-medium); }
-/* A service that dies with the box hosting it. Distinct from a degraded *device*, which keeps
-   working and loses something: this one stops existing, so it gets the strongest ring. It used
-   to be dimmed as unaffected while the panel beside it listed it under "what the house loses". */
-.map-node.is-affected.is-lost:not(.is-source) .map-focus-ring { stroke: var(--sev-critical); stroke-width: 2.5; }
+.map-node.is-affected:not(.is-source) .map-focus-ring { stroke: var(--accent); stroke-width: 2.5; }
+.map-stats-note { margin: -4px 0 10px; line-height: 1.45; }
 
 /* ---- legend ---- */
 .map-legend {

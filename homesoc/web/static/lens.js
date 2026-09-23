@@ -669,6 +669,11 @@
       var blast = blastSection(payload.blast);
       if (blast) { cardBody.appendChild(blast); }
 
+      /* ...and the relationships behind that consequence. The device page and /map have shown
+         "Depends on" and "Depended on by" since the feature shipped; the phone — the surface
+         where you are actually standing in front of the box — had only the headline. */
+      (depsSections(payload.deps) || []).forEach(function (node) { cardBody.appendChild(node); });
+
       cardBody.appendChild(problemsSection(payload.findings || [], payload.actions || {}, d));
       cardBody.appendChild(exposedSection(payload.services || []));
       cardBody.appendChild(vulnSection(payload.vulns || []));
@@ -763,6 +768,86 @@
     }
 
     function plural(n, word) { return Number(n) === 1 ? word : word + 's'; }
+
+    /* ------------------------------------------------------- Depends on / Depended on by */
+
+    /* The three confidence levels an edge can carry (SPEC C2), each as a word. The left border
+       repeats it — dashed for inferred, dotted for assumed, solid for observed, exactly as the
+       blast evidence line already does — but the word is always there, so how strong a claim is
+       never depends on a colour or a line style being noticed. */
+    var DEP_CONF = { observed: 'Observed', inferred: 'Inferred', assumed: 'Assumed' };
+    /* What the other end of the relationship actually is. Not decoration: "external service"
+       and "device on this network" are the difference between a lookup and a neighbour. */
+    var DEP_KIND = {
+      device: 'device on this network',
+      internet: 'the internet',
+      resolver: 'DNS resolver',
+      cloud: 'external service',
+      cloud_blocked: 'blocked domain',
+      service: 'service on a device'
+    };
+
+    function depRow(item, extraClass) {
+      var conf = String((item && item.confidence) || 'inferred');
+      if (!DEP_CONF[conf]) { conf = 'inferred'; }
+      var kind = String((item && item.kind) || '');
+      var row = el('div', { className: 'dep-row conf-' + conf + (extraClass ? ' ' + extraClass : '') });
+      row.appendChild(el('div', { className: 'dep-label', text: String((item && item.label) || 'unknown') }));
+      row.appendChild(el('div', { className: 'dep-meta' },
+        el('span', { className: 'dep-conf', text: DEP_CONF[conf] }),
+        el('span', { className: 'dep-kind', text: DEP_KIND[kind] || kind })));
+      if (item && item.evidence) { row.appendChild(el('p', { className: 'dep-evidence', text: String(item.evidence) })); }
+      return row;
+    }
+
+    function depMore(n, word) {
+      return el('p', { className: 'dep-more', text: 'and ' + num(n) + ' more ' + plural(n, word) + ', not shown' });
+    }
+
+    /* Two sections, same pattern as the rest of the card, rendered straight after "If this
+       fails". Three states, exactly as the blast section has:
+         - deps absent or null: no topology package on this install, so nothing is rendered;
+         - a list empty: said out loud ("Nothing is known to depend on this"), because absence of
+           evidence is the honest answer here and hiding the section would read as a bug;
+         - populated: one row per relationship, best-evidenced first, capped with a count.
+       Blocked domains get their own group inside "Depends on" and are never rows of it: a
+       lookup the filter refused is something the device asks for, not something it relies on. */
+    function depsSections(deps) {
+      if (!deps) { return null; }
+      var up = deps.depends_on || [];
+      var upMore = Number(deps.depends_on_more) || 0;
+      var down = deps.depended_on_by || [];
+      var downMore = Number(deps.depended_on_by_more) || 0;
+      var blocked = deps.blocked || [];
+      var blockedMore = Number(deps.blocked_more) || 0;
+
+      var upSec = section('Depends on', up.length + upMore, true);
+      if (up.length) {
+        up.forEach(function (item) { upSec.appendChild(depRow(item)); });
+        if (upMore) { upSec.appendChild(depMore(upMore, 'link')); }
+      } else {
+        upSec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing this device relies on has been established.' }));
+      }
+      if (blocked.length) {
+        upSec.appendChild(el('h4', { className: 'dep-sub', text: 'Asked for, but blocked' }));
+        upSec.appendChild(el('p', {
+          className: 'dep-sub-note',
+          text: 'The DNS filter refused these lookups. This device keeps asking for them; it is not known to depend on them.'
+        }));
+        blocked.forEach(function (item) { upSec.appendChild(depRow(item, 'is-blocked')); });
+        if (blockedMore) { upSec.appendChild(depMore(blockedMore, 'domain')); }
+      }
+
+      var downSec = section('Depended on by', down.length + downMore, true);
+      if (down.length) {
+        down.forEach(function (item) { downSec.appendChild(depRow(item)); });
+        if (downMore) { downSec.appendChild(depMore(downMore, 'device')); }
+      } else {
+        downSec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing is known to depend on this.' }));
+      }
+      if (deps.note) { downSec.appendChild(el('p', { className: 'blast-note dep-note', text: String(deps.note) })); }
+      return [upSec, downSec];
+    }
 
     function problemsSection(findings, actions, device) {
       var sorted = findings.slice().sort(function (a, b) { return sevRank(a.severity) - sevRank(b.severity); });

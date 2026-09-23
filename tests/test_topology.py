@@ -227,6 +227,36 @@ def test_cloud_edges_separate_answered_from_blocked(house: sqlite3.Connection) -
     assert graph.dependents(edges, "cloud:tracker.example") == []
 
 
+def test_a_partly_refused_domain_states_its_refusals_on_the_row(house: sqlite3.Connection) -> None:
+    """C2.4 again, for the case that hid the biggest refusal on the demo camera.
+
+    ``telemetry-collect.ipcam-vendor.example`` is refused 46 times; ``fw-update.``, ``ntp.``
+    and ``device-gateway.`` under the same registrable domain are answered 81 times. Because
+    edges are keyed on the registrable domain, the answered half won and the 46 refusals
+    disappeared into a row labelled an OBSERVED dependency — invisible to the "asked for, but
+    blocked" list whose entire job is to keep refusals from reading as dependencies. They stay
+    out of ``blocked`` (they are not a separate endpoint) and out of ``observed_count`` (they
+    are not evidence of dependence), and they are stated on the row they belong to.
+    """
+    add_queries(house, "192.168.1.60", "fw-update.vendor.example", 81)
+    add_queries(house, "192.168.1.60", "telemetry.vendor.example", 46, action="block")
+    _nodes, edges = graph.build_graph(house)
+    rows = [e for e in edges if e.dst == "cloud:vendor.example"]
+    assert [e.edge_type for e in rows] == ["cloud"], "one row, not two: it is one domain"
+    edge = rows[0]
+    assert edge.observed_count == 81, "refusals are not evidence of dependence"
+    assert "81 lookups answered" in edge.evidence
+    assert "46 more under the same name refused" in edge.evidence
+    assert "asked for, not depended on" in edge.evidence
+
+
+def test_a_wholly_answered_domain_says_nothing_about_refusals(house: sqlite3.Connection) -> None:
+    add_queries(house, "192.168.1.60", "ring.com", 20)
+    _nodes, edges = graph.build_graph(house)
+    edge = next(e for e in edges if e.dst == "cloud:ring.com")
+    assert edge.evidence == "20 lookups answered in the last 7 days"
+
+
 def test_cloud_can_be_switched_off(house: sqlite3.Connection) -> None:
     add_queries(house, "192.168.1.60", "ring.com", 20)
     _nodes, edges = graph.build_graph(house, include_cloud=False)

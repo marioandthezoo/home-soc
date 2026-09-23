@@ -666,8 +666,22 @@ def cloud_edges(conn: sqlite3.Connection, ctx: InferenceContext) -> list[Edge]:
             if total < MIN_CLOUD_QUERIES:
                 continue
             if counts["allowed"]:
+                # A registrable domain can be partly answered and partly refused: the demo
+                # camera's vendor domain is answered 81 times for firmware, NTP and its device
+                # gateway, and refused 46 times for `telemetry-collect.` under the same name.
+                # Reporting only the 81 dropped the largest refusal on the device into a row
+                # labelled OBSERVED dependency, where the Lens card's "asked for, but blocked"
+                # list — the list that exists so refusals do not read as dependencies — could
+                # not show it. The refusals do not make this a dependency and they do not get
+                # their own row; they are stated on the row they actually belong to.
+                evidence = f"{counts['allowed']} lookups answered in the last {window}"
+                if counts["blocked"]:
+                    evidence += (
+                        f"; {counts['blocked']} more under the same name refused "
+                        "— asked for, not depended on"
+                    )
                 out.append(Edge(f"device:{device_id}", f"cloud:{domain}", "cloud", "dns", "observed",
-                                f"{counts['allowed']} lookups answered in the last {window}", counts["allowed"]))
+                                evidence, counts["allowed"]))
             else:
                 out.append(Edge(f"device:{device_id}", f"cloud:{domain}", "cloud_blocked", "dns", "observed",
                                 f"{counts['blocked']} lookups in the last {window}, all blocked by the DNS filter "

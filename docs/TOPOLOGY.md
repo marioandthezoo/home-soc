@@ -133,9 +133,20 @@ delete: it is a cache, and the next refresh restores exactly the same rows.
 
 ## 4. Blast radius: offline, degraded, unaffected
 
-Click any node and the map enters blast-radius mode: everything that would fail lights up, everything unaffected dims,
-and a side panel gives you a sentence plus the evidence behind it. These are real sentences, from a six-device test
-network:
+Click any node and the map enters blast-radius mode: everything the failure reaches keeps its colour and gets one ring
+in the accent colour, everything outside it dims, and a side panel gives you a sentence plus the evidence behind it.
+
+There is exactly one ring, deliberately. Which *kind* of harm a node takes — unreachable, degraded, or a service that
+stops existing — is a word, on the node's own tooltip and screen-reader name and in the panel's lists, never a second
+ring colour: the map already spends red and amber on finding severity, and a second meaning for the same two hues in
+the same frame is the sort of thing [C7](SPEC_TOPOLOGY.md) exists to forbid.
+
+Two things the ring covers that the counts do not. The three tiles count **devices**, and the panel says so; the
+internet, the resolver and the external endpoints are ringed in the picture but are not devices and are not tallied.
+And a service is only marked lost when the box hosting it actually stops — a printer whose router has died keeps
+printing on the LAN, so its "Printing" node dims along with everything else that goes on working.
+
+These are real sentences, from a six-device test network:
 
 > If Living-room router fails, 5 devices lose their internet connection. They stay on the local network and can still
 > reach each other.

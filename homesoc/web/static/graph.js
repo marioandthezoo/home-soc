@@ -22,7 +22,13 @@
   var PAD_X = 10, PAD_Y = 24;
   var GAP = 34;                 // between a column's labels and the next column's nodes
                                 // (wide enough to hold a bundle's trunk without crossing them)
-  var MAX_LABEL = 104;          // widest a label may be before it is truncated (tooltip keeps it)
+  /* Widest a label may be before it is truncated (the tooltip keeps the full text).
+     104 cut five of the map's own nouns mid-word for the whole scene — "Home SOC DNS fi…",
+     "Living room spe…", "15 blocked doma…", "9 external serv…" — including the two the page
+     asks the reader to read. The columns are laid out from the widest label each one actually
+     needs, and the infrastructure and external columns already reserve MAX_SUBLABEL, so
+     raising this to 126 costs width in the devices column alone. */
+  var MAX_LABEL = 126;
   var MAX_SUBLABEL = 124;       // the second line gets more room: C2.5's "no confirmed consumers"
                                 // is 22 characters and must never be the half that gets cut off
   var OFFLINE_SUFFIX = ' (offline)';
@@ -105,6 +111,18 @@
   }
   function plural(n, one, many) { return n === 1 ? one : (many || one + 's'); }
 
+  /* The drawn label, and the width the layout must reserve for it. One function, used by the
+     column-width pass, the invisible hit rect and the <text> itself, so the three can never
+     disagree — they used to, and the offline suffix was the proof: it was subtracted from the
+     name's budget but never added to the column's reserve, so "Nintendo Switch (offline)"
+     both lost its name to an ellipsis AND had nowhere to go if it had kept it. The suffix now
+     carries its own room. */
+  function drawnLabel(n) {
+    var name = fitText(n.label, LABEL_SIZE, MAX_LABEL);
+    return n.online ? name : name + OFFLINE_SUFFIX;
+  }
+  function labelWidth(n) { return textWidth(drawnLabel(n), LABEL_SIZE); }
+
   /* =====================================================================
      the view: collapsing the cloud column into one node until it is opened
      ===================================================================== */
@@ -160,10 +178,15 @@
         label: label, sublabel: sublabel, device_id: null, criticality: 0, severity: null, online: true
       });
     }
+    /* Both sublabels are short enough to survive MAX_SUBLABEL intact. They used to run to 40
+       and 58 characters and drew as "reached, and grouped — o…" / "asked for and refused by…",
+       so the one pair of nodes the page asks the reader to read was the one pair they could
+       not finish. The full sentences are still on the node's tooltip, its accessible name and
+       the side panel, where there is room for them. */
     group(COLLAPSED_ID, cloudCount, cloudCount + ' external ' + plural(cloudCount, 'service'),
-          'reached, and grouped — open to list them', false);
+          'reached — open to list', false);
     group(BLOCKED_ID, blockedCount, blockedCount + ' blocked ' + plural(blockedCount, 'domain'),
-          'asked for and refused by the DNS filter — not a dependency', true);
+          'asked for, then refused', true);
 
     /* One edge per (other end, direction, confidence, blocked-or-not), carrying how many it
        stands for, so the collapsed node never suggests more or fewer relationships than were
@@ -315,7 +338,7 @@
       col.forEach(function (n) {
         n.__r = R_MIN + (R_MAX - R_MIN) * Math.sqrt(Math.min(1, n.__weight / maxCrit));
         radius = Math.max(radius, n.__r);
-        widest = Math.max(widest, Math.min(MAX_LABEL, textWidth(n.label, LABEL_SIZE)));
+        widest = Math.max(widest, labelWidth(n));
         if (n.sublabel || n.__hub) widest = Math.max(widest, Math.min(MAX_SUBLABEL, textWidth(n.sublabel || '', 9)));
       });
       colX[c] = x + radius;
@@ -507,7 +530,7 @@
       });
       /* An invisible hit area covering the shape AND its label: the label is the part a person
          aims at, and without this the edge that terminates on the node wins the click. */
-      var labelW = Math.min(MAX_LABEL, textWidth(n.label, LABEL_SIZE));
+      var labelW = labelWidth(n);
       g.appendChild(svgEl('rect', {
         x: -n.__r - 6, y: -Math.max(11, lay.rowStep / 2 - 1), width: n.__r * 2 + 20 + labelW,
         height: Math.max(22, lay.rowStep - 2), 'class': 'map-hit'
@@ -532,12 +555,11 @@
          was only ever in the tooltip and the accessible name, so a reader who checked the
          legend found it false — on a page whose whole premise is that it does not overstate
          what it knows. Now it is in the drawn label too. */
-      /* The name is truncated to make room for the suffix, never the suffix to make room for
-         the name: "Nintendo Switch…" would leave the legend's claim about the word "offline"
-         false for exactly the long names most likely to be cut. */
+      /* The suffix is never the half that gets cut: "Nintendo Switch…" would leave the
+         legend's claim about the word "offline" false for exactly the long names most likely
+         to be truncated. drawnLabel() gives it its own room and the column reserves for it. */
       g.appendChild(svgEl('text', { x: n.__r + 8, y: twoLine ? -1 : 4, 'class': 'map-label' },
-                          n.online ? fitText(n.label, LABEL_SIZE, MAX_LABEL)
-                                   : fitText(n.label, LABEL_SIZE, MAX_LABEL - textWidth(OFFLINE_SUFFIX, LABEL_SIZE)) + OFFLINE_SUFFIX));
+                          drawnLabel(n)));
       if (twoLine) {
         g.appendChild(svgEl('text', { x: n.__r + 8, y: 10, 'class': 'map-sublabel' },
                             fitText(subText, 9, MAX_SUBLABEL)));
@@ -607,13 +629,48 @@
     if (blast) {
       (blast.offline || []).forEach(function (d) { if (d && d.device_id != null) set['device:' + d.device_id] = 'offline'; });
       (blast.degraded || []).forEach(function (d) { if (d && d.device_id != null) set['device:' + d.device_id] = 'degraded'; });
-      /* A service dies with the box hosting it. The blast payload lists only *devices*, so the
-         printer's own "Printing" and "Scanning" pentagons were dimmed as unaffected while the
-         panel beside them listed both under "What the house loses". Walk the hosted_by edges
-         and mark them lost — the picture and the text must not contradict each other. */
-      (state.layout ? state.layout.edges : []).forEach(function (e) {
-        if (e.edge_type === 'hosted_by' && set[e.dst]) set[e.src] = 'lost';
+      var mapEdges = (state.layout ? state.layout.edges : []);
+      /* A service dies with the box hosting it — but only when that box actually stops.
+         A host that is merely *degraded* keeps running and keeps offering what it offers:
+         the printer still prints when the router dies, which is exactly why the panel's
+         "what the house loses" does not list printing. Marking every provider whose host was
+         anywhere in the radius put thirteen "lost" rings on the map against one line of text.
+         Only the node that failed, and anything the payload calls unreachable, take their
+         services with them. */
+      mapEdges.forEach(function (e) {
+        if (e.edge_type !== 'hosted_by') return;
+        var host = set[e.dst];
+        if (host === 'source' || host === 'offline') set[e.src] = 'lost';
       });
+      /* Nodes that are not devices, and so are not in any of the three counts. The counts
+         cover devices — the panel says so in words — but the picture must not leave a node
+         dim while the text beside it lists that very node under "what the house loses".
+         Both cases below are read off the graph, never off the prose:
+           - the internet is reached only over an `internet` edge. If the node failing carries
+             one, the internet goes out of reach with it, and so does every external endpoint
+             on the far side of it;
+           - anything else with an `internet` edge (the resolver forwards upstream over one)
+             keeps running on the LAN and loses what it was reaching for: degraded, the same
+             word the panel uses for the devices in the same position.
+         Domains the filter refused are deliberately left out: nothing depends on them, which
+         is the whole reason they are drawn at all, so they stay dim rather than joining a
+         list of things the house loses. */
+      var carriesInternet = mapEdges.some(function (e) {
+        return e.edge_type === 'internet' && e.src === state.selected;
+      });
+      if (carriesInternet) {
+        set.internet = 'lost';
+        mapEdges.forEach(function (e) {
+          if (e.edge_type === 'internet' && e.src !== state.selected && !set[e.src]) {
+            set[e.src] = 'degraded';
+          }
+        });
+        (state.layout ? state.layout.nodes : []).forEach(function (n) {
+          if (n.kind !== 'cloud' || set[n.id]) return;
+          if (n.blocked || (state.layout.blockedOnly && state.layout.blockedOnly[n.id])) return;
+          set[n.id] = 'lost';
+        });
+      }
       return set;
     }
     // no blast radius for this node (it is not a device): highlight only its recorded links
@@ -622,6 +679,31 @@
       if (e.dst === state.selected) set[e.src] = 'linked';
     });
     return set;
+  }
+
+  /* What blast-radius mode has decided about a node, in words. The ring says "in the radius";
+     only this says which way, so a reader who cannot tell two ring colours apart — or is
+     reading with a screen reader, where there are no rings at all — loses nothing. */
+  var BLAST_WORD = {
+    source: 'the device this radius is for',
+    offline: 'in the blast radius — becomes unreachable',
+    degraded: 'in the blast radius — keeps working, loses a service',
+    lost: 'in the blast radius — stops working',
+    linked: 'in the blast radius',
+    dim: 'not in the blast radius'
+  };
+
+  function blastBaseTitle(g) {
+    var t = g.querySelector('title');
+    var base = (t && t.textContent) || '';
+    g.setAttribute('data-title', base);
+    return base;
+  }
+
+  function setNodeTitle(g, text) {
+    var t = g.querySelector('title');
+    if (t) t.textContent = text;
+    g.setAttribute('aria-label', text + '. Press Enter for what stops working without it.');
   }
 
   function applyHighlight() {
@@ -634,7 +716,14 @@
     for (i = 0; i < nodes.length; i++) {
       var id = nodes[i].getAttribute('data-id');
       nodes[i].classList.remove('is-affected', 'is-dim', 'is-source', 'is-degraded', 'is-lost');
-      if (!set) continue;
+      /* C7: severity and confidence must not be conveyed by colour alone, and neither may
+         this. The ring is one treatment for everything in the radius; which *kind* of harm
+         it is is a word, on the node itself and in the panel's lists. */
+      var base = nodes[i].getAttribute('data-title') || '';
+      if (!base) { base = blastBaseTitle(nodes[i]); }
+      if (!set) { setNodeTitle(nodes[i], base); continue; }
+      var word = id === state.selected ? BLAST_WORD.source : BLAST_WORD[set[id]] || BLAST_WORD.dim;
+      setNodeTitle(nodes[i], base + ' · ' + word);
       if (id === state.selected) nodes[i].classList.add('is-source', 'is-affected');
       else if (set[id] === 'degraded') nodes[i].classList.add('is-affected', 'is-degraded');
       else if (set[id] === 'lost') nodes[i].classList.add('is-affected', 'is-lost');
@@ -709,6 +798,13 @@
       stats.appendChild(statTile(counts.degraded != null ? counts.degraded : (blast.degraded || []).length, 'degraded', 'keep working, lose a service'));
       stats.appendChild(statTile(counts.unaffected != null ? counts.unaffected : (blast.unaffected || []).length, 'unaffected', 'carry on as before'));
       body.appendChild(stats);
+      /* The three tiles count devices and nothing else. Without this line "0 unaffected" sat
+         beside a picture with four dim nodes in it, and the reader had to guess which of the
+         two was wrong. The map rings every node in the radius, device or not; the counts are
+         the device half of the same answer. */
+      body.appendChild(el('p', 'muted small map-stats-note',
+        'These three count devices. The internet, the resolver and the services on the map are '
+        + 'ringed in the picture, and named below, but they are not devices and are not counted here.'));
 
       /* Every level the legend explains gets its own word and its own fallback sentence.
          'assumed' — the weakest of the three, and reachable on any install that leaves

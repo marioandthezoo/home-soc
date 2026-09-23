@@ -80,8 +80,9 @@ CAPTURE_TIMEOUT = 3600
 FFMPEG_TIMEOUT = 1800
 
 #: CONTRACT_V2 V1: target length for the finished film.
-TARGET_MIN_SECONDS = 11 * 60
-TARGET_MAX_SECONDS = 14 * 60
+# CONTRACT_V2's preamble, raised from 11-14 when the dependency-map act arrived.
+TARGET_MIN_SECONDS = 15 * 60
+TARGET_MAX_SECONDS = 16 * 60
 
 AUDIO_RATE = 48000
 AUDIO_CH = 2
@@ -704,7 +705,7 @@ def verify(dest: Path, jobs: Sequence[SceneJob]) -> list[str]:
     # Length is a target, not a contract check: say so, do not fail the render for it.
     if dur and not TARGET_MIN_SECONDS <= dur <= TARGET_MAX_SECONDS:
         print(
-            f"  note      {dur / 60:.1f} min is outside CONTRACT_V2's 11-14 minute target - "
+            f"  note      {dur / 60:.1f} min is outside CONTRACT_V2's 15-16 minute target - "
             f"trim or extend the narration in script.py"
         )
     return problems

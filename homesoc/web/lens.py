@@ -64,6 +64,50 @@ TIMELINE_LIMIT = 20
 # generous window costs little and stops a quiet device showing an empty History section.
 TIMELINE_WINDOW_HOURS = 24 * 90
 
+# --------------------------------------------------------------------------- dependencies (C7)
+
+#: How many relationships each Lens dependency list carries before the rest becomes a count.
+#: The payload is fetched on every identification, so a router with seventeen clients must not
+#: put seventeen rows through the air to be rendered on a 390px card nobody scrolls that far.
+DEPS_LIMIT = 6
+#: Evidence lines are read one-handed in a cupboard, so they are capped harder than the map's.
+DEPS_TEXT_LIMIT = 220
+#: The graph window. 168 hours matches /map and ``topology.window_hours``, so the evidence
+#: sentences the phone shows ("183 DNS queries in the last 7 days") are the same ones the
+#: dashboard shows for the same edge.
+DEPS_WINDOW_HOURS = 168
+
+#: Edge type -> what the other end *is*, in the vocabulary the phone renders. ``hosted_by`` is
+#: absent on purpose: it points from a service to the box running it, which is a statement about
+#: this device, not about anything that depends on it.
+DEP_KIND_BY_EDGE: dict[str, str] = {
+    "gateway": "device",
+    "internet": "internet",
+    "dns": "resolver",
+    "cloud": "cloud",
+    "cloud_blocked": "cloud_blocked",
+    "uses": "service",
+}
+#: Edge types that can make one *device* depend on another directly. ``uses`` usually reaches a
+#: provider node — those consumers are resolved through the provider in :func:`deps_section` —
+#: but it points straight at a device when the device offers several services and the evidence
+#: cannot say which one was involved, so it belongs here too.
+DEP_INBOUND_EDGES: frozenset[str] = frozenset({"gateway", "uses"})
+
+_DEP_CONFIDENCE_RANK: dict[str, int] = {"observed": 0, "inferred": 1, "assumed": 2}
+
+#: Said once, next to the lists themselves. The blast section carries the map's own note; this
+#: one is about these two lists specifically, because a list of devices under the heading
+#: "Depended on by" is exactly where a reader would otherwise assume Home SOC watched them talk.
+DEPS_NOTE = (
+    "Only relationships with evidence are listed. Home SOC cannot see traffic between devices, "
+    "so this is what it has observed or inferred — never a record of who talked to whom."
+)
+DEPS_UNMAPPED_NOTE = (
+    "This device is not on the dependency graph yet, so nothing is known about what it depends "
+    "on or what depends on it."
+)
+
 DDL_LENS_TAGS = """
 CREATE TABLE IF NOT EXISTS lens_tags (
     id           INTEGER PRIMARY KEY,
@@ -979,7 +1023,45 @@ def dns_section(
     return out
 
 
-def blast_section(conn: sqlite3.Connection, device_id: int) -> dict | None:
+def dependency_graph(conn: sqlite3.Connection, *, hours: int = DEPS_WINDOW_HOURS) -> tuple[dict | None, Any]:
+    """``(map payload, engine (nodes, edges))`` for this identification, or ``(None, None)``.
+
+    Built once and shared by :func:`deps_section` and :func:`blast_section`. That matters: the
+    phone asks for this payload every time it recognises a sticker, and ``build_graph`` reads a
+    week of ``dns_queries`` with a ``GROUP BY`` — under the connection's shared write lock, so a
+    second build would stall the resolver's own writes as well as the card.
+
+    ``homesoc.topology`` is a separate package that may not be installed, so this resolves through
+    :func:`api.map_graph`, which imports it lazily and raises rather than exploding at import
+    time. Anything that goes wrong answers ``(None, None)`` and costs the card two sections.
+    """
+    fn = getattr(api, "map_graph", None)
+    if not callable(fn):  # an older api module: no map, and therefore no dependency lists
+        return None, None
+    engine_out: list = []
+    unavailable = getattr(api, "TopologyUnavailable", None)
+    try:
+        payload = fn(conn, hours=int(hours), include_cloud=True, engine_out=engine_out)
+    except TypeError:  # an api module whose map_graph predates engine_out
+        logger.debug("map_graph rejected engine_out; calling it bare", exc_info=True)
+        try:
+            payload = fn(conn)
+        except Exception:
+            logger.debug("no dependency graph for Lens", exc_info=True)
+            return None, None
+    except Exception as exc:
+        if unavailable is not None and isinstance(exc, unavailable):
+            # The ordinary "topology is not installed here" case, not a fault.
+            logger.debug("no dependency graph for Lens: %s", exc)
+        else:
+            logger.exception("could not build the dependency graph for Lens")
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    return payload, (engine_out[0] if engine_out else None)
+
+
+def blast_section(conn: sqlite3.Connection, device_id: int, *, engine_graph: Any = None) -> dict | None:
     """"If this fails": what the house loses without this box (SPEC addendum C7).
 
     The single best use of the dependency map — point the phone at a box and learn what depends on
@@ -990,7 +1072,16 @@ def blast_section(conn: sqlite3.Connection, device_id: int) -> dict | None:
     The engine lives in ``homesoc.topology``, which is a separate package and may not be installed:
     :func:`api.blast_summary` imports it lazily and answers ``None`` rather than raising, so a
     missing (or broken) topology package costs the phone this one section and nothing else.
+
+    ``engine_graph`` is the cloud-inclusive ``(nodes, edges)`` :func:`dependency_graph` already
+    built; handing it over produces exactly the same section without a second ``build_graph``.
+    ``tests/test_lens_api.py::test_the_blast_section_is_identical_with_and_without_a_shared_graph``
+    pins the two paths together so this reuse can never quietly change what the phone reads.
     """
+    if engine_graph is not None:
+        shared = _blast_from_graph(conn, device_id, engine_graph)
+        if shared is not None:
+            return shared
     fn = getattr(api, "blast_summary", None)
     if not callable(fn):  # an older api module: the overlay simply has no blast section
         return None
@@ -999,6 +1090,244 @@ def blast_section(conn: sqlite3.Connection, device_id: int) -> dict | None:
     except Exception:  # belt and braces: this must never blank the rest of the card
         logger.exception("could not build the Lens blast section for device %s", device_id)
         return None
+
+
+def _blast_from_graph(conn: sqlite3.Connection, device_id: int, engine_graph: Any) -> dict | None:
+    """:func:`api.blast_summary`'s shape, from a graph the caller already paid for.
+
+    Deliberately the same six keys in the same order: ``blast_summary`` is the contract the phone
+    renders against, and this is only a cheaper route to it, never a second opinion.
+    """
+    fn = getattr(api, "map_blast", None)
+    if not callable(fn):
+        return None
+    try:
+        blast = fn(conn, int(device_id), engine_graph=engine_graph)
+    except TypeError:  # an api module whose map_blast does not take a pre-built graph
+        logger.debug("map_blast does not accept engine_graph; falling back", exc_info=True)
+        return None
+    except Exception:
+        logger.debug("could not reuse the graph for the Lens blast section", exc_info=True)
+        return None
+    if not isinstance(blast, dict) or not isinstance(blast.get("counts"), dict):
+        return None
+    limit = int(getattr(api, "BLAST_TEXT_LIMIT", 400))
+    return {
+        "headline": api._text(blast.get("headline"), limit),
+        "offline_count": int(blast["counts"]["offline"]),
+        "degraded_count": int(blast["counts"]["degraded"]),
+        "confidence": blast.get("confidence"),
+        "evidence": api._text(blast.get("evidence"), limit) or None,
+        "note": getattr(api, "MAP_NOTE", ""),
+    }
+
+
+# --------------------------------------------------------------------------- dependency lists
+
+
+def _dep_text(value: Any) -> str:
+    return api._text(value, DEPS_TEXT_LIMIT)
+
+
+def _dep_label(node: dict, kind: str) -> str:
+    """What to print for the other end of the relationship.
+
+    A vendor label on its own ("Ring") hides the domain, which is the part someone standing in
+    front of a camera can check; a provider label on its own ("Printing") hides which box offers
+    it. Both are folded back in here, because the phone does no string building of its own.
+    """
+    label = str(node.get("label") or node.get("id") or "").strip()
+    sub = str(node.get("sublabel") or "").strip()
+    if not sub:
+        return label
+    if kind in ("cloud", "cloud_blocked"):
+        # "ipcam-vendor.example" or "ring.com — blocked by the DNS filter".
+        domain = sub.split(" — ")[0].strip()
+        if domain and domain.lower() != label.lower():
+            return f"{label} ({domain})"
+        return label
+    if kind == "service" and sub.lower().startswith("on "):
+        # "on Epson printer — 1 confirmed consumer" -> "Printing on Epson printer".
+        return f"{label} {sub.split(' — ')[0].strip()}".strip()
+    return label
+
+
+def _dep_entry(node: dict, kind: str, edge: dict, *, evidence: Any = None) -> dict:
+    """One row of a Lens dependency list — small, already worded, nothing for the phone to do."""
+    return {
+        "label": _dep_label(node, kind),
+        "kind": kind,
+        "confidence": str(edge.get("confidence") or "inferred"),
+        "evidence": _dep_text(edge.get("evidence") if evidence is None else evidence),
+        # Present for anything that is a device on this network, null for the internet, the
+        # resolver and external endpoints. The phone does not link anywhere today; the id is
+        # here so it can, without a second shape.
+        "device_id": node.get("device_id"),
+    }
+
+
+def _dep_sort_key(item: tuple[int, dict]) -> tuple:
+    """Best-evidenced first: confidence band, then how much was actually counted, then name."""
+    strength, entry = item
+    return (
+        _DEP_CONFIDENCE_RANK.get(str(entry.get("confidence") or ""), 9),
+        -int(strength or 0),
+        str(entry.get("label") or "").lower(),
+    )
+
+
+def _dep_cap(items: list[tuple[int, dict]]) -> tuple[list[dict], int]:
+    """Sorted, capped at :data:`DEPS_LIMIT`, with however many were left behind."""
+    ordered = sorted(items, key=_dep_sort_key)
+    return [entry for _strength, entry in ordered[:DEPS_LIMIT]], max(0, len(ordered) - DEPS_LIMIT)
+
+
+def _merge_evidence(keep: str, extra: str) -> str:
+    if not extra or extra in keep:
+        return keep
+    if not keep:
+        return _dep_text(extra)
+    return _dep_text(f"{keep}; {extra}")
+
+
+def deps_section(graph: dict | None, device_id: int) -> dict | None:
+    """"Depends on" and "Depended on by" for the Lens card (SPEC addendum C7).
+
+    The device page and /map have carried these lists since the feature shipped; the phone —
+    the surface where you are actually standing in front of the box — had only the consequence.
+
+    Two rules do all the work here, and both are the honesty rule of C1/C2 in list form:
+
+    * **nothing is listed without an edge.** A printer that advertises printing and could
+      plausibly serve five devices has no ``uses`` edge from any of them, so its "depended on by"
+      list is empty and says so. Inventing rows for the devices that *might* print is exactly
+      the lie the whole feature exists not to tell.
+    * **a blocked domain is not a dependency.** The graph separates ``cloud`` from
+      ``cloud_blocked`` (C2.4) and so does this: blocked endpoints come back in their own
+      ``blocked`` list, never in ``depends_on``, because a camera hammering a telemetry endpoint
+      the filter refuses is asking for something, not relying on it.
+
+    ``graph`` is the payload from :func:`api.map_graph` — already normalised, already capped,
+    already stripped of edges whose confidence the legend cannot explain. ``None`` when the
+    topology package is unavailable, which the caller turns into ``deps: None``.
+    """
+    if not isinstance(graph, dict):
+        return None
+    try:
+        device_id = int(device_id)
+    except (TypeError, ValueError):
+        return None
+    nodes = {str(n.get("id")): n for n in (graph.get("nodes") or []) if isinstance(n, dict) and n.get("id")}
+    edges = [e for e in (graph.get("edges") or []) if isinstance(e, dict)]
+    me = f"device:{device_id}"
+    empty = {
+        "depends_on": [], "depends_on_more": 0,
+        "depended_on_by": [], "depended_on_by_more": 0,
+        "blocked": [], "blocked_more": 0,
+    }
+    if me not in nodes:
+        return dict(empty, note=DEPS_UNMAPPED_NOTE)
+
+    # ---- what this device depends on: every edge that leaves it.
+    upstream: list[tuple[int, dict]] = []
+    blocked: list[tuple[int, dict]] = []
+    for edge in edges:
+        if str(edge.get("src")) != me:
+            continue
+        edge_type = str(edge.get("edge_type") or "")
+        kind = DEP_KIND_BY_EDGE.get(edge_type)
+        other = nodes.get(str(edge.get("dst")))
+        if kind is None or other is None:
+            continue
+        if edge_type == "uses" and str(other.get("kind") or "") != "provider":
+            # A co-drop that cannot say *which* service was involved points at the box itself
+            # (C2.5), and calling that box "a service" would name something the evidence did not.
+            kind = "device"
+        strength = int(edge.get("observed_count") or 0)
+        (blocked if kind == "cloud_blocked" else upstream).append((strength, _dep_entry(other, kind, edge)))
+
+    # ---- what depends on this device. Two sources, and neither is "who might plausibly".
+    downstream: dict[str, tuple[int, dict]] = {}
+
+    def remember(node: dict, edge: dict, *, evidence: Any = None) -> None:
+        node_id = str(node.get("id") or "")
+        if not node_id or node_id == me:
+            return
+        entry = _dep_entry(node, "device", edge, evidence=evidence)
+        strength = int(edge.get("observed_count") or 0)
+        previous = downstream.get(node_id)
+        if previous is None:
+            downstream[node_id] = (strength, entry)
+            return
+        # A device can both route through this one and use a service on it. That is one row
+        # saying both things, ranked by the stronger of the two claims.
+        best = min([(strength, entry), previous], key=_dep_sort_key)
+        other = previous if best[1] is entry else (strength, entry)
+        best[1]["evidence"] = _merge_evidence(best[1]["evidence"], other[1]["evidence"])
+        downstream[node_id] = (max(strength, previous[0]), best[1])
+
+    for edge in edges:
+        if str(edge.get("dst")) != me or str(edge.get("edge_type") or "") not in DEP_INBOUND_EDGES:
+            continue
+        other = nodes.get(str(edge.get("src")))
+        if other is not None:
+            remember(other, edge)
+
+    # Services this device offers, and the devices *seen* using them (C2.5). A provider with no
+    # ``uses`` edge contributes no rows at all — it contributes a sentence to ``note`` instead.
+    hosted: list[dict] = [
+        node
+        for node in (nodes.get(str(e.get("src"))) for e in edges
+                     if str(e.get("dst")) == me and str(e.get("edge_type") or "") == "hosted_by")
+        if node is not None
+    ]
+    hosted_ids = {str(n.get("id")) for n in hosted}
+    consumed: set[str] = set()
+    for edge in edges:
+        if str(edge.get("edge_type") or "") != "uses" or str(edge.get("dst")) not in hosted_ids:
+            continue
+        consumed.add(str(edge.get("dst")))
+        other = nodes.get(str(edge.get("src")))
+        if other is not None:
+            remember(other, edge)
+
+    depends_on, depends_on_more = _dep_cap(upstream)
+    depended_on_by, depended_on_by_more = _dep_cap(list(downstream.values()))
+    blocked_rows, blocked_more = _dep_cap(blocked)
+
+    return {
+        "depends_on": depends_on,
+        "depends_on_more": depends_on_more,
+        "depended_on_by": depended_on_by,
+        "depended_on_by_more": depended_on_by_more,
+        # Kept out of ``depends_on`` on purpose (C2.4): asked for, not depended on.
+        "blocked": blocked_rows,
+        "blocked_more": blocked_more,
+        "note": _deps_note([n for n in hosted if str(n.get("id")) not in consumed], bool(downstream)),
+    }
+
+
+def _deps_note(orphan_providers: list[dict], has_dependents: bool) -> str:
+    """The honesty line under the lists, plus the "no confirmed consumers" case spelled out.
+
+    This is the sentence the printer exists to produce: it advertises printing, five devices
+    could plausibly use it, none has been seen doing so, and the card says that in words rather
+    than leaving an empty list to be read as a bug.
+    """
+    names = sorted({label for label in (str(n.get("label") or "").strip() for n in orphan_providers) if label})
+    if not names:
+        return DEPS_NOTE
+    # The engine's own labels, verbatim and in a parenthetical, so they need no grammatical
+    # surgery: "Camera stream" and "DNS resolution" both read correctly there, and neither has
+    # to be lower-cased into "camera stream" or mangled into "dNS resolution".
+    offered = f"the {'service' if len(names) == 1 else 'services'} it offers ({', '.join(names)})"
+    tail = (
+        f"Nothing has been seen using {offered}; anything listed here depends on it for "
+        "another reason."
+        if has_dependents
+        else f"Nothing has been seen using {offered}, so nothing is listed as depending on it."
+    )
+    return f"{DEPS_NOTE} {tail}"
 
 
 def timeline(conn: sqlite3.Connection, device: dict, *, limit: int = TIMELINE_LIMIT) -> list[dict]:
@@ -1090,6 +1419,11 @@ def lens_device(
     counts = _severity_counts(open_findings)
     contribution = sum(api.SCORE_PENALTY.get(sev, 0) * n for sev, n in counts.items())
 
+    # One graph, two sections. Both "if this fails" and the two relationship lists are views of
+    # the same dependency graph, and building it twice per identification is the cost the
+    # ``engine_graph`` seam in ``api`` exists to avoid.
+    graph, engine_graph = dependency_graph(conn)
+
     payload = {
         "device": {
             "id": int(device["id"]),
@@ -1113,7 +1447,12 @@ def lens_device(
         },
         # None when the topology package is not installed (C7) — the key is always present so the
         # phone can tell "nothing depends on this" from "this install cannot answer that".
-        "blast": blast_section(conn, int(device["id"])),
+        "blast": blast_section(conn, int(device["id"]), engine_graph=engine_graph),
+        # The relationships behind that consequence: what this device leans on, and what leans on
+        # it. Same three-state contract as ``blast`` — null means "this install cannot answer",
+        # empty lists mean "nothing has been established", which is a real answer and is said out
+        # loud rather than hidden.
+        "deps": deps_section(graph, int(device["id"])),
         "services": services,
         "vulns": vulns,
         "findings": [
@@ -1430,12 +1769,16 @@ def claim(conn: sqlite3.Connection, code: Any, *, ip: str | None = None, label: 
 
 __all__ = [
     "Match",
+    "DEPS_LIMIT",
+    "DEPS_NOTE",
     "PORT_INFO",
     "STICKER_PREFIX",
     "blast_section",
     "claim",
     "claim_allowed",
     "claim_reset",
+    "dependency_graph",
+    "deps_section",
     "dns_section",
     "ensure_tables",
     "forget_tag",

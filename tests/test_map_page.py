@@ -473,15 +473,58 @@ def test_the_hub_note_keys_off_something_the_payload_actually_carries():
     assert "not on the IP network" in source
 
 
-def test_a_service_is_not_dimmed_while_the_panel_says_it_is_lost():
-    """The blast payload lists devices only, so a provider hosted on the failing device was
-    given ``is-dim`` while the panel beside it listed the same service under "What the house
-    loses". The picture and the text must not contradict each other."""
+def test_a_service_is_lost_only_when_the_box_hosting_it_actually_stops():
+    """The picture and the panel must agree about what the house loses.
+
+    Two ways round this has been wrong. First a provider hosted on the failing device was
+    dimmed while the panel listed its service under "What the house loses". Then the fix for
+    that marked a provider lost whenever its host was anywhere in the radius, so a router
+    failure put thirteen "lost" rings on the map — printing, scanning, AirPlay, Sonos — against
+    a panel that listed exactly one lost service. A degraded host keeps running: the printer
+    still prints when the router dies. Only the node that failed, and anything the payload
+    calls unreachable, take their services down with them.
+    """
+    source = (STATIC / "graph.js").read_text(encoding="utf-8")
+    assert "if (e.edge_type !== 'hosted_by') return;" in source
+    assert "if (host === 'source' || host === 'offline') set[e.src] = 'lost';" in source
+    assert "'lost'" in source
+
+
+def test_blast_mode_does_not_dim_the_internet_and_the_resolver_it_says_are_lost():
+    """The counts are devices; the picture is every node. They must not contradict.
+
+    Clicking the router put "0 unaffected" beside a frame in which "The internet" and
+    "Home SOC DNS filter" were the two greyed-out nodes, while the panel's own "what the house
+    loses" read "internet access for 17 devices / DNS for 12 devices". Both are read off the
+    graph's ``internet`` edges rather than off the prose, and the panel now says out loud that
+    the three tiles cover devices only.
+    """
+    source = (STATIC / "graph.js").read_text(encoding="utf-8")
+    assert "e.edge_type === 'internet' && e.src === state.selected" in source
+    assert "set.internet = 'lost';" in source
+    # Refused lookups stay out of it: nothing depends on them, which is why they are drawn.
+    assert "if (n.blocked || (state.layout.blockedOnly && state.layout.blockedOnly[n.id])) return;" in source
+    assert "These three count devices." in source
+
+
+def test_blast_mode_uses_one_ring_and_says_the_difference_in_words():
+    """C7: no distinction conveyed by colour alone.
+
+    Blast mode used to ring lost nodes in ``--sev-critical`` and degraded nodes in
+    ``--sev-medium`` — the same two hues the map already uses for finding severity, so one
+    frame carried red rings, amber rings, red fills and amber fills with two unrelated
+    meanings and a legend that explained only the fills. One accent ring now means "the panel
+    is talking about this node"; which kind of harm it is is a word on the node itself.
+    """
     source = (STATIC / "graph.js").read_text(encoding="utf-8")
     css = (STATIC / "map.css").read_text(encoding="utf-8")
-    assert "e.edge_type === 'hosted_by' && set[e.dst]" in source
-    assert "'lost'" in source and "is-lost" in source
-    assert ".map-node.is-affected.is-lost" in css
+    assert "var BLAST_WORD = {" in source
+    for word in ("becomes unreachable", "keeps working, loses a service", "stops working"):
+        assert word in source
+    assert "setNodeTitle(nodes[i], base + ' · ' + word);" in source
+    assert ".map-node.is-affected:not(.is-source) .map-focus-ring { stroke: var(--accent);" in css
+    assert "--sev-critical" not in css.split("blast-radius mode")[1].split("/* ---- legend")[0]
+    assert "--sev-medium" not in css.split("blast-radius mode")[1].split("/* ---- legend")[0]
 
 
 def test_the_spec_phrase_and_the_offline_word_survive_truncation():
@@ -498,9 +541,34 @@ def test_the_spec_phrase_and_the_offline_word_survive_truncation():
     assert "orphanText = orphan ? 'no confirmed consumers' : null" in source
     assert "(orphanText || lay.rowStep >= 28)" in source, "the phrase must not depend on row height"
     assert "MAX_SUBLABEL" in source and "fitText(subText, 9, MAX_SUBLABEL)" in source
-    # The name is truncated to make room for the suffix, never the other way round.
-    assert "MAX_LABEL - textWidth(OFFLINE_SUFFIX, LABEL_SIZE)) + OFFLINE_SUFFIX" in source
+    # The suffix is never the half that gets cut, and it is no longer taken out of the name's
+    # budget either: one drawnLabel()/labelWidth() pair feeds the column reserve, the hit rect
+    # and the drawn <text>, so "Nintendo Switch (offline)" keeps its name AND has room for it.
+    assert "function drawnLabel(n) {" in source
+    assert "return n.online ? name : name + OFFLINE_SUFFIX;" in source
+    assert "widest = Math.max(widest, labelWidth(n));" in source
+    assert "var labelW = labelWidth(n);" in source
     assert "(offline)" in html, "the legend describes what is actually drawn"
+
+
+def test_the_map_labels_the_narration_points_at_are_not_cut_mid_word():
+    """MAX_LABEL of 104 px cut five of the map's own nouns for the whole map scene.
+
+    "Home SOC DNS fi…", "Living room spe…", "15 blocked doma…" and "9 external serv…" — the
+    last two being precisely the pair the page invites the reader to read — plus a collapsed
+    group whose sublabel ran off at "asked for and refused by…". The columns are sized from
+    the widest label each actually needs, so the headroom was there; only the cap was wrong.
+    """
+    source = (STATIC / "graph.js").read_text(encoding="utf-8")
+    cap = int(re.search(r"var MAX_LABEL = (\d+);", source).group(1))
+    # "Home SOC DNS filter" and "Living room speaker" are 19 characters; textWidth() bills
+    # them at 19 * 11.5 * 0.55 = 120.2 px.
+    assert cap >= 121, f"MAX_LABEL {cap} still truncates the map's own node names"
+    assert "'reached — open to list'" in source
+    assert "'asked for, then refused'" in source
+    for sub in ("'reached — open to list'", "'asked for, then refused'"):
+        text = sub.strip("'")
+        assert len(text) * 9 * 0.55 <= 124, f"{text!r} does not fit MAX_SUBLABEL"
 
 
 def test_the_legend_only_promises_evidence_the_shipped_code_can_produce(seeded_client, engine):

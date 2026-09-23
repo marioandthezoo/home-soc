@@ -104,8 +104,10 @@ SHORT_TAKE_RATIO: Final[float] = 0.65
 STABLE_TAKE_RATIO: Final[float] = 0.05
 
 #: CONTRACT_V2 §preamble: the finished film should land between these, in minutes.
-FILM_TARGET_MIN: Final[float] = 11.0
-FILM_TARGET_MAX: Final[float] = 14.0
+#: Raised from 11-14 when the dependency-map act (`07a`) and scene 19's "If this fails"
+#: beat were added: CONTRACT_V2's preamble now reads "Target length 15-16 minutes".
+FILM_TARGET_MIN: Final[float] = 15.0
+FILM_TARGET_MAX: Final[float] = 16.0
 
 SYNTH_TIMEOUT: Final[float] = 120.0
 #: The public speech endpoint drops the occasional connection; retry before giving up.
@@ -728,7 +730,7 @@ def narrate(
     )
     print(f"  {TIMINGS_PATH}")
     print(f"  {SRT_PATH}  ({sum(len(s.cues) for s in results)} cues)")
-    # CONTRACT_V2 targets the *finished film* at 11-14 minutes, and the film is this
+    # CONTRACT_V2 targets the *finished film* at 15-16 minutes, and the film is this
     # timeline: every scene is exactly as long as its narration plus the lead-in and tail
     # pad, so `total` is the number to judge. v1's 6.5-8 minute figure was for a 14-scene
     # script with no Lens act and is no longer the bar.

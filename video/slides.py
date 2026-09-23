@@ -286,6 +286,10 @@ def title() -> str:
         "Windows posture",
         "Microsoft Defender",
         "LAN DNS sinkhole",
+        # The other headline addition of v2, and the one the card was still missing: the film
+        # spends two and a quarter minutes on the dependency map and did not name it until
+        # 04:18. "what depends on what" is the map's own sub-line on the architecture slide.
+        "dependency map \u00b7 what depends on what",
         # The headline addition of v2, and the thing the narration over this very card ends
         # on ("you do not know which of four identical white boxes it is"). Without it the
         # title card advertised the v1 feature set for the first nineteen seconds.
@@ -613,6 +617,11 @@ def _output_panel() -> str:
     rows = (
         ("Dashboard", "127.0.0.1:8787", "overview \u00b7 findings \u00b7 devices \u00b7 vulns \u00b7 host \u00b7 DNS",
          SEV_INFO, False),
+        # The dependency map is an output like any other page, and it belongs next to the
+        # dashboard row rather than at the foot of the column: it reads the same database and
+        # invents nothing, which is the sentence its sub-line has to carry on a diagram.
+        ("Dependency map", "/map", "what depends on what \u00b7 what stops working without it",
+         SEV_INFO, False),
         ("Activity feed", "/feed", "one stream of everything that happened \u00b7 also RSS",
          SEV_LOW, False),
         ("Remediation summary", "/summary", "found vs fixed \u00b7 time-to-fix \u00b7 the open worklist",
@@ -623,18 +632,21 @@ def _output_panel() -> str:
          ACCENT, True),
     )
     out = [_box(_COL_D)]
-    # five rows in the height four used to have: 57 + 5 still clears the type at
-    # 17.5/13 px, and the alternative - a sixth column - would crowd the diagram.
-    rh, gap = 57.0, 5.0
+    # Six rows in the height four used to have. 47 + 5 is the tightest pitch that still keeps
+    # the 16.5 px name and the 12.5 px sub-line on their own baselines with air between them
+    # (measured: name baseline y+21, sub baseline y+38, 9 px of padding under it); the
+    # alternative - a sixth column, or a taller column D - would either crowd the diagram or
+    # collide with the phone below it at y=476.
+    rh, gap = 47.0, 5.0
     y = _COL_D.y + 11
     for name, tag, sub, colour, is_lens in rows:
         r = Rect(_COL_D.x + 14, y, _COL_D.w - 28, rh)
         tx, mx = r.inner(14)
         out.append(_box(r, fill=PANEL_2, rx=8, stroke=ACCENT if is_lens else LINE))
-        out.append(f'<rect x="{r.x:g}" y="{r.y + 10:g}" width="3" height="{rh - 20:g}" rx="1.5" fill="{colour}"/>')
-        out.append(_t(tx + 6, r.y + 25, name, maxx=mx - 108, size=17.5, weight=650))
-        out.append(_t(mx, r.y + 25, tag, maxx=mx + 1, size=12.5, fill=MUTED, anchor="end", mono=True))
-        out.append(_t(tx + 6, r.y + 45, sub, maxx=mx, size=13, fill=MUTED))
+        out.append(f'<rect x="{r.x:g}" y="{r.y + 8:g}" width="3" height="{rh - 16:g}" rx="1.5" fill="{colour}"/>')
+        out.append(_t(tx + 6, r.y + 21, name, maxx=mx - 108, size=16.5, weight=650))
+        out.append(_t(mx, r.y + 21, tag, maxx=mx + 1, size=12.5, fill=MUTED, anchor="end", mono=True))
+        out.append(_t(tx + 6, r.y + 38, sub, maxx=mx, size=12.5, fill=MUTED))
         y += rh + gap
     return "".join(out)
 
@@ -1652,6 +1664,145 @@ _LIMITS: tuple[tuple[str, str, str], ...] = (
 )
 
 
+#: Every sketch below is drawn in this box and rendered at its natural size, centred. They
+#: carry no text of their own: a 13 px SVG label inside a 300-unit viewBox that CSS then
+#: stretches across a 400 px card comes out at a different size from every other word on the
+#: slide, and the first cut of this slide clipped three of them ("the way o…") against the
+#: card's padding. The words live in the HTML caption underneath instead.
+_DEP_ART_W, _DEP_ART_H = 300, 104
+
+
+def _dep_sketch_depends() -> str:
+    """A device and the two things it needs: drawn, not described."""
+    return f"""
+<svg viewBox="0 0 {_DEP_ART_W} {_DEP_ART_H}" width="{_DEP_ART_W}" height="{_DEP_ART_H}" role="img"
+     aria-label="One device with a solid arrow to the internet and a dashed arrow to the resolver">
+  <defs><marker id="dep-a1" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7"
+    orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="{MUTED}"/></marker></defs>
+  <circle cx="44" cy="52" r="15" fill="{PANEL_2}" stroke="{ACCENT}" stroke-width="2.2"/>
+  <path d="M63 43 L228 24" stroke="{MUTED}" stroke-width="1.8" fill="none" marker-end="url(#dep-a1)"/>
+  <path d="M63 61 L228 80" stroke="{MUTED}" stroke-width="1.8" stroke-dasharray="7 5" fill="none"
+        marker-end="url(#dep-a1)"/>
+  <rect x="240" y="8" width="30" height="30" rx="5" fill="{PANEL_2}" stroke="{MUTED}" stroke-width="1.8"/>
+  <path d="M255 66 L272 83 L255 100 L238 83 z" fill="{PANEL_2}" stroke="{MUTED}" stroke-width="1.8"/>
+</svg>"""
+
+
+def _dep_sketch_dependents() -> str:
+    """Three devices leaning on one, which is what node size means on the map."""
+    dots = "".join(
+        f'<circle cx="34" cy="{y}" r="9" fill="{PANEL_2}" stroke="{MUTED}" stroke-width="1.7"/>'
+        f'<path d="M47 {y} L214 52" stroke="{MUTED}" stroke-width="1.8" fill="none" '
+        'marker-end="url(#dep-a2)"/>'
+        for y in (16, 52, 88)
+    )
+    return f"""
+<svg viewBox="0 0 {_DEP_ART_W} {_DEP_ART_H}" width="{_DEP_ART_W}" height="{_DEP_ART_H}" role="img"
+     aria-label="Three small devices with arrows into one much larger one">
+  <defs><marker id="dep-a2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7"
+    orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="{MUTED}"/></marker></defs>
+  {dots}
+  <circle cx="248" cy="52" r="26" fill="{PANEL_2}" stroke="{ACCENT}" stroke-width="2.4"/>
+  <text x="248" y="58" fill="{FG}" font-size="17" font-weight="650" text-anchor="middle"
+        font-family="{SANS}">C</text>
+</svg>"""
+
+
+def _dep_sketch_blast() -> str:
+    """One node failing, what it takes with it, and what carries on regardless."""
+    kept = "".join(
+        f'<circle cx="248" cy="{y}" r="9" fill="{PANEL_2}" stroke="{SEV_MEDIUM}" stroke-width="1.9"/>'
+        for y in (16, 52)
+    )
+    return f"""
+<svg viewBox="0 0 {_DEP_ART_W} {_DEP_ART_H}" width="{_DEP_ART_W}" height="{_DEP_ART_H}" role="img"
+     aria-label="One failed device, two devices it affects, and one that carries on unchanged">
+  <circle cx="46" cy="52" r="19" fill="{PANEL_2}" stroke="{SEV_CRITICAL}" stroke-width="2.4"
+          stroke-dasharray="5 4"/>
+  <path d="M38 44 L54 60 M54 44 L38 60" stroke="{SEV_CRITICAL}" stroke-width="2.4"/>
+  <path d="M70 45 L232 16 M70 52 L232 52" stroke="{SEV_MEDIUM}" stroke-width="1.8" fill="none"/>
+  <path d="M70 60 L232 88" stroke="{LINE}" stroke-width="1.8" fill="none"/>
+  {kept}
+  <circle cx="248" cy="88" r="9" fill="{PANEL_2}" stroke="{LINE}" stroke-width="1.7"/>
+</svg>"""
+
+
+#: The three questions the map answers, each with a sketch of the shape of its answer.
+_DEP_CARDS: tuple[tuple[str, str, str, str, str], ...] = (
+    ("Depends on", "What does this one need?",
+     "The gateway it reaches the internet through, the resolver it asks, the outside services it "
+     "keeps calling. Read off lookups that actually arrived and advertisements it actually made.",
+     _dep_sketch_depends(),
+     "a link is solid, dashed or dotted by how it was established"),
+    ("Depended on by", "What is leaning on it?",
+     "The map sizes a device by how much of the house is on the other end of that question. The "
+     "big circles are the load-bearing ones, and they are rarely the ones you were worried about.",
+     _dep_sketch_dependents(),
+     "bigger means more depends on it"),
+    ("If this fails", "What actually stops working?",
+     "One plain sentence: how many devices go dark, how many keep working but lose something, and "
+     "how many carry on unchanged &mdash; with the evidence for that answer underneath it.",
+     _dep_sketch_blast(),
+     "affected stays lit, unaffected dims"),
+)
+
+
+def dependency_why() -> str:
+    """The question the dependency map exists to answer — and the line it will not cross."""
+    css = f"""
+.dep {{ display: flex; flex-direction: column; }}
+.dep .head h1 {{ font-size: 31px; }}
+.dep-grid {{
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px;
+  margin-top: 26px; flex: 1 1 auto; min-height: 0;
+}}
+.dep-grid .card {{ display: flex; flex-direction: column; padding: 20px 22px; }}
+.dep-grid h3 {{ font-size: 20px; font-weight: 650; letter-spacing: -.012em; margin-top: 2px; }}
+.dep-grid p {{ font-size: 14.5px; color: {MUTED}; margin-top: 10px; line-height: 1.55; }}
+.dep-art {{
+  flex: 1 1 auto; min-height: 0; margin: 16px 0 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+}}
+/* The sketch is drawn at 300 units and shown at 380 px: one uniform scale-up of the whole
+   drawing, so the strokes stay in proportion and nothing is stretched on one axis. It fills
+   the space a 470 px card leaves under three lines of text without crowding the caption. */
+.dep-art svg {{ display: block; width: 380px; height: auto; }}
+.dep-art figcaption {{ font-size: 13.5px; color: {MUTED}; text-align: center; }}
+.dep-foot {{
+  margin-top: 24px; display: flex; align-items: center; gap: 18px;
+  border: 1px solid {LINE}; border-left: 3px solid {SEV_MEDIUM}; border-radius: 12px;
+  background: {PANEL}; padding: 16px 22px; font-size: 16px; color: {MUTED}; line-height: 1.5;
+}}
+.dep-foot b {{ color: {FG}; font-weight: 650; }}
+.dep-foot .warn {{ color: {SEV_MEDIUM}; font-weight: 650; white-space: nowrap; }}
+"""
+    cards = "".join(
+        f'<section class="card"><div class="eyebrow">{eyebrow}</div><h3>{heading}</h3>'
+        f'<p>{detail}</p><figure class="dep-art">{art}'
+        f"<figcaption>{caption}</figcaption></figure></section>"
+        for eyebrow, heading, detail, art, caption in _DEP_CARDS
+    )
+    body = f"""
+<div class="slide dep">
+  {_head("Dependency map", "If the router dies, what actually stops working?",
+         "You have an inventory, and you have a list of problems. Neither of them tells you what "
+         "the house loses when one box goes dark &mdash; or which box that would be.")}
+  <div class="dep-grid">{cards}</div>
+  <div class="dep-foot">
+    <span class="warn">{TRI} Not a traffic diagram.</span>
+    <span><b>Home SOC has no packet visibility.</b> Traffic between two devices on your network
+      never passes through it, so it cannot see one device talking to another &mdash; and it will
+      not draw an arrow saying that it did. Every link on the map is labelled with how it was
+      established, and no link exists without evidence.</span>
+  </div>
+</div>
+"""
+    return _document("Dependency map · the question", body, css)
+
+
+# --------------------------------------------------------------------------- 8. Lens: honest limits
+
+
 def lens_limits() -> str:
     """The honest-limits card that closes the Lens act."""
     css = f"""
@@ -1723,7 +1874,10 @@ def close() -> str:
 .close-cards .card {{ display: flex; flex-direction: column; }}
 .close-cards h2 {{ margin-bottom: 12px; }}
 .close-cards ul {{ list-style: none; padding: 0; }}
-.close-cards li {{ font-size: 15px; padding: 6px 0; color: {MUTED}; line-height: 1.45; }}
+/* 14.5/1.4 with 3 px of padding, not 15/1.45 with 6: the "Read next" card carries seven
+   documents since docs/TOPOLOGY.md joined it, and at the old pitch the list ran 49 px past
+   the grid row and drew itself straight through the footer line. Measured both ways. */
+.close-cards li {{ font-size: 14.5px; padding: 3px 0; color: {MUTED}; line-height: 1.4; }}
 .close-cards li b {{ color: {FG}; font-weight: 600; }}
 .close-cards .doc {{ font-family: {MONO}; font-size: 13.5px; color: {FG}; }}
 .card-foot {{
@@ -1746,6 +1900,10 @@ def close() -> str:
         ("docs/PLAYBOOKS.md", "what to do about each finding"),
         ("docs/GUIDE_HOME_PROTECTION.md", "securing a home network at all"),
         ("docs/NETWORK_DNS_SETUP.md", "the LAN DNS walkthrough, router by router"),
+        # The dependency map is the one feature whose honesty depends on the reader knowing
+        # what Home SOC cannot see. This document is where that is argued in full - including
+        # what would make the map dramatically better - so the closing card has to name it.
+        ("docs/TOPOLOGY.md", "why the map has no traffic in it, and what would"),
         # Act 3 is five minutes of Lens and ends by naming the certificate as a real trust
         # decision. This is the document that resolves it — including the Tailscale route —
         # and it was the one doc the closing card did not list.
@@ -1814,6 +1972,7 @@ SLIDES: dict[str, Callable[[], str]] = {
     "what_it_is": what_it_is,
     "architecture": architecture,
     "first_run": first_run,
+    "dependency_why": dependency_why,
     "daily_use": daily_use,
     "lens_why": lens_why,
     "lens_how": lens_how,
@@ -1825,6 +1984,9 @@ SLIDES: dict[str, Callable[[], str]] = {
 #: different hands; a near-miss on a slide name should not cost a whole capture run. The
 #: canonical names above are the ones :func:`slide_names` and :func:`write_all` use.
 ALIASES: dict[str, str] = {
+    "dep_map": "dependency_why",
+    "dependency_map": "dependency_why",
+    "map_why": "dependency_why",
     "lens_gap": "lens_why",
     "lens_problem": "lens_why",
     "lens_identify": "lens_how",

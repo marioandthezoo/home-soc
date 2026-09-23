@@ -170,6 +170,42 @@ SLIDE_DRIFT = 1.03
 #: anyway. It costs one resample per slide frame - about 8 ms - and nothing else in the
 #: render is anywhere near that price.
 
+#: The same treatment, but for a *page* or *phone* state the voice sits on without
+#: scrolling. The walkthrough is built out of held screenshots, so a scene where the
+#: narration explains one panel for twenty seconds is twenty seconds of bit-identical
+#: frames: `freezedetect` found 10.8 s, 9.4 s, 8.5 s and 7.6 s stretches in the previous
+#: cut, and the quality bar is 6 s.
+#:
+#: A slide's single push cannot be borrowed as-is. Its *rate* falls as the hold gets
+#: longer - 1.03 spread over 30 s moves the crop box 0.058 px per frame, over 20 s at
+#: 1.012 only 0.034 px, and at that speed most of a dark dashboard rounds to the same
+#: bytes two frames running and freezes anyway (measured: scene 12 still had an 8.5 s
+#: stretch with a whole-hold 1.012 push on it). So a held page drifts at a fixed *speed*
+#: instead, in and back out over a short cycle: the excursion stays under one per cent -
+#: invisible, and far too small to soften 2x-captured text - while every frame differs
+#: from the one before it.
+#: Crop-box speed, in page-layer pixels of width per second.
+IDLE_DRIFT_RATE = 2.5
+#: One in-and-out cycle takes this long, so the push half is half of it. Short enough that
+#: the excursion stays tiny at this speed, long enough that nothing reads as movement.
+IDLE_DRIFT_CYCLE = 9.0
+#: Holds shorter than this are left alone: a beat between scrolls does not need help, and
+#: skipping them keeps the resample off most frames.
+#:
+#: 4.0 was one tenth of a second too generous for the one state in the film whose narration
+#: claims motion: scene 18's `hit=True` shot - the real instant of recognition, green reticle,
+#: chip reading "identifying…" - is on screen for 3.83 s, so it fell through this test and
+#: `freezedetect` reported a 3.7 s bit-identical stretch under the words "Lens reads frames
+#: the whole time". Under CONTRACT_V2 V7's 6 s bar, and still the only dead frame in the Lens
+#: act. 2.5 catches it and anything else of that length; the ceiling is IDLE_DRIFT_CYCLE, and
+#: a 2.5 s cycle at IDLE_DRIFT_RATE is a 0.2 per cent excursion.
+IDLE_DRIFT_AFTER = 2.5
+#: A Zoom holds at full extent between its push and its pull-back, and that hold is as
+#: frozen as any other still - scene 07a's zoom onto the printer's provider node sat dead
+#: for 10.8 s. The hold keeps creeping at IDLE_DRIFT_RATE instead, capped at this fraction
+#: past the rect the Zoom asked for so a 1.6x push never becomes a 1.7x one.
+HOLD_CREEP_MAX = 0.06
+
 CURSOR_HEIGHT = 34.0
 HALO_RADIUS = 34
 #: the halo is centred on the arrow's body, not on its tip, so the whole
@@ -1528,7 +1564,19 @@ class PhoneStore:
         sx, sy, sw, sh = a["screen"]
         strip, dy, (y0, y1) = self._strip(swap)
         if dy <= 0:
-            return blend_frames(a["canvas"], self.canvas(swap.to), ease_in_out_cubic(progress))
+            # No captured strip between these two offsets, so this is a cut, not a glide. It
+            # used to dissolve across the whole PhoneScroll — 1.8 s on scene 19's travel past
+            # six findings — which put two complete card bodies on screen at 50/50 for about
+            # 0.8 s: "Problems" and "Exposed" superimposed on one baseline, the count pill
+            # reading a blend of 6 and 4, a LOW and a HIGH badge stacked at the same y. Text
+            # dissolved through text is unreadable, and it landed exactly under the sentence
+            # naming the section. Hold each end still and put the dissolve in the middle, at
+            # the same 400 ms the film uses between scenes — the same treatment the desktop
+            # non-overlapping scroll already gets through CUT_DISSOLVE_HOLD.
+            return blend_frames(
+                a["canvas"], self.canvas(swap.to),
+                ease_in_out_cubic(_cut_progress(swap, progress)),
+            )
         u = ease_in_out_cubic(progress)
         off = int(round(dy * u)) if swap.dy_css > 0 else int(round(dy * (1.0 - u)))
         window = strip[off : off + (y1 - y0)]
@@ -2272,23 +2320,62 @@ def build_plan(
         i for i, st in enumerate(states)
         if st.kind == "page" and not st.path.startswith("/lens")
     )
-    for i, st in enumerate(states[: len(plan.swaps) + 1] if SLIDE_DRIFT > 1.001 else []):
-        if st.kind != "slide":
-            continue
+    # A Zoom already owns its stretch of the scene; never drift under one.
+    busy = [(c.t0, c.t_out) for c in plan.cameras]
+
+    def _free(a: float, b: float) -> bool:
+        return not any(t0 < b and a < t1 for t0, t1 in busy)
+
+    for i, st in enumerate(states[: len(plan.swaps) + 1]):
+        slide = st.kind == "slide"
         start = plan.swaps[i - 1].t1 if i > 0 else 0.0
         if i < len(plan.swaps):
             hold_until, t_out = plan.swaps[i].t0, plan.swaps[i].t1
         else:
             hold_until = t_out = plan.duration
-        if hold_until - start < 0.5:
+        span = hold_until - start
+        if slide:
+            if SLIDE_DRIFT <= 1.001 or span < 0.5 or not _free(start, t_out):
+                continue
+            # The push runs the whole time the slide is up, so no frame of it is a repeat
+            # of the one before. hold_until == t1 means there is no settle phase to hold,
+            # and the drift is still at full extent when the scene dissolves away from it.
+            plan.cameras.append(
+                CameraEvt(start, hold_until, hold_until, t_out, _drift_rect(SLIDE_DRIFT),
+                          hires=False, linear=True)
+            )
             continue
-        # The push runs the whole time the slide is up, so no frame of it is a repeat of the
-        # one before. hold_until == t1 means there is no settle phase to hold, and the drift
-        # is still at full extent when the scene cross-dissolves away from it.
-        plan.cameras.append(
-            CameraEvt(start, hold_until, hold_until, t_out, _drift_rect(),
-                      hires=False, linear=True)
-        )
+        if IDLE_DRIFT_RATE <= 0.0 or span < IDLE_DRIFT_AFTER:
+            continue
+        # Burst states drift too. A `scan` burst moves the whole viewfinder and needs no
+        # help, but scene 18's `card` burst only animates the strip of viewfinder above
+        # the card - real captured motion, and still two thirds of a minute that
+        # freezedetect calls frozen because it is averaged over the whole frame. The
+        # drift is an order of magnitude smaller than the handheld motion (about 0.05
+        # against 1.0 mean absolute difference at 6 fps), so it never hides a burst that
+        # has stopped playing.
+        # Cut the free parts of the hold into equal in-and-out cycles of at most
+        # IDLE_DRIFT_CYCLE seconds, so the crop box moves at the same speed whether the
+        # voice sits here for five seconds or for forty, and comes back to rest at every
+        # cycle boundary and at the end of the hold - the scroll or dissolve that follows
+        # starts from an untouched frame. A Zoom that owns part of the hold keeps it; only
+        # what is left over drifts.
+        for lo, hi in _free_spans(start, hold_until, busy):
+            free = hi - lo
+            if free < IDLE_DRIFT_AFTER:
+                continue
+            cycles = max(1, int(math.ceil(free / IDLE_DRIFT_CYCLE)))
+            seg = free / cycles
+            scale = WIN_W / max(1.0, WIN_W - IDLE_DRIFT_RATE * (seg / 2.0))
+            if scale <= 1.0005:
+                continue
+            rect = _drift_rect(scale)
+            for k in range(cycles):
+                a = lo + k * seg
+                plan.cameras.append(
+                    CameraEvt(a, a + seg / 2.0, a + seg / 2.0, a + seg, rect,
+                              hires=False, linear=True)
+                )
     plan.cameras.sort(key=lambda c: c.t0)
     return plan
 
@@ -2353,9 +2440,28 @@ def _tap_point(
     return (x + w / 2.0, y + h / 2.0) if (w or h) else (x, y)
 
 
-def _drift_rect() -> tuple[float, float, float, float]:
-    w = WIN_W / SLIDE_DRIFT
-    h = WIN_H / SLIDE_DRIFT
+def _free_spans(
+    start: float, end: float, busy: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    """``[start, end]`` with every ``busy`` interval cut out of it, in order."""
+    spans = [(start, end)]
+    for b0, b1 in sorted(busy):
+        out: list[tuple[float, float]] = []
+        for a, b in spans:
+            if b1 <= a or b0 >= b:
+                out.append((a, b))
+                continue
+            if b0 > a:
+                out.append((a, b0))
+            if b1 < b:
+                out.append((b1, b))
+        spans = out
+    return [(a, b) for a, b in spans if b - a > 0.01]
+
+
+def _drift_rect(scale: float = SLIDE_DRIFT) -> tuple[float, float, float, float]:
+    w = WIN_W / scale
+    h = WIN_H / scale
     return ((WIN_W - w) / 2.0, (WIN_H - h) / 2.0, w, h)
 
 
@@ -2518,6 +2624,11 @@ def _camera_rect(
             u = raw if cam.linear else ease_in_out_cubic(raw)
         elif t <= cam.hold_until:
             u = 1.0
+            # `linear` drift events have t1 == hold_until, so this only ever runs for a
+            # real Zoom: keep inching in rather than sitting on one frame.
+            if IDLE_DRIFT_RATE > 0.0:
+                dw = abs(float(WIN_W) - float(target[2])) or float(WIN_W)
+                u += min(HOLD_CREEP_MAX, IDLE_DRIFT_RATE * max(0.0, t - cam.t1) / dw)
         else:
             u = 1.0 - ease_in_out_cubic(
                 (t - cam.hold_until) / max(1e-6, cam.t_out - cam.hold_until)
@@ -2565,6 +2676,20 @@ CUT_DISSOLVE_HOLD: Final[float] = 0.20
 #: the page). Both layouts are text, and text dissolved through text is unreadable, so the
 #: dissolve is squeezed into the middle 40% of the swap and each end is held still.
 FADE_DISSOLVE_HOLD: Final[float] = 0.30
+
+
+#: A phone state change with no captured strip between its two offsets is a cut. The blend
+#: itself takes this long, centred in the swap, and both ends are held still around it - the
+#: same 400 ms the film gives a scene-to-scene dissolve, rather than smearing two card bodies
+#: through each other for the whole of a 1.8 s scroll.
+CUT_DISSOLVE_SECONDS: Final[float] = DISSOLVE
+
+
+def _cut_progress(swap: Swap, progress: float) -> float:
+    """Remap a swap's 0..1 so the blend happens in a CUT_DISSOLVE_SECONDS window at its centre."""
+    span = max(1e-6, swap.t1 - swap.t0)
+    hold = max(0.0, min(0.45, (span - CUT_DISSOLVE_SECONDS) / (2.0 * span)))
+    return _compressed(progress, hold)
 
 
 def _compressed(prog: float, hold: float) -> float:
@@ -2829,6 +2954,24 @@ def _render_phone_frame(
         side = sp.alpha.shape[0]
         blit(canvas, sp, tx - side / 2, ty - side / 2)
         break
+
+    # The idle drift, applied here because this path never goes near the page layer: a
+    # phone frame is the finished canvas, so the crop box is the one _camera_rect worked
+    # out in page-layer pixels, rescaled to it. Taps move with the phone; the caption is
+    # drawn afterwards so it stays put and stays crisp. Without this, every Lens scene
+    # that holds a card under narration froze - 21.9 s in scene 19 alone.
+    cam = _camera_rect(plan, t)
+    if cam is not None:
+        rx, ry, rw, rh = cam[0]
+        h, w = canvas.shape[0], canvas.shape[1]
+        sx, sy = w / float(WIN_W), h / float(WIN_H)
+        canvas = np.array(
+            Image.fromarray(canvas).resize(
+                (w, h), Image.BILINEAR,
+                box=(rx * sx, ry * sy, (rx + rw) * sx, (ry + rh) * sy),
+            ),
+            dtype=np.uint8,
+        )
 
     _draw_caption(plan, canvas, cap, t, cover=False,
                   scale=1.0 - _slide_mix(plan, frm, to, prog, swap))
