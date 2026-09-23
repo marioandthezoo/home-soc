@@ -510,7 +510,11 @@ That drops a shortcut in your Startup folder — no administrator needed — whi
 `run.bat --autostart`. It runs after *you* log in, so the gap between power-on and DNS coming back
 is however long it takes you to type your password. `-Mode task` registers a Scheduled Task instead
 (needs an elevated PowerShell to register; the task itself runs with normal rights) and is only
-marginally earlier.
+marginally earlier. `-Mode task -Elevated` (the task runs as administrator) is opt-in and is refused
+unless the Home SOC folder, the base Python folder named in `.venv\pyvenv.cfg` and all their parent
+folders are writable by administrators alone, so a per-user python.org install (under
+`%LOCALAPPDATA%\Programs\Python`) always fails it; install Python for all users first. Add
+`-CheckOnly` to see the checks and the command without registering anything.
 
 ### The secondary-DNS trap
 

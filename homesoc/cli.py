@@ -9,6 +9,7 @@ packages are developed in parallel: a missing scanner must degrade to a logged
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import json
 import logging
@@ -460,14 +461,18 @@ def soc_health_drafts(cfg: Config, conn: sqlite3.Connection, scheduler: Schedule
     if cfg.scan.use_nmap and util.which("nmap") is None:
         # The only emitter of SOC-SYS-001 (ports.run just logs), so one source owns the row.
         drafts.append(FindingDraft("SOC-SYS-001", "host", {"hint": "install nmap or set scan.use_nmap=false", "method": "python"}))
-    if cfg.web.exposed and not cfg.web.token:
-        drafts.append(FindingDraft("SOC-SYS-003", "host", {"host": cfg.web.host, "port": cfg.web.port}))
+    # Where the dashboard really listens, not what config.toml says: `serve --host 0.0.0.0` in
+    # one terminal and `scan` in another must not clear the finding the server just earned.
+    bound_host, bound_port = recorded_bind(conn, cfg)
+    web = dataclasses.replace(cfg.web, host=bound_host, port=bound_port)
+    if web.exposed and not web.token:
+        drafts.append(FindingDraft("SOC-SYS-003", "host", {"host": web.host, "port": web.port}))
     # SPEC addendum B10: Lens on the LAN without TLS. This complements SOC-SYS-003 rather
     # than repeating it — that one is about there being no password, this one about the
     # whole conversation (and the paired-phone token) crossing the Wi-Fi in clear text.
-    if cfg.lens.insecure_on_lan(cfg.web, tls=tls_last_used(conn)):
+    if cfg.lens.insecure_on_lan(web, tls=tls_last_used(conn)):
         drafts.append(FindingDraft("SOC-LENS-001", "host", {
-            "host": cfg.web.host, "port": cfg.web.port, "tls": False,
+            "host": web.host, "port": web.port, "tls": False,
             # Recorded because it decides which half of the finding's description applies:
             # true means Lens refuses to serve phones at all, false means it serves them in clear.
             "require_https": bool(cfg.lens.require_https),
@@ -714,16 +719,22 @@ def send_digest(cfg: Config, conn: sqlite3.Connection) -> None:
     counts = counts_fn(conn) if counts_fn else fallback_counts(conn)
     open_counts = counts.get("open", {}) if isinstance(counts, dict) else {}
     top = list_findings_safe(conn, status="open", limit=5)
-    lines = ["Open findings: " + ", ".join(f"{s} {open_counts.get(s, 0)}" for s in SEVERITIES)]
-    for f in top:
-        lines.append(f"- [{f.get('severity')}] {f.get('title') or f.get('finding_id')} ({f.get('subject')})")
     score = _lazy("security_score")
     subject = f"{cfg.general.name} daily digest"
     if score is not None:
         subject += f" — score {score(conn)}"
     try:
         channels = importlib.import_module("homesoc.notify.channels")
-        channels.send(cfg, conn, subject, "\n".join(lines), severity="info")
+        # Titles and subjects carry LAN-chosen text (hostnames, banners, UPnP descriptions), and
+        # rows stored before the catalog flattened them still hold CR/LF, U+2028 and bidi
+        # controls. The finding lines come from the notify package's own formatter, the one place
+        # that sanitises them, never from a hand-built f-string here: a raw newline forged a
+        # "[CRITICAL] ..." line in Discord, ntfy and the webhook. `findings` gives the webhook
+        # the slimmed (also sanitised) list.
+        body = "Open findings: " + ", ".join(f"{s} {open_counts.get(s, 0)}" for s in SEVERITIES)
+        if top:
+            body += "\n" + channels.format_findings_body(top)
+        channels.send(cfg, conn, subject, body, severity="info", findings=top)
     except Exception:
         logger.exception("digest could not be sent")
 
@@ -988,6 +999,101 @@ def make_dashboard_server(app: Any, host: str, port: int, *, ssl_context: Any = 
     return server
 
 
+#: Overrides an intruder on an open dashboard would plant (Settings page): where the house's DNS
+#: goes, which blocklists apply, where alerts go, who is scanned, and the dashboard's own
+#: bind and credential. Finding one when the policy has to generate a token means the
+#: dashboard may already have been used by someone else.
+TAMPER_SIGNAL_KEYS: tuple[str, ...] = (
+    "web.", "notify.", "dns.upstreams", "dns.doh_upstream", "dns.lists", "dns.listen", "dns.enabled",
+    "network.exclude",
+)
+
+
+def _tamper_signals(cfg: Config, conn: sqlite3.Connection) -> list[str]:
+    """Reasons to believe an exposed, token-less dashboard was already used by someone else."""
+    reasons: list[str] = []
+    try:
+        previous = str(db.get_setting(conn, BIND_SETTING, "") or "")
+    except sqlite3.Error:
+        previous = ""
+    if previous and ":" in previous and not config.is_loopback_host(previous.rpartition(":")[0]):
+        reasons.append(f"it was last started listening on {previous}")
+    try:
+        paired = len(db.lens_active_tokens(conn))
+    except sqlite3.Error:
+        paired = 0
+    if paired:
+        reasons.append(f"{paired} Lens phone token(s) are active")
+    try:
+        stored = config.overrides(conn)
+    except sqlite3.Error:
+        stored = {}
+    planted = sorted(k for k in stored if k.startswith(TAMPER_SIGNAL_KEYS))
+    if planted:
+        reasons.append("Settings-page overrides exist for " + ", ".join(planted))
+    return reasons
+
+
+def enforce_bind_policy(cfg: Config, conn: sqlite3.Connection, host: str | None = None) -> Config | None:
+    """The LAN exposure policy, applied before anything is built from ``cfg``.
+
+    Loopback: ``cfg`` unchanged, whatever the token (only this machine can connect).
+    Exposed with no token: a random token is generated, stored as the ``web.token`` override so
+    it survives restarts (the database is owner-only), and the returned Config carries it, so
+    the scheduler, SOC health and the dashboard all see the same credential. There is no "no
+    token on the LAN" setting: the documented alternative is loopback plus Tailscale Serve.
+    Exposed with a short token: None after saying exactly what to change (callers exit
+    EXIT_USAGE), because a hand-picked PIN falls to the rate-limited guesser within a day.
+    """
+    bind = host if host is not None else cfg.web.host
+    web = dataclasses.replace(cfg.web, host=bind)
+    problem = config.lan_bind_problem(web)
+    if problem is None:
+        return cfg
+    if problem == "weak-token":
+        emit(f"Refusing to listen on {bind or 'every interface'}: web.token is only {len(web.token)} characters, "
+             "and anyone on the network could guess it.")
+        emit(f"Use a random token of at least {config.MIN_TOKEN_LENGTH} characters, for example the output of")
+        emit('  python -c "import secrets; print(secrets.token_urlsafe(24))"')
+        emit(f"in [web] token of {paths.config_path()}, then remove any Settings-page value with")
+        emit("  python -m homesoc config unset web.token")
+        emit("Or remove web.token from both places and Home SOC generates a strong one itself, or keep the")
+        emit("dashboard on 127.0.0.1 (see docs/LENS_SETUP.md for the Tailscale route).")
+        logger.error("refused to bind the dashboard to %s: web.token is shorter than %d characters",
+                     bind, config.MIN_TOKEN_LENGTH)
+        return None
+    # problem == "no-token"
+    reasons = _tamper_signals(cfg, conn)
+    token = secrets.token_urlsafe(32)
+    try:
+        config.set_override(conn, "web.token", token)
+        stored = True
+    except (sqlite3.Error, ValueError):
+        logger.exception("could not store the generated web.token; it lasts until this process stops")
+        stored = False
+    emit(f"This dashboard is reachable from your network ({bind or 'every interface'}) and had no web.token,")
+    emit("so Home SOC generated one" + (" and saved it in its database." if stored else " for this run only."))
+    emit("Every device, this one included, now needs it: use the Dashboard link printed below once and")
+    emit("the browser remembers it. To choose your own token instead, set [web] token (16+ characters)")
+    emit(f"in {paths.config_path()} and run: python -m homesoc config unset web.token")
+    if reasons:
+        emit("")
+        emit("WARNING: this dashboard may already have been open to the network without a password:")
+        for reason in reasons:
+            emit(f"  - {reason}")
+        emit("Anyone on the network could have changed settings or paired a phone. Review and clean up:")
+        emit("  python -m homesoc lens revoke --all")
+        emit("  python -m homesoc config overrides      (then: config unset <key> for anything you did not set)")
+    logger.warning("dashboard exposed on %s without web.token: generated one%s", bind,
+                   " (possible prior use by others: " + "; ".join(reasons) + ")" if reasons else "")
+    try:
+        db.record_event(conn, "warning", "cli", "generated web.token for a LAN-facing dashboard",
+                        {"host": bind, "stored": stored, "signals": reasons})
+    except sqlite3.Error:
+        pass
+    return config.with_overrides(cfg, {"web.token": token})
+
+
 def _serve_forever(rt: Runtime, host: str, port: int, *, tls: bool = False) -> int:
     create_app = _lazy("create_app")
     if create_app is None:
@@ -1006,11 +1112,20 @@ def _serve_forever(rt: Runtime, host: str, port: int, *, tls: bool = False) -> i
         emit(f"Certificate: {cert}")
         emit(f"  SHA-256 fingerprint: {fingerprint or 'unavailable'}")
         emit("  Self-signed: the phone warns once, then remembers. Check the fingerprint matches.")
+    # Last line of the LAN exposure policy: whatever the caller did (or forgot), nothing listens
+    # beyond loopback without a strong token. cmd_serve/cmd_run have already run
+    # enforce_bind_policy, so reaching this means a new caller skipped it.
+    problem = config.lan_bind_problem(dataclasses.replace(rt.cfg.web, host=host))
+    if problem is not None:
+        emit(f"Refusing to start the dashboard on {host or 'every interface'}: "
+             + ("web.token is empty" if problem == "no-token" else "web.token is too short")
+             + ", so anyone on the network could use it. Set a random token of at least "
+             f"{config.MIN_TOKEN_LENGTH} characters, or listen on 127.0.0.1.")
+        logger.error("refused to bind the dashboard to %s (%s)", host, problem)
+        return EXIT_USAGE
     record_tls_state(rt.conn, tls)
     record_bind_state(rt.conn, host, port)
     app = create_app(rt.cfg, rt.conn, scheduler=rt.scheduler, dns_server=rt.dns_server)
-    if rt.cfg.web.exposed and not rt.cfg.web.token:
-        logger.warning("dashboard bound to %s without web.token - anyone on the LAN can use it", host)
     emit(f"Dashboard: {dashboard_url(rt.cfg, host, port, tls=tls)}  (Ctrl-C to stop)")
     try:
         server = make_dashboard_server(app, host, port, ssl_context=ssl_context)
@@ -1299,6 +1414,11 @@ def cmd_serve(ctx: Context) -> int:
     if ctx.args.port:
         overrides["web.port"] = ctx.args.port
     cfg = config.with_overrides(ctx.cfg, overrides) if overrides else ctx.cfg
+    # Before Runtime: the scheduler, SOC health and create_app must all see the final token.
+    checked = enforce_bind_policy(cfg, ctx.conn)
+    if checked is None:
+        return EXIT_USAGE
+    cfg = checked
     rt = Runtime(cfg, ctx.conn)
     # SPEC-GAP: "dashboard only" still needs a worker behind the Run buttons, so the scheduler
     # starts with every job manual-only (no timetable: nothing runs unless asked for).
@@ -1333,12 +1453,17 @@ def cmd_dns(ctx: Context) -> int:
 
 
 def cmd_run(ctx: Context) -> int:
-    rt = Runtime(ctx.cfg, ctx.conn)
+    # Before Runtime: the scheduler, SOC health and create_app must all see the final token.
+    cfg = enforce_bind_policy(ctx.cfg, ctx.conn)
+    if cfg is None:
+        return EXIT_USAGE
+    ctx.cfg = cfg
+    rt = Runtime(cfg, ctx.conn)
     _install_signal_handlers()
     db.record_event(ctx.conn, "info", "cli", "Home SOC started", {"version": __version__, "platform": util.platform_name()})
     rt.start()
     try:
-        return _serve_forever(rt, ctx.cfg.web.host, ctx.cfg.web.port,
+        return _serve_forever(rt, cfg.web.host, cfg.web.port,
                               tls=bool(getattr(ctx.args, "tls", False)))
     except KeyboardInterrupt:
         return EXIT_OK
@@ -2110,7 +2235,7 @@ __all__ = [
     "WILDCARD_HOSTS", "TLS_SETTING", "BIND_SETTING", "recorded_bind", "lens_hosts", "lens_display_host",
     "ensure_lens_cert",
     "lens_cert_fingerprint", "lens_pair_url", "qr_ascii", "record_tls_state", "tls_last_used",
-    "record_bind_state",
+    "record_bind_state", "enforce_bind_policy", "TAMPER_SIGNAL_KEYS",
     "cmd_lens", "cmd_lens_pair", "cmd_lens_tokens", "cmd_lens_revoke", "cmd_lens_cert",
     "Runtime", "Context", "build_parser", "main",
 ]

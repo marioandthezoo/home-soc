@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 from xml.sax.saxutils import escape as _xml_escape
 
+from homesoc.util import INVISIBLE_TEXT, UNSAFE_TEXT
+
 logger = logging.getLogger(__name__)
 
 SEVERITY_RANK: dict[str, int] = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
@@ -31,13 +33,30 @@ DISCORD_COLOR: dict[str, int] = {
 TOAST_APP_ID = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe"
 HTTP_TIMEOUT = 10
 TOAST_TIMEOUT = 20
-MAX_BODY_CHARS = 3500          # Discord embed description limit is 4096; keep headroom
+HTTP_WALL_CLOCK = 30
+HTTP_MAX_ERROR_BODY = 4096
+# Size budgets are in the unit each service actually counts, never in Python characters: a device
+# chooses the text, and a 4-byte emoji is one character but four bytes. ntfy rejects (or turns into
+# an "attachment.txt") any message over its 4096-byte limit; Discord caps an embed description at
+# 4096 characters as counted by JavaScript, i.e. UTF-16 code units. Both leave headroom.
+NTFY_MAX_BODY_BYTES = 3900
+DISCORD_MAX_DESCRIPTION_UNITS = 4000
+# The finding lines of one message share the ntfy budget minus this reserve (the digest header, the
+# "... and N more" line, newlines). Each line gets an equal share in UTF-8 bytes (at least 370 with
+# ten lines), so a few device-chosen titles full of emoji can neither push the rest of the batch
+# out of the message nor, together, exceed the limit; a single finding keeps nearly the whole budget.
+BODY_RESERVE_BYTES = 200
 MAX_TOAST_CHARS = 200
 MAX_LISTED_FINDINGS = 10
 # Finding titles and subjects carry LAN-controlled text (hostnames, banners, the description a device
 # gives its UPnP port mapping). A CR/LF in it would forge an extra "[CRITICAL] ..." line in the alert,
 # so each is flattened to one line here even for rows stored before the catalog started doing so.
-_UNSAFE_TEXT = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
+# Replaced by a space: C0/C1 controls, U+2028/2029, lone surrogates and the whole Unicode
+# Bidi_Control set (including U+061C). Removed outright: every other Default_Ignorable_Code_Point.
+# Both classes live in homesoc.util (safe_one_line) so device_text, these channels and the
+# topology labels strip exactly the same set.
+_UNSAFE_TEXT = UNSAFE_TEXT
+_INVISIBLE_TEXT = INVISIBLE_TEXT
 # Discord renders embed descriptions as Markdown: masked links [text](url), autolinks, <url>,
 # mentions, spoilers. Every such metacharacter is backslash-escaped (Discord drops the backslash and
 # shows the character) so device-chosen text can never become a disguised or clickable link.
@@ -97,9 +116,29 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _truncate_encoded(text: str, limit: int, encoding: str) -> str:
+    """``text`` cut so its ``encoding`` form is at most ``limit`` bytes, on a code-point boundary.
+
+    ``utf-8`` budgets ntfy's byte limit; ``utf-16-le`` (2 bytes per unit) budgets JavaScript's
+    string length, which is what Discord counts. The ellipsis marking the cut is included.
+    """
+    raw = text.encode(encoding, "replace")
+    if len(raw) <= limit:
+        return text
+    tail = "…".encode(encoding)
+    cut = max(0, limit - len(tail))
+    if encoding.startswith("utf-16"):
+        cut -= cut % 2
+    # "ignore" drops a code point split by the cut (a partial UTF-8 sequence, or the high half of
+    # a UTF-16 surrogate pair) instead of producing mojibake.
+    return raw[:cut].decode(encoding, "ignore") + "…"
+
+
 def _one_line(value: Any, limit: int = MAX_LINE_CHARS) -> str:
-    """One printable line: control, line-separator and bidi characters become spaces."""
-    return _truncate(_UNSAFE_TEXT.sub(" ", str(value)), limit)
+    """One printable line: control, line-separator and bidi characters become spaces, and
+    invisible (default-ignorable) characters are removed."""
+    flat = _INVISIBLE_TEXT.sub("", _UNSAFE_TEXT.sub(" ", str(value)))
+    return _truncate(flat, limit)
 
 
 def escape_discord_markdown(text: str) -> str:
@@ -109,10 +148,13 @@ def escape_discord_markdown(text: str) -> str:
 # --- payload builders (pure) ----------------------------------------------------------------------
 def format_findings_body(findings: list[dict]) -> str:
     lines = []
-    for f in findings[:MAX_LISTED_FINDINGS]:
+    listed = findings[:MAX_LISTED_FINDINGS]
+    line_budget = (NTFY_MAX_BODY_BYTES - BODY_RESERVE_BYTES) // max(1, len(listed))
+    for f in listed:
         severity = _one_line(f.get("severity", "info"), 20).upper()
         title = _one_line(f.get("title", f.get("finding_id", "?")))
-        lines.append(f"[{severity}] {title}  ({_one_line(f.get('subject', ''), 200)})")
+        line = f"[{severity}] {title}  ({_one_line(f.get('subject', ''), 200)})"
+        lines.append(_truncate_encoded(line, line_budget, "utf-8"))
     if len(findings) > MAX_LISTED_FINDINGS:
         lines.append(f"... and {len(findings) - MAX_LISTED_FINDINGS} more")
     return "\n".join(lines)
@@ -131,7 +173,7 @@ def build_ntfy(subject: str, body: str, severity: str) -> dict:
     sev = str(severity).lower()
     tags = {"critical": "rotating_light", "high": "warning", "medium": "mag", "low": "information_source"}.get(sev, "shield")
     return {
-        "data": _truncate(body, MAX_BODY_CHARS).encode("utf-8"),
+        "data": _truncate_encoded(body, NTFY_MAX_BODY_BYTES, "utf-8").encode("utf-8", "replace"),
         "headers": {
             "Title": _truncate(subject.encode("ascii", "replace").decode("ascii"), 250),
             "Priority": str(NTFY_PRIORITY.get(sev, 3)),
@@ -147,7 +189,9 @@ def build_discord(subject: str, body: str, severity: str, findings: list[dict] |
         "embeds": [
             {
                 "title": _truncate(f"{sev.upper()} - {len(findings or [])} finding(s)" if findings else sev.upper(), 250),
-                "description": _truncate(escape_discord_markdown(body), MAX_BODY_CHARS),
+                "description": _truncate_encoded(
+                    escape_discord_markdown(body), 2 * DISCORD_MAX_DESCRIPTION_UNITS, "utf-16-le",
+                ),
                 "color": DISCORD_COLOR.get(sev, DISCORD_COLOR["info"]),
             }
         ],
@@ -225,15 +269,36 @@ def _default_poster(url: str, *, json: Any = None, data: Any = None, headers: di
         import requests
     except ImportError:  # pragma: no cover
         return False, "requests not installed"
+    from homesoc.feeds.netguard import Watch
+
+    # requests' timeout is per recv, so a server that drips its reply a byte at a time would hold
+    # the scheduler thread; the watch shuts the connection down after HTTP_WALL_CLOCK seconds.
+    # Only the first HTTP_MAX_ERROR_BODY bytes of an error reply are read, never the whole body.
     try:
-        resp = requests.post(url, json=json, data=data, headers=headers, timeout=HTTP_TIMEOUT)
-    except requests.RequestException as exc:
+        with Watch(lambda: HTTP_WALL_CLOCK, "notification"):
+            resp = requests.post(url, json=json, data=data, headers=headers, timeout=HTTP_TIMEOUT, stream=True)
+            try:
+                if 200 <= resp.status_code < 300:
+                    return True, None
+                text = _read_error_body(resp)
+            finally:
+                close = getattr(resp, "close", None)
+                if callable(close):
+                    close()
+    except (requests.RequestException, OSError) as exc:
         # Never str(exc): requests embeds the full URL (Discord token, ntfy secret topic) in
         # connection errors, and this string ends up in homesoc.log and the notifications table.
         return False, f"{type(exc).__name__} talking to {_safe_host(url)}"
-    if 200 <= resp.status_code < 300:
-        return True, None
-    return False, f"HTTP {resp.status_code}: {_scrub(resp.text[:200], url)}"
+    return False, f"HTTP {resp.status_code}: {_scrub(text[:200], url)}"
+
+
+def _read_error_body(resp: Any) -> str:
+    """At most HTTP_MAX_ERROR_BODY bytes of a streamed error reply, decoded leniently."""
+    raw = getattr(resp, "raw", None)
+    if raw is None or not callable(getattr(raw, "read", None)):
+        return str(getattr(resp, "text", "") or "")[:HTTP_MAX_ERROR_BODY]
+    data = raw.read(HTTP_MAX_ERROR_BODY, decode_content=True) or b""
+    return data.decode(getattr(resp, "encoding", None) or "utf-8", "replace")
 
 
 def _safe_host(url: str) -> str:

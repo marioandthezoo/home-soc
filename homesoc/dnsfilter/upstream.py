@@ -52,6 +52,12 @@ DOH_BOOTSTRAP_TTL = 24 * 3600.0
 # After a reply that matches the question but not the 0x20 case pattern, wait this long for a
 # correctly-cased one before concluding that the upstream normalises case (see _query_udp).
 CASE_MATCH_GRACE = 0.2
+# Such an upstream is then asked without 0x20 only for a while, never for the life of the process: one
+# wrong-case reply may be a spoof or a middlebox hiccup, and a permanent exclusion would let a single
+# forged packet switch the hardening off until restart. The first exclusion is short; each further
+# soft reply on a re-probe doubles it (up to CASE_EXCLUDE_MAX), and one exact-case reply clears it.
+CASE_EXCLUDE_FIRST = 60.0
+CASE_EXCLUDE_MAX = 3600.0
 
 _rand = random.SystemRandom()  # os.urandom-backed: the 0x20 pattern must not be predictable
 
@@ -201,9 +207,11 @@ class Upstream:
         self._doh_ip: str | None = None
         self._doh_ip_at = 0.0
         self._doh_mounted: set[str] = set()
-        # Upstreams (or middleboxes) observed to lowercase the question: 0x20 is skipped for those,
-        # otherwise every query to them would pay the CASE_MATCH_GRACE wait.
-        self._case_normalizing: set[str] = set()
+        # Upstreams (or middleboxes) observed to lowercase the question: 0x20 is skipped for those until
+        # the exclusion expires, otherwise every query to them would pay the CASE_MATCH_GRACE wait.
+        # label -> monotonic time the exclusion ends; _case_strikes: label -> consecutive soft replies.
+        self._case_normalizing: dict[str, float] = {}
+        self._case_strikes: dict[str, int] = {}
 
     # ---- public ---------------------------------------------------------------------------
     @property
@@ -339,7 +347,7 @@ class Upstream:
         ``strict_case`` says whether *we* scrambled the name — the client's own capitalisation must
         never switch strict matching on, or a client that already does 0x20 would pay the grace wait.
         """
-        if not self.randomize_query_case or not request.questions or addr.label in self._case_normalizing:
+        if not self.randomize_query_case or not request.questions or self._case_excluded(addr.label):
             return request, plain_wire, False
         try:
             probe = DNSRecord.parse(plain_wire)
@@ -347,6 +355,33 @@ class Upstream:
             return probe, probe.pack(), True
         except (DNSError, ValueError, IndexError):  # pragma: no cover - a request we built ourselves
             return request, plain_wire, False
+
+    def _case_excluded(self, label: str, now: float | None = None) -> bool:
+        """True while ``label`` is excluded from 0x20; an expired exclusion means the next query
+        re-probes with a scrambled name (its strike count is kept until an exact-case reply)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            until = self._case_normalizing.get(label)
+            if until is None:
+                return False
+            if now < until:
+                return True
+            del self._case_normalizing[label]
+            return False
+
+    def _note_case_soft(self, label: str, now: float | None = None) -> float:
+        """A reply matched the question but not our case pattern, and no exact one followed."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            strikes = self._case_strikes.get(label, 0) + 1
+            self._case_strikes[label] = strikes
+            hold = min(CASE_EXCLUDE_MAX, CASE_EXCLUDE_FIRST * (2 ** min(strikes - 1, 16)))
+            self._case_normalizing[label] = now + hold
+        return hold
+
+    def _note_case_exact(self, label: str) -> None:
+        with self._lock:
+            self._case_strikes.pop(label, None)
 
     # ---- transports -----------------------------------------------------------------------
     def _query_udp_then_tcp(
@@ -376,9 +411,10 @@ class Upstream:
                 if remaining <= 0:
                     if soft is not None:
                         # Only reachable when no correctly-cased answer ever arrived: the upstream (or a
-                        # middlebox) lowercases questions. Accept it and stop paying the grace wait.
-                        self._case_normalizing.add(addr.label)
-                        logger.debug("%s normalises question case; disabling 0x20 for it", addr.label)
+                        # middlebox) lowercases questions — or one reply was forged. Accept it and stop
+                        # paying the grace wait for a while; the exclusion expires and is re-probed.
+                        hold = self._note_case_soft(addr.label)
+                        logger.debug("%s normalised question case; 0x20 off for it for %d s", addr.label, hold)
                         return soft
                     raise socket.timeout("udp timeout")
                 sock.settimeout(remaining)
@@ -396,7 +432,10 @@ class Upstream:
                     continue
                 if not same_question(request, reply):
                     continue
-                if not strict_case or same_question_exact(request, reply):
+                if not strict_case:
+                    return reply
+                if same_question_exact(request, reply):
+                    self._note_case_exact(addr.label)
                     return reply
                 if soft is None:
                     soft = reply
@@ -531,8 +570,10 @@ class Upstream:
                 self.health.failing_since = time.monotonic()
 
     def status(self) -> dict:
+        now = time.monotonic()
         with self._lock:
             h = self.health
+            excluded = {label: until for label, until in self._case_normalizing.items() if until > now}
             return {
                 "ok": h.ok,
                 "consecutive_failures": h.consecutive_failures,
@@ -543,7 +584,8 @@ class Upstream:
                 "breaker_rejections": self.breaker_rejections,
                 "canary_runs": self.canary_runs,
                 "case_randomized": self.randomize_query_case,
-                "case_normalizing": sorted(self._case_normalizing),
+                "case_normalizing": sorted(excluded),
+                "case_exclusion_seconds_left": {label: int(until - now) for label, until in sorted(excluded.items())},
             }
 
 

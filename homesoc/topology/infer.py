@@ -24,6 +24,7 @@ Register one with :func:`register_source`.
 
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import json
 import logging
@@ -41,15 +42,15 @@ from homesoc.topology.graph import (
     Edge,
     Node,
 )
-from homesoc.util import iso_ago
+from homesoc.util import iso_ago, safe_one_line
 
 logger = logging.getLogger(__name__)
 
-#: Control characters are stripped from every name before it is put in a label, a headline or
-#: a log line. Nicknames are owner-supplied and reach a terminal table and a JSON payload; HTML
-#: escaping belongs to the web layer (double-escaping here would corrupt what it renders), but
-#: a CR/LF in a nickname could forge a row in the CLI's output, so those go.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+#: Every name goes through util.safe_one_line before it is put in a label, a headline or a log
+#: line: control, line-separator and bidi characters (RLO, LRI, U+061C, U+2028...) become a space
+#: and invisible characters are removed. Nicknames are owner-supplied and legacy hostname rows
+#: predate ingestion-time sanitising; both reach a terminal table, notifications and a JSON
+#: payload. HTML escaping belongs to the web layer (double-escaping here would corrupt it).
 MAX_LABEL = 48
 
 #: How many cloud endpoints one device may contribute to the map. The map has to stay readable
@@ -70,7 +71,7 @@ MIN_CONSUMER_RATIO = 0.75
 
 
 def clean_text(value: Any, limit: int = MAX_LABEL) -> str:
-    return _CONTROL_CHARS.sub("", str(value or "")).strip()[:limit].strip()
+    return safe_one_line(value or "").strip()[:limit].strip()
 
 
 def display_name(row: Mapping[str, Any] | sqlite3.Row) -> str:
@@ -95,13 +96,27 @@ _TWO_LEVEL_SUFFIXES: frozenset[str] = frozenset({
 })
 
 
+#: What a DNS name may contain before it is treated as one: letters, digits, hyphen, underscore
+#: (``_dmarc``, ``_tcp``) and dots — after IDNA, so every real name fits. 253 is the DNS limit.
+_DOMAIN_CHARS = re.compile(r"[a-z0-9_.-]+")
+MAX_DOMAIN = 253
+
+
 def registrable_domain(name: str) -> str:
     """``www.eu.example.co.uk`` -> ``example.co.uk``; best effort, no public-suffix list.
 
     A local copy rather than an import from the DNS filter: the topology package must keep
     working with ``dnsfilter`` absent, and the cross-package import rules do not allow it.
     """
-    labels = [p for p in str(name or "").strip().strip(".").lower().split(".") if p]
+    text = str(name or "").strip().strip(".").lower()
+    if len(text) > MAX_DOMAIN or not _DOMAIN_CHARS.fullmatch(text):
+        # Not a hostname. The resolver logs whatever arrived in the question section, escaped
+        # the way dnslib prints it ("\032", "<", "](") — and the qname is chosen by whoever
+        # sent the packet, whose source address anyone on a flat LAN can forge. Such a name must
+        # not become a cloud node, a map label or a finding's evidence under a household
+        # device's name, so it is not a domain at all. IDNs arrive as their xn-- ASCII form.
+        return ""
+    labels = [p for p in text.split(".") if p]
     if len(labels) <= 2:
         return ".".join(labels)
     if ".".join(labels[-2:]) in _TWO_LEVEL_SUFFIXES and len(labels) >= 3:
@@ -397,6 +412,10 @@ class AddressOwners:
     spans: Mapping[str, Sequence[tuple[str, str, int]]]
     #: address -> device that holds it now; the answer when no sighting covers the address
     current: Mapping[str, int]
+    #: address -> (runs overlap?, ascending first-sighting stamps). Filled on first use, so an
+    #: address that many identities have held costs one pass rather than one per query row —
+    #: the per-row rescan was O(rows x holders), and MAC churn on one address controls both.
+    _index: dict[str, tuple[bool, list[str]]] = field(default_factory=dict, repr=False, compare=False)
 
     def owner_at(self, address: str, ts: str) -> int | None:
         runs = self.spans.get(address)
@@ -404,17 +423,22 @@ class AddressOwners:
             return self.current.get(address)
         if len(runs) == 1:
             return runs[0][2]
-        if _overlapping(runs):
+        cached = self._index.get(address)
+        if cached is None:
+            cached = (_overlapping(runs), [run[0] for run in runs])
+            self._index[address] = cached
+        overlapping, starts = cached
+        if overlapping:
             # Two devices answered on this address in interleaved sweeps. Which one made a given
             # query cannot be recovered, so nothing is claimed for it.
             return None
         # Sequential leases: each holder owns the address from its first sighting until the next
         # holder's first sighting, so a query in the gap after a device stopped answering still
         # belongs to it rather than to nobody.
-        for index in range(len(runs) - 1, -1, -1):
-            if runs[index][0] <= ts:
-                return runs[index][2]
-        return None  # earlier than every sighting, and more than one device has held it
+        position = bisect.bisect_right(starts, ts)
+        if position == 0:
+            return None  # earlier than every sighting, and more than one device has held it
+        return runs[position - 1][2]
 
     def holders(self, address: str) -> set[int]:
         return {device_id for _f, _t, device_id in self.spans.get(address, ())}
@@ -919,9 +943,15 @@ def _support_nodes(conn: sqlite3.Connection, ctx: InferenceContext, edges: list[
             device_id, 0, None, True,
         ))
 
-    for domain in sorted({e.dst[len("cloud:"):] for e in edges if e.dst.startswith("cloud:")}):
+    # Edge types arriving at each cloud node, gathered once: scanning every edge for every cloud
+    # domain was O(cloud nodes x edges), both of which grow with the identities a LAN device mints.
+    cloud_types: dict[str, set[str]] = {}
+    for edge in edges:
+        if edge.dst.startswith("cloud:"):
+            cloud_types.setdefault(edge.dst, set()).add(edge.edge_type)
+    for domain in sorted(node[len("cloud:"):] for node in cloud_types):
         node_id = f"cloud:{domain}"
-        blocked = all(e.edge_type == "cloud_blocked" for e in edges if e.dst == node_id)
+        blocked = cloud_types[node_id] == {"cloud_blocked"}
         nodes.append(Node(
             node_id, "cloud", cloud_label(domain),
             f"{domain} — blocked by the DNS filter" if blocked else domain,

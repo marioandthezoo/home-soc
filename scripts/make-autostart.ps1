@@ -10,14 +10,26 @@
               PowerShell, but the task itself is not elevated.
 
   -Elevated additionally asks for -RunLevel Highest. That is only accepted when the whole
-  install tree is writable by administrators alone: an elevated logon task that executes
-  files a standard user can rewrite is a local privilege escalation, not a convenience.
-  On a normal install (Home SOC living under C:\Users\<you>\...) the check fails by design
-  and the script tells you what to do instead.
+  install tree AND the base Python interpreter the .venv runs (pyvenv.cfg "home") are
+  writable by administrators alone: an elevated logon task that executes files a standard
+  user can rewrite is a local privilege escalation, not a convenience. On a normal install
+  (Home SOC living under C:\Users\<you>\...) the check fails by design and the script tells
+  you what to do instead.
+
+  The elevated task does not run "python -m homesoc" directly. A logon task inherits the
+  user's environment, including HKCU\Environment, which the user can change without admin
+  rights (PYTHONPATH -> sitecustomize.py, PATH, ProgramFiles, PSModulePath ...). It runs
+      pythonw.exe -I -S "<root>\scripts\run-elevated.py" run
+  instead: -I ignores every PYTHON* variable and the user site, and run-elevated.py checks
+  the import path and replaces the environment with machine-wide values before starting
+  Home SOC.
 .PARAMETER Mode
   startup (default) or task.
 .PARAMETER Elevated
   Only with -Mode task: request highest privileges. Refused unless the tree is admin-only.
+.PARAMETER CheckOnly
+  Only with -Mode task: run the checks and print the command that would be registered,
+  without registering anything. Needs no administrator rights.
 .PARAMETER Remove
   Remove the autostart entry for the chosen mode instead of creating it.
 .EXAMPLE
@@ -28,6 +40,7 @@ param(
     [ValidateSet("startup", "task")]
     [string]$Mode = "startup",
     [switch]$Elevated,
+    [switch]$CheckOnly,
     [switch]$Remove
 )
 $ErrorActionPreference = "Stop"
@@ -35,7 +48,29 @@ $root = Split-Path -Parent $PSScriptRoot
 $runBat = Join-Path $root "run.bat"
 $venvPythonw = Join-Path $root ".venv\Scripts\pythonw.exe"
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
+$venvCfg = Join-Path $root ".venv\pyvenv.cfg"
+$elevatedStarter = Join-Path $PSScriptRoot "run-elevated.py"
 $taskName = "Home SOC"
+
+function Get-VenvBaseInterpreterDir {
+    <# The folder named by pyvenv.cfg "home": the .venv launcher runs THAT interpreter and its
+       standard library, so an elevated task is only as safe as that folder. $null when the file
+       or the key is missing, which the caller treats as unsafe. #>
+    param([string]$ConfigPath)
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $null }
+    foreach ($line in (Get-Content -LiteralPath $ConfigPath)) {
+        if ($line -match '^\s*home\s*=\s*(?<home>.+?)\s*$') {
+            $home_ = $Matches['home']
+            if ([IO.Path]::IsPathRooted($home_) -and (Test-Path -LiteralPath $home_ -PathType Container)) {
+                $resolved = (Resolve-Path -LiteralPath $home_).ProviderPath
+                if ($resolved.Length -gt 3) { $resolved = $resolved.TrimEnd('\') }
+                return $resolved
+            }
+            return $null
+        }
+    }
+    return $null
+}
 
 function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -161,7 +196,7 @@ if ($Mode -eq "startup") {
 
 # ---------------------------------------------------------------------- task mode
 
-if (-not (Test-IsAdmin)) {
+if (($Remove -or -not $CheckOnly) -and -not (Test-IsAdmin)) {
     Write-Host "[Home SOC] -Mode task needs an elevated PowerShell to register the task (Run as Administrator)." -ForegroundColor Red
     Write-Host "           The task itself runs with your normal rights. Use -Mode startup for the no-admin path." -ForegroundColor Yellow
     exit 1
@@ -191,15 +226,36 @@ $argument = "-m homesoc run"
 $runLevel = "Limited"
 if ($Elevated) {
     Write-Host "[Home SOC] checking whether $root can be modified by non-administrators ..."
-    $offenders = @(Test-TreeIsAdminOnly -Path $root)   # @() so .Count is reliable for 0 and 1
+    $offenders = New-Object System.Collections.Generic.List[string]
+    foreach ($o in @(Test-TreeIsAdminOnly -Path $root)) { $offenders.Add($o) }
+    if (-not (Test-Path -LiteralPath $elevatedStarter -PathType Leaf)) {
+        $offenders.Add("$elevatedStarter is missing")
+    }
+    # The .venv launcher runs the interpreter named by pyvenv.cfg "home" and imports ITS standard
+    # library first. A per-user python.org install (%LOCALAPPDATA%\Programs\Python\...) is
+    # writable by the user, so it has to pass the same test as the Home SOC tree.
+    $baseDir = Get-VenvBaseInterpreterDir -ConfigPath $venvCfg
+    if (-not $baseDir) {
+        $offenders.Add("[base interpreter] cannot read an existing 'home' folder from $venvCfg")
+    } else {
+        Write-Host "[Home SOC] checking the base interpreter the .venv runs: $baseDir ..."
+        foreach ($o in @(Test-TreeIsAdminOnly -Path $baseDir)) { $offenders.Add("[base interpreter] $o") }
+    }
     if ($offenders.Count -gt 0) {
         Write-Host ""
         Write-Host "[Home SOC] refusing to register an ELEVATED logon task." -ForegroundColor Red
         Write-Host "  An elevated task runs $execute and the Python code under $root at every logon."
         Write-Host "  These entries let a standard user (i.e. any malware running as you, without a UAC prompt)"
         Write-Host "  rewrite that code and have Windows execute it as full Administrator:"
-        foreach ($ace in ($offenders | Select-Object -Unique -First 8)) { Write-Host "    $ace" -ForegroundColor Yellow }
-        if ($offenders.Count -gt 8) { Write-Host ("    ... and {0} more" -f ($offenders.Count - 8)) -ForegroundColor Yellow }
+        # Up to 8 lines per location, so a problem with the base interpreter is never hidden
+        # behind a long list for the Home SOC tree.
+        foreach ($group in @(
+                @($offenders | Where-Object { -not $_.StartsWith("[base interpreter]") }),
+                @($offenders | Where-Object { $_.StartsWith("[base interpreter]") }))) {
+            if ($group.Count -eq 0) { continue }
+            foreach ($ace in ($group | Select-Object -Unique -First 8)) { Write-Host "    $ace" -ForegroundColor Yellow }
+            if ($group.Count -gt 8) { Write-Host ("    ... and {0} more" -f ($group.Count - 8)) -ForegroundColor Yellow }
+        }
         Write-Host ""
         Write-Host "  Do one of these instead:" -ForegroundColor Green
         Write-Host "    * Drop -Elevated. A normal-rights logon task covers everything except the handful of"
@@ -216,8 +272,18 @@ if ($Elevated) {
         Write-Host "      profile is the safe place.) Then re-run this script with -Elevated."
         exit 1
     }
-    Write-Host "[Home SOC] tree is admin-only; an elevated task is safe here."
+    Write-Host "[Home SOC] tree and base interpreter are admin-only; an elevated task is safe here."
     $runLevel = "Highest"
+    # Never "-m homesoc run" when elevated: see the header. -I ignores PYTHONPATH & co. and the
+    # user site; -S defers site until run-elevated.py has checked the import path; the starter
+    # then replaces the inherited (user-writable) environment with machine-wide values.
+    $argument = '-I -S "{0}" run' -f $elevatedStarter
+}
+
+if ($CheckOnly) {
+    Write-Host "[Home SOC] check only: nothing registered (run level would be: $runLevel)."
+    Write-Host "           Command: $execute $argument"
+    exit 0
 }
 
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name

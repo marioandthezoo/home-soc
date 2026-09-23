@@ -4,7 +4,13 @@ NVD is slow (about 1 s per call) and rate limited (5 requests / 30 s without a k
 50 with one), so this module is built around three guards rather than around the
 HTTP call itself: a 7-day cache in the ``settings`` table, a sliding-window rate
 limiter, and a per-scan wall-clock :class:`Budget` that makes every call give up
-cleanly instead of stalling the scheduler.
+cleanly instead of stalling the scheduler. Each request also runs under a
+socket-level wall clock (``homesoc.feeds.netguard.Watch``): the per-recv read
+timeout alone lets a server that drips bytes hold the call for hours.
+
+The answer is untrusted input even from NVD: anything that is not the documented
+shape (wrong types, JSON nested past the stack) is "could not find out" (None),
+never an exception that aborts the rest of the vulns scan.
 """
 
 from __future__ import annotations
@@ -15,16 +21,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any
 
 import requests
 
+from homesoc.feeds import netguard
 from homesoc.vulns.cpe import CPE
 
 logger = logging.getLogger(__name__)
 
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 REQUEST_TIMEOUT_SEC = 15.0
+# Wall clock for one request, connect to last body byte (REQUEST_TIMEOUT_SEC is per recv).
+REQUEST_MAX_SECONDS = 30.0
 RETRY_SLEEP_SEC = 6.0
 CACHE_TTL_SEC = 7 * 24 * 3600
 SCAN_BUDGET_SEC = 60.0
@@ -144,7 +154,11 @@ def nvd_for_cpe(
     body = _fetch(params, api_key or "", budget or Budget(), limiter or RateLimiter.for_key(api_key), session)
     if body is None:
         return None
-    result = summarize(body)
+    try:
+        result = summarize(body)
+    except Exception as exc:  # noqa: BLE001 - a malformed answer is "could not find out", never a crash
+        logger.warning("NVD answer for %s not understood: %s: %s", params, type(exc).__name__, exc)
+        return None
     result["query"] = params
     # How the CVEs were attributed. "cpe" is an exact cpeName match; "keyword" is a
     # full-text search that the caller must qualify (and must not report as a count of
@@ -189,44 +203,63 @@ def _fetch(
         if wait > 0:
             _sleep(wait)
         limiter.record()
-        try:
-            # stream=True: without it requests downloads (and gunzips) the whole body before
-            # _read_limited sees a byte, so the size cap bounded nothing. allow_redirects=False:
-            # the apiKey header is custom, and requests only strips Authorization on a cross-host
-            # redirect, so a redirect would hand the key to whatever host it names. The NVD API
-            # never redirects; a 3xx is treated like any other non-200 answer.
-            resp = http.get(NVD_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC,
-                            stream=True, allow_redirects=False)
-        except requests.RequestException as exc:
-            logger.warning("NVD request failed: %s", exc)
-            return None
-        try:
-            status = getattr(resp, "status_code", 0)
-            if status in (429, 403):
-                if attempt == 2 or not budget.can_spend(RETRY_SLEEP_SEC + REQUEST_TIMEOUT_SEC):
-                    logger.warning("NVD rate limited (%s); giving up on %s", status, params)
-                    return None
-                _sleep(RETRY_SLEEP_SEC)
-                continue
-            if status != 200:
-                logger.warning("NVD returned %s for %s", status, params)
+        watch = netguard.Watch(_request_seconds(budget), "NVD request")
+        retry = False
+        with watch:
+            try:
+                # stream=True: without it requests downloads (and gunzips) the whole body before
+                # _read_limited sees a byte, so the size cap bounded nothing. allow_redirects=False:
+                # the apiKey header is custom, and requests only strips Authorization on a cross-host
+                # redirect, so a redirect would hand the key to whatever host it names. The NVD API
+                # never redirects; a 3xx is treated like any other non-200 answer.
+                resp = http.get(NVD_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC,
+                                stream=True, allow_redirects=False)
+            except requests.RequestException as exc:
+                logger.warning("NVD request failed: %s", exc)
                 return None
             try:
-                raw = _read_limited(resp)
-            except requests.RequestException as exc:
-                logger.warning("NVD response read failed: %s", exc)
-                return None
-        finally:
-            _close(resp)
+                # A pooled keep-alive connection was connected outside this watch: adopt it.
+                watch.adopt(netguard.response_socket(resp))
+                status = getattr(resp, "status_code", 0)
+                if status in (429, 403):
+                    if attempt == 2 or not budget.can_spend(RETRY_SLEEP_SEC + REQUEST_TIMEOUT_SEC):
+                        logger.warning("NVD rate limited (%s); giving up on %s", status, params)
+                        return None
+                    retry = True
+                    raw = None
+                elif status != 200:
+                    logger.warning("NVD returned %s for %s", status, params)
+                    return None
+                else:
+                    try:
+                        raw = _read_limited(resp)
+                    except requests.RequestException as exc:
+                        logger.warning("NVD response read failed: %s", exc)
+                        return None
+            finally:
+                _close(resp)
+        if retry:
+            _sleep(RETRY_SLEEP_SEC)  # outside the watch: the pause is not part of the request
+            continue
+        if watch.expired:
+            # The watch cut the connection: whatever was read (even a "complete" body without a
+            # Content-Length) is not the answer.
+            logger.warning("NVD request exceeded its wall clock for %s", params)
+            return None
         if raw is None:
             return None
         try:
             body = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: "[[[[..." nested past the stack
             logger.warning("NVD returned non-JSON for %s", params)
             return None
         return body if isinstance(body, dict) else None
     return None
+
+
+def _request_seconds(budget: Budget) -> Callable[[], float]:
+    """The socket wall clock for one request: what the budget has left, within sane bounds."""
+    return lambda: min(REQUEST_MAX_SECONDS, max(REQUEST_TIMEOUT_SEC, budget.remaining()))
 
 
 def _close(resp) -> None:
@@ -263,21 +296,23 @@ def summarize(body: dict[str, Any]) -> dict[str, Any]:
     persisting hundreds of rows per lighttpd would drown the vulns table.
     """
     cves: list[dict[str, Any]] = []
-    for item in body.get("vulnerabilities") or []:
+    items = body.get("vulnerabilities") if isinstance(body, dict) else None
+    for item in items if isinstance(items, list) else []:
         cve = item.get("cve") if isinstance(item, dict) else None
-        if not isinstance(cve, dict) or not cve.get("id"):
+        if not isinstance(cve, dict) or not isinstance(cve.get("id"), str) or not cve["id"]:
             continue
+        metrics = cve.get("metrics")
         cves.append(
             {
-                "cve": str(cve["id"]),
-                "cvss": _best_cvss(cve.get("metrics") or {}),
+                "cve": cve["id"][:64],
+                "cvss": _best_cvss(metrics if isinstance(metrics, dict) else {}),
                 "published": _short_date(cve.get("published")),
                 "title": _description(cve),
             }
         )
     cves.sort(key=lambda c: (c["cvss"] is None, -(c["cvss"] or 0.0), c["cve"]))
     scores = [c["cvss"] for c in cves if c["cvss"] is not None]
-    total = body.get("totalResults")
+    total = body.get("totalResults") if isinstance(body, dict) else None
     count = int(total) if isinstance(total, int) and total >= len(cves) else len(cves)
     # `returned` is what this page actually contained: the only number a caller can defend
     # when the query was a keyword search rather than an exact cpeName.
@@ -299,14 +334,19 @@ def _best_cvss(metrics: dict[str, Any]) -> float | None:
 
 
 def _description(cve: dict[str, Any]) -> str | None:
-    for desc in cve.get("descriptions") or []:
-        if isinstance(desc, dict) and desc.get("lang", "en") == "en" and desc.get("value"):
-            return str(desc["value"])[:300]
+    descriptions = cve.get("descriptions")
+    for desc in descriptions if isinstance(descriptions, list) else []:
+        if not isinstance(desc, dict) or desc.get("lang", "en") != "en":
+            continue
+        value = desc.get("value")
+        if isinstance(value, str) and value:
+            return value[:300]
     return None
 
 
 def _short_date(value: Any) -> str | None:
-    return str(value)[:10] if value else None
+    # Only a string: str() of an arbitrary nested structure can itself blow the stack.
+    return value[:10] if isinstance(value, str) and value else None
 
 
 def _cache_get(conn, key: str) -> dict[str, Any] | None:
@@ -323,7 +363,7 @@ def _cache_get(conn, key: str) -> dict[str, Any] | None:
         return None
     try:
         entry = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(entry, dict) or not isinstance(entry.get("result"), dict):
         return None

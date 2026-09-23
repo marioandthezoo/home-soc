@@ -10,6 +10,12 @@ Redirects are followed by hand, not by requests: every hop must be https and
 must not point at a loopback, private, link-local, CGNAT or multicast address,
 so a compromised feed origin cannot bounce Home SOC into the LAN (blind GET
 SSRF against a router's CGI) or downgrade the download to plain http.
+
+Both rules are also enforced where a URL check cannot be fooled: on the socket.
+Each download runs under a netguard.Watch that refuses any connect to a
+non-public address (whatever URL parser or DNS answer led there) and shuts the
+connection down when the feed's wall clock runs out, in whatever phase the
+server is stalling (TLS handshake, headers or body).
 """
 
 from __future__ import annotations
@@ -30,8 +36,9 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import requests
+from urllib3.util import parse_url
 
-from homesoc.feeds import parsers, registry
+from homesoc.feeds import netguard, parsers, registry
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +47,7 @@ CONNECT_TIMEOUT_SEC = 10
 READ_TIMEOUT_SEC = 60
 # requests' read timeout is per recv(); a mirror trickling 1 KB every 50 s would otherwise hold the
 # single scheduler thread for hours, so every feed and every update() call also has a wall clock.
+# The feed's wall clock is enforced on the socket (netguard.Watch), not only between chunks.
 FEED_MAX_SECONDS = 180.0
 UPDATE_MAX_SECONDS = 600.0
 MIN_THROUGHPUT_BYTES_PER_SEC = 1024
@@ -57,8 +65,14 @@ GZIP_MAGIC = b"\x1f\x8b"
 MAX_REDIRECTS = 5
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 PARSE_DEADLINE_EVERY_LINES = 20000
+# Only printable ASCII may appear in a request target: no whitespace, control characters or
+# backslashes, which URL parsers disagree about (see _check_hop).
+_URL_OK = frozenset(chr(c) for c in range(0x21, 0x7F)) - {"\\"}
 
 _LOCK = threading.Lock()
+
+# Parsers that take one whole JSON document, never a batch of lines (a "list" feed served as JSON).
+_DOCUMENT_PARSERS = frozenset({parsers.parse_feodo, parsers.parse_kev})
 
 # Extension per kind keeps the data folder self-describing for a human.
 _EXT = {"kev": "json", "epss": "csv", "oui": "txt", "json": "json"}
@@ -224,14 +238,21 @@ def backoff_until(conn: sqlite3.Connection, name: str) -> datetime | None:
 
 
 class _Deadline:
-    """Monotonic wall clock for one download; raising FeedError from inside the stream loop."""
+    """Monotonic wall clock for one download; raising FeedError from inside the stream loop.
+
+    `watch` enforces the same clock on the sockets: while a block runs under ``with
+    deadline.watch``, every connect it makes is checked against _connect_permitted and, once
+    the time is up, every connection it opened is shut down so a blocked read returns.
+    """
 
     def __init__(self, seconds: float) -> None:
         self.started = time.monotonic()
         self.seconds = seconds
+        self.watch = netguard.Watch(self.remaining, "feed download",
+                                    check_address=lambda host: _connect_permitted(host))
 
     def check(self, what: str) -> None:
-        if time.monotonic() - self.started > self.seconds:
+        if self.watch.expired or time.monotonic() - self.started > self.seconds:
             raise FeedError(f"{what} exceeded {int(self.seconds)} s")
 
     def remaining(self) -> float:
@@ -437,14 +458,14 @@ def _mark_error(conn: sqlite3.Connection, name: str, error: str) -> None:
 
 
 def _is_public_ip(value: str) -> bool:
-    """True only for globally routable unicast addresses (no loopback/RFC 1918/link-local/CGNAT/multicast)."""
-    try:
-        ip = ipaddress.ip_address(value.split("%", 1)[0])
-    except ValueError:
-        return False
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return ip.is_global and not ip.is_multicast
+    """True only for globally routable unicast addresses: no loopback, RFC 1918, link-local, CGNAT or
+    multicast, and no IPv6 form that embeds or reaches one (see netguard.is_public_ip)."""
+    return netguard.is_public_ip(value)
+
+
+def _connect_permitted(host: str) -> bool:
+    """The socket-level rule for feed downloads: connect only to public addresses."""
+    return _is_public_ip(host)
 
 
 def _check_hop(url: str) -> str:
@@ -453,16 +474,26 @@ def _check_hop(url: str) -> str:
     Runs without DNS so it also guards the scripted responses tests use. Name resolution is
     checked separately in _http_get, right before the real connection.
     """
+    if not url or not set(url) <= _URL_OK:
+        # A backslash, whitespace or control character is where urlsplit and urllib3 disagree:
+        # https://10.0.0.1\@example.com/ is example.com to one and 10.0.0.1 to the other.
+        raise FeedError(f"refusing URL with a backslash or non-printable character {url[:200]!r}")
     try:
         parts = urlsplit(url)
         host = parts.hostname
         parts.port  # noqa: B018 - raises ValueError on a malformed port
+        client_host = parse_url(url).host
     except ValueError as exc:
         raise FeedError(f"refusing malformed URL {url[:200]!r}") from exc
     if parts.scheme.lower() != "https":
         raise FeedError(f"refusing non-https URL {url[:200]!r}")
     if not host:
         raise FeedError(f"refusing URL without a host {url[:200]!r}")
+    if "@" in parts.netloc:
+        raise FeedError(f"refusing URL with credentials in it {url[:200]!r}")
+    if (client_host or "").strip("[]").lower() != host.lower():
+        # Validate exactly the host the HTTP client will connect to, never a second parser's view.
+        raise FeedError(f"refusing URL whose host is ambiguous {url[:200]!r}")
     try:
         ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
@@ -490,34 +521,70 @@ def _check_resolves_public(host: str) -> None:
             raise FeedError(f"refusing {host}: resolves to non-public address {addr}")
 
 
+def _allow_configured_proxy(url: str) -> None:
+    """Let the active watch connect to the owner's configured proxy (HTTPS_PROXY / system settings).
+
+    Through a proxy the socket goes to the proxy, not to the feed host, and that address is the
+    owner's own choice; the feed host itself is still checked by _check_hop/_check_resolves_public.
+    """
+    watch = netguard.current()
+    if watch is None:
+        return
+    proxy = requests.utils.select_proxy(url, requests.utils.get_environ_proxies(url))
+    if not proxy:
+        return
+    try:
+        proxy_host = (parse_url(proxy).host or "").strip("[]")
+        infos = socket.getaddrinfo(proxy_host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError, ValueError):
+        return
+    for info in infos:
+        watch.allow(str(info[4][0]))
+
+
 def _http_get(url: str, headers: dict[str, str], timeout: tuple[int, int]) -> requests.Response:
     """One request, redirects not followed (tests substitute a fake response without a network)."""
     _check_resolves_public(_check_hop(url))
+    _allow_configured_proxy(url)
     return requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=False)
 
 
 def _open(url: str, headers: dict[str, str], deadline: _Deadline) -> requests.Response:
-    """GET `url`, following at most MAX_REDIRECTS redirects, each hop re-validated by _check_hop."""
-    for _hop in range(MAX_REDIRECTS + 1):
-        _check_hop(url)
-        try:
-            resp = _http_get(url, headers, (CONNECT_TIMEOUT_SEC, READ_TIMEOUT_SEC))
-        except requests.RequestException as exc:
-            raise FeedError(f"request failed: {exc}") from exc
-        if resp.status_code not in _REDIRECT_CODES:
-            return resp
-        with resp:  # release the connection; a redirect body is never read
-            location = resp.headers.get("Location")
-        if not location:
-            raise FeedError(f"HTTP {resp.status_code} without a Location header")
-        url = urljoin(url, location.strip())
-        deadline.check("redirects")
-    raise FeedError(f"more than {MAX_REDIRECTS} redirects")
+    """GET `url`, following at most MAX_REDIRECTS redirects, each hop re-validated by _check_hop.
+
+    Runs under the deadline's watch: a server that drips its TLS handshake or its headers is cut
+    off when the feed's wall clock runs out, and no hop can connect to a non-public address.
+    """
+    with deadline.watch:
+        for _hop in range(MAX_REDIRECTS + 1):
+            _check_hop(url)
+            try:
+                resp = _http_get(url, headers, (CONNECT_TIMEOUT_SEC, READ_TIMEOUT_SEC))
+            except requests.RequestException as exc:
+                deadline.check("request")
+                raise FeedError(f"request failed: {exc}") from exc
+            if resp.status_code not in _REDIRECT_CODES:
+                return resp
+            with resp:  # release the connection; a redirect body is never read
+                location = resp.headers.get("Location")
+            if not location:
+                raise FeedError(f"HTTP {resp.status_code} without a Location header")
+            url = urljoin(url, location.strip())
+            deadline.check("redirects")
+        raise FeedError(f"more than {MAX_REDIRECTS} redirects")
 
 
 def _fetch_one(conn: sqlite3.Connection, spec: registry.FeedSpec, row: Any, max_bytes: int,
                deadline: _Deadline | None = None) -> str:
     deadline = deadline or _Deadline(FEED_MAX_SECONDS)
+    # One watch spans the whole fetch, so the connection _open made is still covered while the
+    # body streams; it is released when this feed is done.
+    with deadline.watch:
+        return _fetch_one_watched(conn, spec, row, max_bytes, deadline)
+
+
+def _fetch_one_watched(conn: sqlite3.Connection, spec: registry.FeedSpec, row: Any, max_bytes: int,
+                       deadline: _Deadline) -> str:
     # The feed's own ceiling applies on top of the configured one, on the wire and after gunzip.
     max_bytes = registry.size_cap(spec, max_bytes) or max_bytes
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
@@ -590,7 +657,10 @@ def _stream_to_tmp(resp: requests.Response, tmp: Path, max_bytes: int, deadline:
     deadline = deadline or _Deadline(FEED_MAX_SECONDS)
     total = 0
     sha = hashlib.sha256()
-    with tmp.open("wb") as fh:
+    with deadline.watch, tmp.open("wb") as fh:
+        # A body read blocks until a whole chunk arrives; the watch, not the loop below, is what
+        # stops a server dripping one byte at a time into it.
+        deadline.watch.adopt(netguard.response_socket(resp))
         try:
             for chunk in resp.iter_content(chunk_size=CHUNK_BYTES):
                 if chunk:
@@ -608,10 +678,13 @@ def _stream_to_tmp(resp: requests.Response, tmp: Path, max_bytes: int, deadline:
                     raise FeedError(f"download too slow ({int(total / elapsed)} B/s after {int(elapsed)} s)")
         except requests.RequestException as exc:
             # A read timeout mid-body is an ordinary feed failure, not a crash.
+            deadline.check("download")
             raise FeedError(f"download failed: {exc}") from exc
+    # Checked first: a body without Content-Length that the watch cut short ends like a complete
+    # one, and must never be installed as the new list.
+    deadline.check("download")
     if total == 0:
         raise FeedError("empty response body")
-    deadline.check("download")
     return total, sha.hexdigest()
 
 
@@ -669,13 +742,14 @@ def _count_entries(spec: registry.FeedSpec, path: Path, max_bytes: int | None = 
     if cap is not None and size > cap:
         raise FeedError(f"file of {size} bytes exceeds cap of {cap} bytes")
     try:
-        # Line feeds are counted line by line (no read_text + splitlines copy); EPSS is parsed
-        # row by row from the file; JSON feeds need the whole document but are capped small.
-        if spec.kind in ("hosts", "domains", "adblock", "ip", "oui"):
+        # Line feeds are counted line by line (no read_text + splitlines copy, no line longer than
+        # parsers.MAX_LINE_CHARS ever held); EPSS is parsed row by row from the file; JSON feeds
+        # (KEV, Feodo) need the whole document but are capped small.
+        if spec.kind in ("hosts", "domains", "adblock", "ip", "oui") and spec.parser not in _DOCUMENT_PARSERS:
             count = _count_lines_parsed(spec, path, deadline=deadline)
         elif spec.kind == "epss":
             with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
-                count = len(parsers.parse_epss_lines(_deadline_lines(fh, deadline)))
+                count = len(parsers.parse_epss_lines(_deadline_lines(parsers.bounded_lines(fh), deadline)))
         else:
             text = path.read_text(encoding="utf-8", errors="replace")
             parsed = spec.parser(text)
@@ -701,17 +775,21 @@ def _deadline_lines(lines: Iterable[str], deadline: _Deadline | None) -> Iterato
 
 def _count_lines_parsed(spec: registry.FeedSpec, path: Path, batch_lines: int = PARSE_DEADLINE_EVERY_LINES,
                         deadline: _Deadline | None = None) -> int:
-    """Feed the line-oriented parsers in batches so a 64 MB list never lives in memory twice."""
+    """Feed the line-oriented parsers in batches so a 64 MB list never lives in memory twice.
+
+    Lines are read with a length bound (parsers.bounded_lines): a list served as one enormous
+    line is skipped piece by piece instead of being read, joined and split into millions of tokens.
+    """
     count = 0
     batch: list[str] = []
     with path.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
+        for line in parsers.bounded_lines(fh):
             batch.append(line)
             if len(batch) >= batch_lines:
-                count += sum(1 for _ in spec.parser("".join(batch)))  # type: ignore[misc]
+                count += sum(1 for _ in spec.parser(batch))  # type: ignore[misc]
                 batch = []
                 if deadline is not None:
                     deadline.check("parse")
     if batch:
-        count += sum(1 for _ in spec.parser("".join(batch)))  # type: ignore[misc]
+        count += sum(1 for _ in spec.parser(batch))  # type: ignore[misc]
     return count

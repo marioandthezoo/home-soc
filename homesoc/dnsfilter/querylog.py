@@ -29,7 +29,12 @@ ACTIONS = ("allow", "block", "cache", "error")
 LOG_BUDGET_PER_CLIENT = 600       # rows per client per minute
 LOG_BUDGET_TOTAL = 30000          # rows per minute across all clients (forged sources each get a budget)
 LOG_BUDGET_MAX_CLIENTS = 4096     # budget table bound; beyond it new sources are not logged that minute
-MAX_QNAME_LOG = 255               # a wire name is at most 255 octets; dnslib's escaped text can be longer
+# Inventory devices (``clients.KnownClients``) are budgeted outside the two shared pools above: forged
+# source addresses can fill the table or the total, but never stop a real device's lookups being
+# logged. Each known device still has its own LOG_BUDGET_PER_CLIENT.
+OVERFLOW_EVENT_SECONDS = 3600.0   # at most one "forged sources flooded the query log" event per hour
+OVERFLOW_SAMPLE = 8               # source addresses quoted in that event
+MAX_QNAME_LOG = 255              # a wire name is at most 255 octets; dnslib's escaped text can be longer
 MAX_LOG_ROWS = 2_000_000          # hard cap on dns_queries, oldest rows evicted first
 ROW_CAP_CHECK_SECONDS = 300.0
 ROW_CAP_CHUNK = 50_000            # delete in slices so no single statement holds the DB lock for long
@@ -93,8 +98,10 @@ class QueryLog:
         client_budget: int = LOG_BUDGET_PER_CLIENT,
         total_budget: int = LOG_BUDGET_TOTAL,
         max_rows: int = MAX_LOG_ROWS,
+        known=None,
     ) -> None:
         self.conn = conn
+        self.known = known  # ``client in known`` → an inventory device with its own reserved budget
         self.enabled = enabled
         self.flush_interval = flush_interval
         self.batch_size = batch_size
@@ -112,8 +119,13 @@ class QueryLog:
         self._budget_minute: int | None = None
         self._budget_used: dict[str, int] = {}
         self._budget_total = 0
+        self._known_used: dict[str, int] = {}           # inventory devices: rows this minute, outside the pools
         self._over_budget: dict[str, int] = {}          # client -> rows not logged, reported by flush()
         self._budget_events: dict[str, float] = {}      # client -> monotonic time of its last event
+        self._overflow_rows = 0                         # rows refused because the source table was full
+        self._overflow_sample: list[str] = []
+        self._overflow_event_at: float | None = None
+        self.overflowed = 0
         self._last_cap_check = time.monotonic()
         self.total = 0
         self.dropped = 0
@@ -194,9 +206,26 @@ class QueryLog:
         if minute != self._budget_minute:
             self._budget_minute = minute
             self._budget_used.clear()
+            self._known_used.clear()
             self._budget_total = 0
+        known = self.known
+        if known is not None and client in known:
+            # A real device: its own budget, never drawn from the table or the total that forged
+            # sources can exhaust (the known set is bounded by the inventory, not by packets).
+            used = self._known_used.get(client, 0)
+            if used >= self.client_budget:
+                self._over_budget[client] = self._over_budget.get(client, 0) + 1
+                return False
+            self._known_used[client] = used + 1
+            return True
         used = self._budget_used.get(client)
         if used is None and len(self._budget_used) >= LOG_BUDGET_MAX_CLIENTS:
+            # Only reachable with thousands of source addresses in one minute, i.e. forged ones.
+            # Counted and reported (see _report_overflow) instead of vanishing without a trace.
+            self._overflow_rows += 1
+            self.overflowed += 1
+            if len(self._overflow_sample) < OVERFLOW_SAMPLE:
+                self._overflow_sample.append(str(client)[:64])
             return False
         used = used or 0
         if used >= self.client_budget or self._budget_total >= self.total_budget:
@@ -225,9 +254,13 @@ class QueryLog:
         from the flush thread so the resolver's answer path never waits on the DB lock."""
         with self._lock:
             over, self._over_budget = self._over_budget, {}
+            overflow, sample = self._overflow_rows, self._overflow_sample
+            self._overflow_rows, self._overflow_sample = 0, []
+        now = time.monotonic()
+        if overflow:
+            self._report_overflow(overflow, sample, now)
         if not over:
             return
-        now = time.monotonic()
         for c in [c for c, t in self._budget_events.items() if now - t >= 3600]:
             del self._budget_events[c]
         for client, n in sorted(over.items(), key=lambda kv: -kv[1]):
@@ -240,6 +273,22 @@ class QueryLog:
                 f"{n} were answered but not logged",
                 {"client": client, "not_logged": n, "budget_per_minute": self.client_budget},
             )
+
+    def _report_overflow(self, rows: int, sample: list[str], now: float) -> None:
+        """One event per hour when the per-minute source table overflowed. That needs thousands of
+        distinct source addresses within a minute, which a home network only produces when someone
+        is forging them — typically to push other devices' lookups out of this log."""
+        if self._overflow_event_at is not None and now - self._overflow_event_at < OVERFLOW_EVENT_SECONDS:
+            return
+        self._overflow_event_at = now
+        record_event(
+            self.conn, "warning", "dns",
+            f"The DNS query log was offered more than {LOG_BUDGET_MAX_CLIENTS} different source addresses in one "
+            f"minute; {rows} queries from addresses outside the device inventory were answered but not logged. "
+            "A home network does not have that many devices: something on the LAN is probably forging source "
+            "addresses. Lookups by devices in the inventory are still logged.",
+            {"not_logged": rows, "sources_per_minute_limit": LOG_BUDGET_MAX_CLIENTS, "sample_sources": sample},
+        )
 
     def flush(self) -> int:
         try:
@@ -336,6 +385,14 @@ def maintenance(cfg, conn: sqlite3.Connection) -> dict:
         enforce_row_cap(conn)
     except sqlite3.Error:
         logger.exception("query log row cap failed")
+    try:
+        # The reputation table gains a row per newly seen domain from any (forgeable) source; this
+        # is its retention, run on the same hourly job.
+        from homesoc.dnsfilter.reputation import prune_reputation
+
+        prune_reputation(conn)
+    except sqlite3.Error:
+        logger.exception("reputation table prune failed")
     return {"rollup_rows": written, "purged": purged}
 
 

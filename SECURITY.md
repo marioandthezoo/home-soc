@@ -90,7 +90,7 @@ it is stored.
 | Adversary | Position | What the agent does about it |
 |---|---|---|
 | A web page you visit | Runs JavaScript in your browser, same machine | Dashboard is loopback-only by default; Host-header allowlist blocks DNS rebinding; CSP + CSRF header requirement block cross-origin API calls |
-| A device on your LAN | Can reach any listening port on this host | Dashboard is not bound to the LAN by default; when it is, a token is required and `SOC-SYS-003` (high) fires if you skipped it |
+| A device on your LAN | Can reach any listening port on this host | Dashboard is loopback-only by default. Bound to anything else, Home SOC will not start without a token of at least 16 characters, and generates and stores one if `web.token` is empty. `SOC-SYS-003` checks the address the server actually bound to |
 | The wider internet | Can send packets if a port is forwarded | The resolver drops every query from a non-private source address; the dashboard is not exposed unless you exposed it |
 | A compromised or hostile feed mirror | Controls the bytes of a blocklist or CVE file | TLS-verified, size-capped, atomically replaced; parsed by validating parsers that never execute anything |
 | A hostile device being scanned | Controls its banners, hostname, mDNS names, XML | All of it is treated as data — escaped in HTML, parameterised in SQL, never interpolated into a command line |
@@ -104,10 +104,32 @@ Every item below is implemented in the code, with the file that does it.
 ### The dashboard binds to localhost
 
 `web.host` defaults to `127.0.0.1` (`config.example.toml`). Out of the box the dashboard is reachable
-only from the machine it runs on. Changing this to `0.0.0.0` is a deliberate act, and the agent
-notices: `Config.Web.exposed` is true for anything other than loopback, and `cli.soc_health_drafts()`
-raises **`SOC-SYS-003` (high) — "Dashboard is reachable from the LAN without a token"** whenever the
-dashboard is exposed and `web.token` is empty.
+only from the machine it runs on. Loopback means `localhost`, `127.0.0.0/8` and `::1` / `[::1]`
+(`config.is_loopback_host()`); everything else counts as exposed, including `""`, `0.0.0.0`, `::`,
+a hostname and a LAN address.
+
+**Home SOC will not listen on the network without a real token** (`cli.enforce_bind_policy()`,
+run by `serve` and `run` before anything starts, plus a last check right before the socket is bound):
+
+- Exposed with an **empty** `web.token` (no `config.toml`, a copy of `config.example.toml`, or a
+  removed token): a token is generated (`secrets.token_urlsafe(32)`), stored as a Settings override so
+  it survives restarts, and the login link is printed once. The stored override wins over
+  `config.toml`; to use a token of your own, put it in `config.toml` and run
+  `python -m homesoc config unset web.token`.
+- Exposed with a token **shorter than 16 characters**: refused (exit code 2) with the exact fix. On
+  loopback a short token still only logs a warning.
+- There is no "no token on the LAN" switch. For remote access keep the dashboard on loopback and use
+  a VPN or Tailscale Serve.
+- If the startup message says the dashboard **"may already have been open to the network"** (an earlier
+  non-loopback bind, active Lens tokens, or Settings overrides of `web.*`, `notify.*`,
+  `dns.upstreams`, `dns.doh_upstream`, `dns.lists`, `dns.listen`, `dns.enabled` or
+  `network.exclude`), run `python -m homesoc lens revoke --all` and review
+  `python -m homesoc config overrides`. A LAN host that reached a token-less dashboard could have
+  planted its own token or redirected DNS and alerts, so a "token is set" check alone cannot tell.
+
+**`SOC-SYS-003` (high) — "Dashboard is reachable from the LAN without a token"** and `SOC-LENS-001`
+remain as defence in depth. They follow the address the server actually bound to (recorded by
+`serve`), not only `config.toml`, so a `scan` in a second terminal sees `serve --host 0.0.0.0`.
 
 ### A real token, generated for you
 
@@ -130,8 +152,8 @@ login form with HTTP 401, API routes get `{"ok": false, "error": "unauthorized"}
 - Wrong tokens are **rate-limited**: 10 per source address and 100 in total per 10 minutes, then a
   15-minute lockout, and a warning in the activity feed. The all-addresses lockout does not apply
   to this PC's own loopback address (which keeps its per-address limit), so a LAN host cannot lock
-  you out at the desk. A token shorter than 16 characters logs a
-  warning at startup.
+  you out at the desk. A token shorter than 16 characters is refused for any non-loopback bind
+  and logs a warning at startup on loopback.
 - Comparison uses `hmac.compare_digest`, not `==`.
 
 ### Host-header validation (anti DNS-rebinding)
@@ -207,11 +229,26 @@ T0–T3 — a value from config cannot turn into a different flag.
   read, and EPSS is parsed row by row.
 - **Redirects are checked hop by hop**: at most 5, every hop must be `https`, and a hop to a
   loopback, private, link-local, CGNAT or multicast address (or a name resolving to one) is refused.
-  NVD, VirusTotal and URLhaus calls do not follow redirects at all, so an API key header can never
-  be forwarded to another host, and their answers are read with a size cap.
-- **Timeouts everywhere**: 10 s connect, 60 s read, a 180 s wall clock per feed, a 600 s wall clock
-  for the whole batch, plus a throughput floor (1 KB/s after a 30 s grace) so a server that trickles
-  one byte at a time cannot hold the scheduler thread hostage.
+  A hop containing a backslash, whitespace, a control or non-ASCII character, or `user@` credentials
+  is refused, and the host checked is the one urllib3 will connect to. Every connect a feed download
+  makes is checked again on the socket against the address it is actually connecting to
+  (`homesoc/feeds/netguard.py`), so no URL-parser trick or DNS rebinding can reach loopback or the
+  LAN. NAT64, IPv4-compatible, site-local, Teredo and 6to4 forms of private addresses count as
+  private. A configured HTTPS proxy is still allowed.
+  NVD, VirusTotal (domain and file-hash lookups) and URLhaus calls do not follow redirects at all, so
+  an API key header can never be forwarded to another host, and their answers are read with a size
+  cap.
+- **Timeouts everywhere**: 10 s connect and 60 s read per network read, a 180 s wall clock per feed
+  and a 600 s wall clock for the whole batch. The per-feed wall clock is enforced on the socket itself
+  (`homesoc/feeds/netguard.py`): when it runs out, the connection is shut down in whatever phase the
+  server is stalling (TLS handshake, headers or body), so a server that trickles one byte at a time
+  cannot hold the scheduler thread hostage. NVD requests get the same guard with a 30 s wall clock,
+  VirusTotal file lookups 45 s and notification posts 30 s. A 1 KB/s throughput floor after a 30 s
+  grace also applies between chunks.
+- **Line length is bounded before parsing**: line-oriented feeds are read in lines of at most 4096
+  characters (longer lines are drained and dropped, never split), so a feed that is one giant line
+  cannot cost many times its size in memory. The OUI feed has its own 16 MB cap. Malformed JSON,
+  including nesting deep enough to overflow the parser, costs one lookup, never a whole vulns scan.
 - **Atomic replace**: the body streams to `<name>.tmp` and only `os.replace`s into place after it has
   been fully read and counted. A crash mid-download can never leave a truncated blocklist that the
   resolver would happily load. A SHA-256 sidecar is written next to each file.
@@ -249,20 +286,40 @@ T0–T3 — a value from config cannot turn into a different flag.
   truncated rather than dropped. One device can no longer use up a bucket everyone shares.
 - **One bad name cannot take DNS down for the house.** A query that fails upstream no longer opens
   the circuit breaker; the breaker opens only if the resolver's own canary query (`. NS`) fails too.
-  A failing name is answered SERVFAIL locally for 5 s, a zone that keeps failing is held for 30 s,
-  and upstream work in flight is capped per client (32), per zone (32) and in total (1024).
-- **TCP connections are bounded**: 64 in total and 8 per source, a 10 s wait for the first byte,
-  5 s for a whole message, 120 s and 100 queries per connection. Non-local sources are refused
-  before a thread is started.
+  A failing name is answered SERVFAIL locally for 5 s, a zone that keeps failing is held for 30 s.
+  Upstream work in flight is capped per client (32, counted separately for UDP and TCP), per zone
+  (32; reverse lookups are charged per IPv4 /16 or IPv6 /32) and, for UDP, in total (256). A UDP
+  query over a shared limit is answered TC=1, never SERVFAIL, so the client retries over TCP, whose
+  capacity forged packets cannot reach.
+- **No thread per packet.** UDP is served by one listener thread and a fixed pool of 8 workers; the
+  source check and rate limit run on the listener before a datagram is queued (at most 1024), a full
+  queue is answered TC=1, and queries that need an upstream go to a separate bounded pool so slow
+  names never hold the workers.
+- **TCP connections are bounded**: 64 in total and 8 per source. When the table is full the oldest
+  idle connection of the busiest source is closed instead of refusing the newcomer (RFC 7766
+  §6.2.3), so a device holding many connections cannot lock out a victim that was sent TC=1. A 10 s
+  idle wait (2 s while the table is more than half full), 5 s for a whole message, 120 s and 100
+  queries per connection. Non-local sources are refused before a thread is started.
 - **The query log has budgets**: 600 rows per client and 30,000 in total per minute (queries over
   budget are still answered, just not written), names are truncated, and the table is capped at
-  2 million rows, oldest first.
+  2 million rows, oldest first. Devices in the inventory (seen in the last 30 days) have their own
+  budget that forged source addresses cannot use up, and an overflow of the per-minute source table
+  is recorded as a warning event instead of passing silently.
+- **Reputation lookups cannot be starved by forged sources**: inventory devices have their own queue
+  lane; one client may use at most 10% of the VirusTotal daily quota and all non-inventory sources
+  together 50%; the reputation table keeps clean/unknown rows 30 days and at most 100,000 rows.
 - **Response size is clamped to 1232 bytes** regardless of what the client's EDNS advertises. Larger
   answers set TC=1, forcing the client to retry over TCP — which a spoofed source cannot complete.
 - **`ANY` queries and non-IN classes are refused** outright.
 - Requests to upstreams are rebuilt from scratch with a new ID and minimal EDNS, so client-specific
   EDNS options never leak out, and question case is randomised (0x20) with the reply validated
-  against it.
+  against it. An upstream that returns a wrong-case reply is asked without 0x20 for 60 s, doubling
+  up to 1 h if it keeps happening; one correctly-cased reply restores it, so one spoofed reply cannot
+  switch the protection off for good.
+- **DNS attribution is by source address.** On a flat LAN a host can forge another device's address
+  over UDP, so a cloud dependency or a `NET-DEP-003` finding credited to a device means "from its
+  address", not proof that the device made the lookup, and the finding says so. Names that are not
+  valid hostnames are dropped before they reach the map or a finding.
 - The UDP socket sets `SIO_UDP_CONNRESET` on Windows so a single ICMP port-unreachable cannot kill
   the listener.
 
@@ -270,8 +327,15 @@ T0–T3 — a value from config cannot turn into a different flag.
 
 Hostnames (reverse DNS and mDNS), service banners, certificate names and UPnP port-mapping fields
 are chosen by the devices that send them. Where they enter the inventory they are reduced to one
-printable line (control characters, line breaks, terminal escapes and bidi overrides removed) and
-capped in length; a UPnP "internal client" must be an IPv4 address. On the way out they are escaped
+printable line (control characters, line breaks, terminal escapes, every Unicode bidi control
+including U+061C, and invisible default-ignorable characters such as zero-width spaces, BOM and
+Hangul fillers removed) and capped in length; a UPnP "internal client" must be an IPv4 address. The
+same helper (`util.safe_one_line`) is applied again to every notification line and every map label,
+so rows stored before a fix and owner nicknames are covered too. Alert bodies are sized in the unit
+each service counts (ntfy in UTF-8 bytes, at most 3900 of its 4096; Discord in UTF-16 units, at most
+4000 of 4096) and every finding line gets an equal share, so device-chosen emoji cannot push an alert
+past a service limit or push other findings out of it. The scheduled daily digest goes through the
+same sanitiser as every other alert. On the way out they are escaped
 again for each format: HTML, the Markdown report, Discord Markdown, RSS/toast XML, the terminal (CLI
 output shows control characters as `\xNN`) and the log (a message is always one line). The
 Windows toast never splices alert text into PowerShell source: the toast XML is passed as base64,
@@ -280,6 +344,26 @@ sweep adds at most 32 new devices (256 a day) after the first one, and reports a
 `NET-DEV-004`, so a device inventing MAC addresses cannot flood the inventory. The UPnP/IGD walk
 only talks to the device that answered, inside your LAN range, never to loopback or link-local
 addresses, and every fetch has a wall-clock deadline.
+
+### The host scanners assume malware may be trying to hide
+
+- **Autostart entries are compared by command, not only by name.** A changed Run value, Startup
+  shortcut target, task action or service path is reported as a changed entry, with the old command
+  in the evidence, until you accept it (`persistence.accept_entry`, or `promote_to_baseline` for
+  all). Unreviewed entries stay open for as long as they exist; they no longer auto-resolve after 7
+  days.
+- **Nothing is hidden on a self-declared field.** Scheduled tasks are filtered only by the
+  `\Microsoft\` folder (which a standard user cannot write), never by their Author. A service counts
+  as part of Windows only when its binary sits in the Windows folder, outside user-writable
+  subfolders, with a valid Microsoft signature, is not a script host or launcher, and has no outside
+  paths in its arguments.
+- **VirusTotal "unknown" and "clean" verdicts are provisional** and looked up again later (unknown
+  after 6 h, doubling up to 7 days; clean after 3 days), within the shared daily budget, because a
+  fresh payload is exactly what VirusTotal has not classified yet at download time.
+
+Known limits: an attacker with administrator rights can still hide a task in `\Microsoft\`, or a
+service behind a Microsoft- or WHQL-signed binary with Windows-only arguments, and an in-place swap
+of a binary that keeps the same command line is not detected.
 
 ### Least privilege, and exactly what needs admin
 
@@ -296,6 +380,18 @@ Three things do need admin, and each one is a separate script you run knowingly:
 | Let other LAN devices reach the resolver | `scripts/enable-lan-dns.ps1` | `New-NetFirewallRule` requires elevation |
 | Start at logon via Task Scheduler | `scripts/make-autostart.ps1 -Mode task` | `Register-ScheduledTask` requires elevation |
 | Nothing (the default path) | `scripts/install.ps1`, or `-Mode startup` | a Startup-folder shortcut needs no privileges |
+
+The logon task runs with normal rights by default. `make-autostart.ps1 -Mode task -Elevated` is
+opt-in and is refused unless the Home SOC tree, the base interpreter folder named in
+`.venv\pyvenv.cfg` (`home`) and all their parent folders are writable by administrators alone; a
+per-user python.org install (under `%LOCALAPPDATA%\Programs\Python`) therefore always fails the
+check. The elevated task runs `pythonw.exe -I -S scripts\run-elevated.py run`, which ignores
+`PYTHON*` variables and the user site, refuses an import path outside the venv and the base
+interpreter, and replaces the inherited environment (which includes the user-writable
+`HKCU\Environment`) with machine-wide values: a fixed Windows `PATH`, no per-user app folders. Only
+`HOMESOC_DATA` and `HOMESOC_CONFIG` are kept. An elevated Home SOC never runs `winget` (it lives in
+a user-writable folder), so the software-update check reports "winget not found" there.
+`-CheckOnly` runs the checks and prints the command without registering anything.
 
 Checks that a normal user cannot perform — Secure Boot state, TPM state, BitLocker volume status,
 the Security event log — are recorded as `needs_admin`, a distinct state from `fail`, and listed
@@ -346,11 +442,12 @@ them off in `config.toml`: `vulns.nvd_enrich = false`, leave `dns.virustotal_api
 The default is loopback-only, and for most people it should stay that way. If you want to reach the
 dashboard from your phone on the same Wi-Fi:
 
-1. **Set a token first, then change the host.** Not the other way round.
-   `python -m homesoc init` already generated one — keep it, or replace it with something at least as
-   long: `python -c "import secrets; print(secrets.token_urlsafe(24))"`. Then set
-   `web.host = "0.0.0.0"`. If you get the order wrong, `SOC-SYS-003` (high) will appear on your
-   dashboard, which is the point.
+1. **Set a token first, then change the host.** `python -m homesoc init` already generated one —
+   keep it, or replace it with something at least as long:
+   `python -c "import secrets; print(secrets.token_urlsafe(24))"`. Then set
+   `web.host = "0.0.0.0"`. If you get the order wrong, Home SOC generates and stores a token for you
+   and prints the login link; a token shorter than 16 characters is refused on a non-loopback
+   address.
 2. **Bind to one interface, not all of them.** If you know this machine's LAN address, put that in
    `web.host` instead of `0.0.0.0`. It will not then be reachable over a VPN interface or a second
    NIC you forgot about.

@@ -136,10 +136,13 @@ restart is implied anyway. When Lens *is* switched off, everything disappears ra
 refusing: `/lens`, `/lens/claim`, `/lens/pair`, `/lens/stickers`, `/lens-sw.js` and all of
 `/api/lens/*` answer **404**, while the rest of the dashboard is untouched.
 
-Leave `[web] token` set — this is not optional advice. With Lens on, the dashboard is reachable
-from the whole LAN, and with no token Home SOC authenticates nobody: anyone on the Wi-Fi can open
-`/lens/pair`, read the pairing code off the screen and pair their own phone. The whole pairing
-model assumes the dashboard token is set. See §11.
+Home SOC will not listen on the network without a token. With Lens on, the dashboard is reachable
+from the whole LAN, and a dashboard with no token would authenticate nobody: anyone on the Wi-Fi
+could open `/lens/pair`, read the pairing code off the screen and pair their own phone. So with
+`[web] token` empty, `serve --host 0.0.0.0` (or `run` with `web.host = "0.0.0.0"`) generates a
+random token, saves it in the database and prints the login link; a token shorter than 16
+characters is refused (exit code 2) with the exact fix. Keeping the random token `init` wrote is
+still the simplest path. See §11.
 
 ---
 
@@ -206,6 +209,21 @@ Certificate: data\tls\cert.pem
   Self-signed: the phone warns once, then remembers. Check the fingerprint matches.
 Dashboard: https://192.168.1.105:8443/login?token=<your-token>  (Ctrl-C to stop)
 ```
+
+If `[web] token` was empty, a block like this comes first, and the `Dashboard:` link then carries
+the generated token (it is printed on every start; open it once and the browser remembers you):
+
+```
+This dashboard is reachable from your network (0.0.0.0) and had no web.token,
+so Home SOC generated one and saved it in its database.
+Every device, this one included, now needs it: use the Dashboard link printed below once and
+the browser remembers it. To choose your own token instead, set [web] token (16+ characters)
+in config.toml and run: python -m homesoc config unset web.token
+```
+
+If it also says **"this dashboard may already have been open to the network without a password"**,
+an earlier version may have been reachable without a token: run `python -m homesoc lens revoke --all`
+and review `python -m homesoc config overrides` (`config unset <key>` anything you did not set).
 
 `--tls` works on `run` too — `python -m homesoc run --tls` — which is the normal mode (dashboard +
 scheduler + resolver) and what you actually want day to day. `serve --tls` is the dashboard alone.
@@ -308,7 +326,9 @@ host = "your-pc.your-tailnet.ts.net"
 ```
 
 Home SOC binds the address that name resolves to and adds the name to the allowlist. (Binding by
-name is verified; that it is *enough* for Tailscale Serve is not.)
+name is verified; that it is *enough* for Tailscale Serve is not.) Any host name counts as
+"not loopback", so the token rules of section 3 apply: an empty `[web] token` is generated and saved
+at startup, and one shorter than 16 characters is refused.
 
 **Obstacle 2: the plain-HTTP refusal.** With TLS terminated by the proxy, Home SOC sees a plain
 HTTP request and refuses to serve Lens to anything but a loopback peer (section 11). If the proxy
@@ -580,6 +600,15 @@ Lens names the reason on screen rather than showing a dead rectangle.
   last 30 days of their 825-day life, but only when Home SOC starts with `--tls`. Force it:
   `python -m homesoc lens cert --regenerate`, then restart.
 
+### "Refusing to listen on 0.0.0.0: web.token is only N characters"
+
+Home SOC will not listen on the network with a short, guessable token (anything under 16
+characters). Put a random one in `[web] token` of `config.toml`, for example the output of
+`python -c "import secrets; print(secrets.token_urlsafe(24))"`, and clear any Settings-page value
+with `python -m homesoc config unset web.token`. Or remove the token from both places and Home SOC
+generates one itself. A short token is still accepted when the dashboard listens on `127.0.0.1`
+only (with a warning), since then nothing else on the network can reach it.
+
 ### The phone cannot reach the host at all
 
 Work down this list; each step rules out the one above it.
@@ -709,7 +738,8 @@ longer use.
   else. The reverse holds in one direction only: **anything holding the dashboard token** can use
   the Lens API — from any host, not just this one, which is what makes `/lens/pair` and the
   `curl -k` unlearn call in §10 work. (With no `[web] token` set there is no dashboard credential
-  at all, and the only requests treated as the owner's are the ones from this machine.)
+  at all, and the only requests treated as the owner's are the ones from this machine. That can
+  only happen on a loopback bind: Home SOC generates a token before it listens on anything else.)
 - **Survive revocation, expiry, or `lens.enabled = false`.**
 
 ### How the token is handled
@@ -757,9 +787,12 @@ refused over plain HTTP either way: `require_https = false` will serve a phone t
 paired, but Home SOC will not mint a pairing code into a cleartext URL.
 
 Finding **SOC-SYS-003** (high) fires when the dashboard is reachable from the LAN with no
-`web.token`. That is the more severe of the two and the one to fix first: without the token,
-`/lens/pair` is open to everyone on the Wi-Fi, so anyone can read a pairing code and pair
-themselves. Lens's own token model cannot help — it is downstream of that page.
+`web.token`. `serve` and `run` no longer let that happen (they generate a token first), so the
+finding is now a backstop; it follows the address the server actually bound to, so a `scan` in a
+second terminal sees `serve --host 0.0.0.0` too. If it ever fires, it is the more severe of the two
+and the one to fix first: without the token, `/lens/pair` is open to everyone on the Wi-Fi, so
+anyone can read a pairing code and pair themselves. Lens's own token model cannot help — it is
+downstream of that page.
 
 ### Turning it all off
 

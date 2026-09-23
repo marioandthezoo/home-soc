@@ -7,9 +7,9 @@ timezone = "local"                 # display only; storage is UTC ISO-8601
 log_level = "INFO"
 
 [web]
-host = "127.0.0.1"                 # set 0.0.0.0 to reach the dashboard from other devices (then set token!)
+host = "127.0.0.1"                 # set 0.0.0.0 to reach the dashboard from other devices (a token is generated if empty)
 port = 8787
-token = ""                         # if non-empty, required as ?token= or X-Token header / login cookie
+token = ""                         # required as ?token= / X-Token header / login cookie; 16+ characters off loopback
 refresh_seconds = 15
 
 [network]

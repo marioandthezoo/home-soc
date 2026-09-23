@@ -5,17 +5,22 @@ looked up with ``GET /api/v3/files/<sha256>`` when a VirusTotal key is configure
 never uploaded. The daily quota is shared with the DNS reputation worker through
 ``dnsfilter.reputation.shared_budget`` (imported lazily; a local equivalent is used if that module
 is unavailable so this scanner never hard-depends on the DNS package).
+
+Only detections are final. "unknown" (VirusTotal has not seen the hash) and "clean" are provisional
+and looked up again later (:func:`recheck_due`), because a fresh payload is exactly what VirusTotal
+has not classified yet at download time. The API key is never sent across a redirect.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from homesoc import db
 from homesoc.models import ScanResult
 from homesoc.scanners.host_windows import Collector, cfg_get
-from homesoc.util import json_dumps, utcnow_iso
+from homesoc.util import age_seconds, json_dumps, utcnow_iso
 
 if TYPE_CHECKING:  # pragma: no cover
     from homesoc.config import Config
@@ -36,6 +41,8 @@ MAX_FILES_PER_RUN = 500
 MAX_DEPTH = 3
 VT_FILE_URL = "https://www.virustotal.com/api/v3/files/{sha256}"
 VT_TIMEOUT_SEC = 15
+# Wall clock for one whole lookup (connect, headers and capped body), as a multiple of VT_TIMEOUT_SEC.
+VT_WALL_CLOCK_FACTOR = 3
 VT_PER_MINUTE = 4
 VT_MAX_BODY_BYTES = 2 * 1024 * 1024  # untrusted third-party body; cap what one lookup can allocate
 
@@ -44,7 +51,17 @@ VERDICT_SUSPICIOUS = "suspicious"
 VERDICT_CLEAN = "clean"
 VERDICT_UNKNOWN = "unknown"      # VirusTotal has never seen this hash
 VERDICT_UNCHECKED = "unchecked"  # no key / no budget yet
-FINAL_VERDICTS = {VERDICT_MALICIOUS, VERDICT_SUSPICIOUS, VERDICT_CLEAN, VERDICT_UNKNOWN}
+#: Verdicts that are never looked up again: a detection does not go away by asking twice.
+FINAL_VERDICTS = {VERDICT_MALICIOUS, VERDICT_SUSPICIOUS}
+#: Verdicts that are provisional. A fresh payload is typically "unknown" (never seen) or "clean"
+#: (seen, not yet detected) at download time and detected hours or days later, so these are looked
+#: up again once they are old enough (see :func:`recheck_due`), within the shared daily budget.
+RECHECK_VERDICTS = {VERDICT_UNKNOWN, VERDICT_CLEAN}
+#: First re-check of an "unknown" hash after 6 h, then 12 h, 24 h, ... (doubling, capped at 7 days).
+UNKNOWN_RECHECK_SEC = 6 * 3600
+#: A "clean" hash is looked up again when the file shows up again 3 days or more later.
+CLEAN_RECHECK_SEC = 3 * 86400
+RECHECK_MAX_SEC = 7 * 86400
 
 _SKIP_SUFFIXES = {".crdownload", ".part", ".tmp", ".partial"}
 
@@ -182,19 +199,41 @@ def sha256_of(path: Path) -> str | None:
 # --------------------------------------------------------------------------- virustotal
 
 
+@contextlib.contextmanager
+def _get_no_redirects(requests_mod: Any, url: str, **kwargs: Any) -> Iterator[Any]:
+    """GET that never follows a redirect (``allow_redirects=False``); a 3xx comes back as-is.
+
+    ``requests_mod`` is the ``requests`` module (a parameter so tests can pass a double).
+    (``max_redirects = 0`` is deliberately not set: ``requests`` then raises on any 3xx even with
+    ``allow_redirects=False``, which would hide the status code.)
+    """
+    with requests_mod.Session() as session, session.get(url, allow_redirects=False, **kwargs) as resp:
+        yield resp
+
+
 def vt_fetch(api_key: str, sha256: str, timeout: float = VT_TIMEOUT_SEC) -> tuple[int, dict[str, Any] | None]:
     """``(http_status, json)``; status 0 on network failure. Split out so tests can stub it.
 
     The body is streamed and hard-capped at :data:`VT_MAX_BODY_BYTES`: this is third-party input,
     and a report for a heavily-detected file can be large, so an unbounded ``resp.json()`` would
     let the remote side decide how much memory a scan uses.
+
+    Redirects are never followed. ``requests`` strips only ``Authorization`` on a cross-host
+    redirect, so the ``x-apikey`` header would otherwise be replayed to whatever host a ``Location``
+    header names. Any 3xx is returned as its status code, which :func:`lookup_hash` maps to
+    "unchecked".
     """
     try:
         import requests
     except ImportError:  # pragma: no cover
         return 0, None
+    from homesoc.feeds.netguard import Watch
+
+    # requests' timeout is per recv: a server that drips one byte at a time never trips it. The
+    # watch shuts the connection down when the wall clock runs out, whatever phase it is in.
     try:
-        with requests.get(
+        with Watch(lambda: max(float(timeout), 1.0) * VT_WALL_CLOCK_FACTOR, "VirusTotal lookup"), _get_no_redirects(
+            requests,
             VT_FILE_URL.format(sha256=sha256),
             headers={"x-apikey": api_key, "accept": "application/json"},
             timeout=timeout,
@@ -263,13 +302,54 @@ def existing_check(conn: Any, sha256: str) -> dict[str, Any] | None:
 
 
 def upsert_check(conn: Any, sha256: str, path: Path, size: int, verdict: str, source: str | None, detail: dict[str, Any] | None) -> None:
+    """Insert or refresh a hash. ``detail=None`` keeps the stored detail (a cached run has none)."""
     db.write(
         conn,
         "INSERT INTO file_checks(sha256, path, size, first_seen, verdict, source, detail) VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(sha256) DO UPDATE SET path = excluded.path, size = excluded.size, verdict = excluded.verdict, "
-        "source = excluded.source, detail = excluded.detail",
+        "source = excluded.source, detail = COALESCE(excluded.detail, file_checks.detail)",
         (sha256, str(path), int(size), utcnow_iso(), verdict, source, json_dumps(detail) if detail else None),
     )
+
+
+def _detail_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def recheck_due(row: dict[str, Any] | None) -> bool:
+    """Whether a stored hash should be looked up (again).
+
+    Detections are final. "unknown" is re-checked after :data:`UNKNOWN_RECHECK_SEC`, doubling per
+    unsuccessful attempt up to :data:`RECHECK_MAX_SEC`; "clean" after :data:`CLEAN_RECHECK_SEC`.
+    Files are only candidates while they are recent, so in practice this means "a few more times
+    while the download is fresh, and again whenever the same file is downloaded later".
+    """
+    if row is None:
+        return True
+    verdict = row.get("verdict")
+    if verdict in FINAL_VERDICTS:
+        return False
+    if verdict not in RECHECK_VERDICTS:
+        return True  # unchecked (no key or no budget last time)
+    detail = _detail_dict(row.get("detail"))
+    age = age_seconds(detail.get("checked_at") or row.get("first_seen"))
+    if age is None:
+        return True
+    if verdict == VERDICT_UNKNOWN:
+        try:
+            attempts = max(1, int(detail.get("attempts") or 1))
+        except (TypeError, ValueError):
+            attempts = 1
+        interval = min(RECHECK_MAX_SEC, UNKNOWN_RECHECK_SEC * 2 ** min(attempts - 1, 8))
+    else:
+        interval = CLEAN_RECHECK_SEC
+    return age >= interval
 
 
 # --------------------------------------------------------------------------- scanner entry point
@@ -306,15 +386,25 @@ def run(cfg: Config, conn: Any, *, quick: bool = False, progress: Callable[[str]
         verdict = row["verdict"] if row else VERDICT_UNCHECKED
         source = row["source"] if row else None
         detail: dict[str, Any] | None = None
-        if row and row["verdict"] in FINAL_VERDICTS:
+        if not recheck_due(row):
             counts["cached"] += 1
         elif api_key and budget is not None and not stop_lookups:
             if budget.try_acquire():
-                verdict, detail = lookup_hash(api_key, digest, min_malicious)
-                source = "virustotal"
+                new_verdict, new_detail = lookup_hash(api_key, digest, min_malicious)
                 counts["looked_up"] += 1
-                if detail.get("http") == 429:
+                if new_detail.get("http") == 429:
                     stop_lookups = True  # quota hit upstream; stop spending the day's budget
+                if new_verdict == VERDICT_UNCHECKED and row and row["verdict"] in RECHECK_VERDICTS:
+                    pass  # a failed re-check keeps what we knew; checked_at is unchanged, so it retries next run
+                else:
+                    verdict, detail, source = new_verdict, new_detail, "virustotal"
+                    detail["checked_at"] = utcnow_iso()
+                    if verdict == VERDICT_UNKNOWN:
+                        prior = _detail_dict(row.get("detail")) if row and row["verdict"] == VERDICT_UNKNOWN else {}
+                        try:
+                            detail["attempts"] = int(prior.get("attempts") or 1) + 1 if prior else 1
+                        except (TypeError, ValueError):
+                            detail["attempts"] = 1
             else:
                 counts["budget_exhausted"] += 1
         upsert_check(conn, digest, path, size, verdict, source, detail)
@@ -352,6 +442,7 @@ __all__ = [
     "candidate_files",
     "get_budget",
     "lookup_hash",
+    "recheck_due",
     "run",
     "sha256_of",
     "verdict_from_stats",

@@ -158,7 +158,12 @@ def match_services(cfg, conn: sqlite3.Connection, *, quick: bool = False,
             summary["kev_possible"] += possible
             summary["kev_suppressed"] += suppressed
         if nvd_enabled and not quick:
-            status = _match_nvd(ctx, api_key, conn, budget, limiter, min_cvss, now)
+            try:
+                status = _match_nvd(ctx, api_key, conn, budget, limiter, min_cvss, now)
+            except Exception as exc:  # noqa: BLE001 - one bad NVD answer costs one service, not the scan
+                logger.warning("NVD enrichment failed for %s: %s: %s", ctx.subject, type(exc).__name__, exc)
+                errors.append(f"nvd: {ctx.subject}: {type(exc).__name__}")
+                status = "skipped"
             summary[f"nvd_{status}"] += 1
         _apply_epss(ctx, epss)
         summary["vulns_upserted"] += _upsert_vulns(conn, ctx.vulns, now)

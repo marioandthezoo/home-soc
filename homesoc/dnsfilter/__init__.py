@@ -8,6 +8,8 @@ Package layout (SPEC §12):
 * ``upstream``   — UDP → TCP → DoH forwarding with health tracking
 * ``querylog``   — batched query log, hourly rollup, retention, dashboard aggregates
 * ``reputation`` — VirusTotal / URLhaus lookups with a persisted daily budget and async worker
+* ``clients``    — ``KnownClients``: inventory addresses that get reserved query-log and reputation
+  capacity, so forged UDP source addresses cannot use it up
 
 The small DB/config helpers below live here (not in a private module) because every submodule needs
 them and the package must keep working while the core package (``homesoc.db``/``homesoc.config``)

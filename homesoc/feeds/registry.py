@@ -65,7 +65,8 @@ FEEDS: dict[str, FeedSpec] = {
               "epss", parsers.parse_epss, 24, "FIRST EPSS, free for non-commercial use with attribution",
               max_bytes=32 * _MB, gzip=True),  # ~13 MB of csv inside ~2.6 MB of gzip today
         _spec("oui", "https://www.wireshark.org/download/automated/data/manuf",
-              "oui", parsers.parse_oui, 168, "Wireshark manuf (IEEE OUI data), GPLv2 data file"),
+              "oui", parsers.parse_oui, 168, "Wireshark manuf (IEEE OUI data), GPLv2 data file",
+              max_bytes=16 * _MB),  # ~3 MB today; re-read by every vendor lookup
         _spec("oisd_small", "https://small.oisd.nl", "domains", parsers.parse_adblock, 12,
               "oisd, CC BY-SA 4.0"),
         _spec("oisd_big", "https://big.oisd.nl", "domains", parsers.parse_adblock, 12,
@@ -156,6 +157,11 @@ def _cached(name: str, path: Path, loader: Callable[[str], Any], empty: Callable
                 value = loader(text)
         except OSError as exc:
             logger.warning("cannot read feed file %s: %s", path, exc)
+            value = empty()
+        except Exception as exc:  # noqa: BLE001 - a feed file is untrusted: bad content means "no data"
+            # e.g. RecursionError from JSON nested past the stack. Cached under this signature, so
+            # the file is not re-parsed until it changes.
+            logger.warning("cannot parse feed file %s: %s: %s", path, type(exc).__name__, exc)
             value = empty()
     with _cache_lock:
         _cache[name] = _CacheEntry(signature=sig, value=value)
@@ -320,14 +326,16 @@ def load_kev() -> KevCatalog:
 
 
 def load_epss() -> dict[str, float]:
-    return _cached("epss", _path("epss"), parsers.parse_epss, dict, file_loader=parsers.parse_epss_lines)
+    return _cached("epss", _path("epss"), parsers.parse_epss, dict,
+                   file_loader=lambda fh: parsers.parse_epss_lines(parsers.bounded_lines(fh)))
 
 
 # -------------------------------------------------------------------- OUI ---
 
 
 def load_oui() -> dict[str, str]:
-    return _cached("oui", _path("oui"), parsers.parse_oui, dict)
+    return _cached("oui", _path("oui"), parsers.parse_oui, dict,
+                   file_loader=lambda fh: parsers.parse_oui(parsers.bounded_lines(fh)))
 
 
 def _mac_hex(mac: str) -> str | None:
@@ -378,7 +386,10 @@ def load_blocklist(name: str) -> set[str]:
     def loader(text: str) -> set[str]:
         return set(spec.parser(text))  # type: ignore[misc]
 
-    return _cached(name, _path(name), loader, set)
+    def file_loader(fh: IO[str]) -> set[str]:
+        return set(spec.parser(parsers.bounded_lines(fh)))  # type: ignore[misc]
+
+    return _cached(name, _path(name), loader, set, file_loader=file_loader)
 
 
 def load_ipset(name: str) -> list[ipaddress.IPv4Network]:
@@ -390,7 +401,12 @@ def load_ipset(name: str) -> list[ipaddress.IPv4Network]:
     def loader(text: str) -> list[ipaddress.IPv4Network]:
         return list(spec.parser(text))  # type: ignore[misc]
 
-    return _cached(name, _path(name), loader, list)
+    def file_loader(fh: IO[str]) -> list[ipaddress.IPv4Network]:
+        return list(spec.parser(parsers.bounded_lines(fh)))  # type: ignore[misc]
+
+    # Feodo is one JSON document (read whole, capped at 8 MB); DROP-style lists are read line by line.
+    line_parser = spec.parser is not parsers.parse_feodo
+    return _cached(name, _path(name), loader, list, file_loader=file_loader if line_parser else None)
 
 
 def iter_domain_feeds() -> Iterator[FeedSpec]:

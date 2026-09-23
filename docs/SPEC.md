@@ -464,7 +464,7 @@ Daily digest at `digest_hour` (scheduler job): counts + top 5 open findings.
   → blocklists (exact and parent-suffix match against a `set[str]`; wildcard lists load as suffix rules) → reputation
   table (verdict malicious with `malicious ≥ reputation_min_malicious_votes`) → allow. Lists reload when feed files change
   (mtime check every 60 s). Memory target: ≤ 150 MB with oisd_small + hagezi_pro + malware lists.
-- `server.py`: `DnsServer(cfg, conn).start()/stop()`; threads: UDP receiver (socketserver.ThreadingUDPServer) and TCP
+- `server.py`: `DnsServer(cfg, conn).start()/stop()`; threads: UDP listener (socketserver.UDPServer feeding a fixed worker pool) and TCP
   (ThreadingTCPServer, 2-byte length framing), binding `cfg.dns.listen:port`; per-query: parse with dnslib; refuse non-IN
   class and `ANY`; cache lookup (`cache.py`, TTL-respecting, min TTL 30 s, negative cache 60 s, max entries); policy;
   block → `block_mode` response (null: A 0.0.0.0 / AAAA :: TTL 60; other qtypes NODATA; nxdomain: RCODE NXDOMAIN);
@@ -562,7 +562,7 @@ colors critical #e5484d, high #f76b15, medium #ffb224, low #46a758, info #3e63dd
 - `run.bat`: `@echo off`, cd to script dir, `if not exist .venv python -m venv .venv`, activate, `pip install -r requirements.txt -q`,
   `python -m homesoc init` (idempotent), `python -m homesoc run`. `run.sh` equivalent.
 - `scripts/install.ps1`: same as run.bat steps without run; creates a Startup-folder shortcut to run.bat (no admin);
-  prints next steps. `scripts/make-autostart.ps1`: `-Mode startup|task` (task requires admin, uses schtasks at logon, highest).
+  prints next steps. `scripts/make-autostart.ps1`: `-Mode startup|task` (registering the task requires admin; the task runs at logon with normal rights. `-Elevated` is opt-in, refused unless the Home SOC tree and the venv's base interpreter are admin-only, and runs `pythonw.exe -I -S scripts\run-elevated.py run` with a machine-only environment; `-CheckOnly` previews the checks).
 - `scripts/enable-lan-dns.ps1` (requires admin): `New-NetFirewallRule -DisplayName "Home SOC DNS" -Direction Inbound -Protocol UDP -LocalPort 53 -Action Allow -Profile Private` (+TCP), prints router instructions.
 - `requirements.txt`: a hash-locked runtime lock generated with pip-compile (`flask==3.1.3`, `requests==2.34.2`,
   `dnslib==0.9.26`, their whole transitive closure and pip), installed with `--require-hashes`. `pytest>=9.0.3`

@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from homesoc import db
 from homesoc.models import ScanResult
 from homesoc.scanners.host_windows import PS_DIR, Collector, as_list, is_denied, run_ps_json, write_checks
-from homesoc.util import is_macos, is_windows, json_dumps, parse_iso, run_cmd, utcnow_iso, which
+from homesoc.util import is_elevated, is_macos, is_windows, json_dumps, parse_iso, run_cmd, utcnow_iso, which
 
 if TYPE_CHECKING:  # pragma: no cover
     from homesoc.config import Config
@@ -66,6 +66,11 @@ def is_high_risk(name: str, package_id: str | None = None) -> bool:
 
 
 def winget_exe() -> str | None:
+    # winget is found on the user's PATH or in %LOCALAPPDATA%\Microsoft\WindowsApps, both of which
+    # the user can write without admin rights. Running whatever sits there from an elevated Home SOC
+    # would hand a non-admin program administrator rights, so an elevated process never runs it.
+    if is_elevated():
+        return None
     found = which("winget")
     if found:
         return found

@@ -214,6 +214,19 @@ def is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def is_elevated() -> bool:
+    """True when this process runs with administrator rights (Windows) or as root (POSIX).
+    Any failure to tell counts as not elevated."""
+    try:
+        if is_windows():
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        return os.geteuid() == 0
+    except (AttributeError, OSError):
+        return False
+
+
 def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
@@ -337,20 +350,47 @@ def _gateway_macos() -> str | None:
 
 # ------------------------------------------------------------------ device text
 
-# C0/C1 controls (CR, LF, ESC, NEL, CSI...), DEL, Unicode line/paragraph separators and the bidi
-# override/isolate/mark characters. Same class as findings.catalog.one_line.
-_DEVICE_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
+# Replaced by a space: C0/C1 controls (CR, LF, ESC, NEL, CSI...), DEL, U+2028/2029, lone
+# surrogates (they cannot be encoded as UTF-8, so one would abort a notification channel), and the
+# whole Unicode Bidi_Control set, including U+061C ARABIC LETTER MARK, which is invisible yet
+# strongly right-to-left and reorders the digits and punctuation that follow it.
+UNSAFE_TEXT = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff"
+    r"\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+"
+)
+# Removed outright: every other Default_Ignorable_Code_Point (Unicode DerivedCoreProperties), the
+# characters a renderer draws as nothing: soft hyphen, zero-width space/joiners, word joiner and
+# invisible operators, BOM, variation selectors, the Hangul fillers (U+115F/1160/3164/FFA0 look
+# blank but are "letters"), Mongolian and Khmer invisibles, and the Tag block. Removing rather than
+# spacing them keeps emoji readable and shows exactly what a reader sees, so a device name cannot
+# carry invisible padding that looks like a trusted name while comparing differently.
+INVISIBLE_TEXT = re.compile(
+    r"[\u00ad\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200d\u2060-\u2065\u206a-\u206f"
+    r"\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8"
+    r"\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]+"
+)
+# Old name, kept for callers that imported it.
+_DEVICE_UNSAFE = UNSAFE_TEXT
+
+
+def safe_one_line(value: Any) -> str:
+    """``value`` as one printable line: control, line-separator, bidi and lone-surrogate characters
+    become a space and invisible (default-ignorable) characters are removed. Not trimmed or capped.
+    The one sanitiser shared by device_text, the notification channels and the topology labels
+    (findings.catalog.one_line should switch to it too)."""
+    if value is None:
+        return ""
+    return INVISIBLE_TEXT.sub("", UNSAFE_TEXT.sub(" ", str(value)))
 
 
 def device_text(value: Any, limit: int = 256) -> str:
     """A string a LAN device chose (hostname, banner, UPnP field, certificate name), made safe to
-    store: one printable line, runs of control/bidi characters collapsed to a single space,
-    trimmed and capped at ``limit``. Applied where such text enters the inventory, so every
-    consumer (dashboard, notifications, CLI, logs, reports) sees the same harmless string."""
+    store: one printable line (see safe_one_line), trimmed and capped at ``limit``. Applied where
+    such text enters the inventory, so every consumer (dashboard, notifications, CLI, logs,
+    reports) sees the same harmless string."""
     if value is None:
         return ""
-    flat = _DEVICE_UNSAFE.sub(" ", str(value))
-    return flat.strip()[:limit].strip()
+    return safe_one_line(value).strip()[:limit].strip()
 
 
 # ----------------------------------------------------------------------- terminal

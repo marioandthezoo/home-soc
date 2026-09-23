@@ -214,9 +214,16 @@ def _reverse_adjacency(edges: list[Edge]) -> dict[str, list[str]]:
     return out
 
 
-def dependents(edges: list[Edge], node_id: str) -> list[str]:
-    """Everything that transitively depends on ``node_id``, in a deterministic order."""
-    reverse = _reverse_adjacency(edges)
+def dependents(edges: list[Edge], node_id: str, *, reverse: dict[str, list[str]] | None = None) -> list[str]:
+    """Everything that transitively depends on ``node_id``, in a deterministic order.
+
+    ``reverse`` is a :func:`_reverse_adjacency` the caller already built. Pass it whenever this
+    is called more than once over the same edges: rebuilding it on every call is what made a
+    graph build O(nodes x edges), and let a LAN device that churns MAC addresses turn every map,
+    overview and Lens request into minutes of CPU inside the resolver's process.
+    """
+    if reverse is None:
+        reverse = _reverse_adjacency(edges)
     seen: set[str] = set()
     stack = list(reverse.get(node_id, ()))
     while stack:
@@ -229,9 +236,96 @@ def dependents(edges: list[Edge], node_id: str) -> list[str]:
 
 
 def _dependent_counts(edges: list[Edge]) -> dict[str, int]:
-    """How many *devices* depend on each node — Node.criticality."""
+    """How many *devices* depend on each node — Node.criticality.
+
+    Keys are the nodes that are the target of at least one dependency edge; the value is the
+    number of distinct ``device:*`` nodes that reach it (never counting the node itself), which
+    is exactly ``len([d for d in dependents(edges, n) if d.startswith("device:")])``.
+
+    Computed in one pass rather than one traversal per node. The traversal-per-node version was
+    O(targets x edges) — it also rebuilt the reverse map every time — and targets and edges both
+    grow with the number of device identities a LAN device can mint, so the cost grew with the
+    square of something an attacker controls. Here the reverse graph is condensed into strongly
+    connected components (Tarjan, iteratively: no recursion limit to hit), and each component's
+    set of dependent devices is a bitmask built from the components it points at, which Tarjan
+    has always finished first. That is O(nodes + edges) set unions of at most one bit per device.
+    """
     reverse = _reverse_adjacency(edges)
-    return {node_id: sum(1 for d in dependents(edges, node_id) if d.startswith("device:")) for node_id in reverse}
+    if not reverse:
+        return {}
+    nodes: set[str] = set(reverse)
+    referenced: set[str] = set()  # nodes some other node's closure reads: every dependency src
+    for srcs in reverse.values():
+        nodes.update(srcs)
+        referenced.update(srcs)
+    device_bit = {name: 1 << i for i, name in enumerate(sorted(n for n in nodes if n.startswith("device:")))}
+
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    comp_of: dict[str, int] = {}
+    closures: dict[int, int] = {}  # component -> bitmask of devices that reach it (kept only if referenced)
+    counts: dict[str, int] = {}
+    next_index = 0
+    next_comp = 0
+
+    for root in sorted(nodes):
+        if root in index:
+            continue
+        index[root] = low[root] = next_index
+        next_index += 1
+        stack.append(root)
+        on_stack.add(root)
+        work: list[tuple[str, Any]] = [(root, iter(reverse.get(root, ())))]
+        while work:
+            node, successors = work[-1]
+            descended = False
+            for nxt in successors:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = next_index
+                    next_index += 1
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(reverse.get(nxt, ()))))
+                    descended = True
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            if descended:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] != index[node]:
+                continue
+            members: list[str] = []
+            while True:
+                member = stack.pop()
+                on_stack.discard(member)
+                members.append(member)
+                comp_of[member] = next_comp
+                if member == node:
+                    break
+            # Inside a cycle every member reaches every other, so the component's own devices
+            # are dependents of each member (each member's own bit is masked off below).
+            mask = 0
+            if len(members) > 1:
+                for member in members:
+                    mask |= device_bit.get(member, 0)
+            for member in members:
+                for src in reverse.get(member, ()):
+                    other = comp_of[src]
+                    if other != next_comp:
+                        mask |= device_bit.get(src, 0) | closures.get(other, 0)
+            if any(m in referenced for m in members) and mask:
+                closures[next_comp] = mask
+            for member in members:
+                if member in reverse:
+                    counts[member] = (mask & ~device_bit.get(member, 0)).bit_count()
+            next_comp += 1
+    return counts
 
 
 # ------------------------------------------------------------------ criticality
@@ -260,15 +354,25 @@ def criticality(conn: sqlite3.Connection, *, hours: int = 168,
         # them here makes a handed-in graph produce exactly the include_cloud=False answer.
         edges = [e for e in edges if e.edge_type not in ("cloud", "cloud_blocked")]
     triggered = outages_mod.trigger_counts(conn)
+    # Everything per-device below is a lookup into maps built once. Scanning every edge for every
+    # device row was O(devices x edges), and both grow with the identities a LAN device can mint.
+    counts = _dependent_counts(edges)
+    hosted_on: dict[str, set[str]] = {}
+    users_of: dict[str, set[str]] = {}
+    for edge in edges:
+        if edge.edge_type == "hosted_by":
+            hosted_on.setdefault(edge.dst, set()).add(edge.src)
+        elif edge.edge_type == "uses":
+            users_of.setdefault(edge.dst, set()).add(edge.src)
     out: list[dict[str, Any]] = []
     for row in db.query(conn, "SELECT id, mac, ip, hostname, nickname, kind FROM devices ORDER BY id"):
         device_id = int(row["id"])
         node_id = f"device:{device_id}"
-        depending = [d for d in dependents(edges, node_id) if d.startswith("device:")]
-        count = len(depending)
+        count = int(counts.get(node_id, 0))
         outage_count = int(triggered.get(device_id, 0))
-        hosted = [e for e in edges if e.edge_type == "hosted_by" and e.dst == node_id]
-        consumers = {e.src for e in edges if e.edge_type == "uses" and e.dst in {h.src for h in hosted}}
+        consumers: set[str] = set()
+        for provider_id in hosted_on.get(node_id, ()):
+            consumers |= users_of.get(provider_id, set())
         if not count and not outage_count:
             continue
         weight = count + (5 if outage_count >= 2 else 2 if outage_count else 0) + (3 if consumers else 0)
@@ -459,7 +563,7 @@ def blast_radius(conn: sqlite3.Connection, device_id: int, *, hours: int = 168,
         "degraded": sorted(degraded.values(), key=lambda d: d["label"].lower()),
         "unaffected": sorted(unaffected, key=lambda d: d["label"].lower()),
         "services_lost": _dedupe_keep_order(services_lost),
-        "headline": headline(name, is_gateway, len(degraded), len(offline), len(unaffected), services_lost),
+        "headline": headline(_spoken_name(row, name), is_gateway, len(degraded), len(offline), len(unaffected), services_lost),
         "confidence": confidence,
         # Only outages this device actually headed may speak for its blast radius. A device that
         # was merely caught in three gateway outages has an evidence slot that must stay empty,
@@ -508,6 +612,30 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+_KIND_NOUN: dict[str, str] = {
+    "router": "router", "gateway": "router", "camera": "camera", "printer": "printer", "phone": "phone",
+    "tablet": "tablet", "tv": "TV", "speaker": "speaker", "computer": "computer", "laptop": "laptop",
+    "pc": "computer", "iot": "smart device", "console": "games console", "nas": "network storage",
+}
+
+
+def _spoken_name(row: Any, name: str) -> str:
+    """The name for a sentence: a device with no nickname or hostname is "the unnamed camera
+    (192.168.1.142)", never a bare address standing in for a name."""
+    from homesoc.topology import infer  # local: infer imports this module
+
+    try:
+        named = any(infer.clean_text(row[k]) for k in ("nickname", "hostname"))
+        kind = str(row["kind"] or "").strip().lower()
+        ip = infer.clean_text(row["ip"])
+    except (KeyError, IndexError, TypeError):
+        return name
+    if named:
+        return name
+    noun = _KIND_NOUN.get(kind, "device")
+    return f"the unnamed {noun} ({ip})" if ip else f"the unnamed {noun}"
 
 
 def headline(name: str, is_gateway: bool, degraded: int, offline: int, unaffected: int, services_lost: list[str]) -> str:
@@ -584,6 +712,15 @@ def refresh(conn: sqlite3.Connection, *, hours: int = 168, include_cloud: bool =
     Tuesday" is the one piece of information the rebuild cannot recover.
     """
     nodes, edges = build_graph(conn, hours=hours, include_cloud=include_cloud)
+    return store(conn, nodes, edges, hours=hours)
+
+
+def store(conn: sqlite3.Connection, nodes: list[Node], edges: list[Edge], *, hours: int = 168) -> dict[str, Any]:
+    """Write a graph the caller already built to ``dep_edges`` (the second half of :func:`refresh`).
+
+    Split out so the topology job can build the graph once and hand the same edges to
+    :func:`criticality`, instead of paying for a second full build under the write lock.
+    """
     now = utcnow_iso()
     existing = {
         (str(r["src"]), str(r["dst"]), str(r["edge_type"])): str(r["first_seen"])
@@ -639,5 +776,5 @@ __all__ = [
     "CONFIDENCES", "CONFIDENCE_RANK", "NODE_KINDS", "EDGE_TYPES", "DEPENDENCY_EDGE_TYPES",
     "INTERNET_ID", "RESOLVER_ID", "NOTE", "LEGEND",
     "Node", "Edge",
-    "build_graph", "criticality", "blast_radius", "refresh", "stored_edges", "dependents", "headline",
+    "build_graph", "criticality", "blast_radius", "refresh", "store", "stored_edges", "dependents", "headline",
 ]

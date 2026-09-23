@@ -5,6 +5,12 @@ third parties and may contain junk, CRLF line endings, inline comments,
 oversized lines or unexpected syntax. Each parser tolerates what it can and
 silently drops the rest, so a single malformed line never poisons a list.
 No parser touches the network, the database or the filesystem.
+
+Line-oriented parsers accept either the whole text or any iterable of lines (an
+open file wrapped in bounded_lines(), a batch list), and every one of them drops
+a line longer than MAX_LINE_CHARS before splitting it: a 60 MB file that is one
+line of short tokens would otherwise become ~20 million str objects (~1.3 GB)
+in the process that also runs the LAN's DNS resolver.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import IO, Any
 from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
@@ -45,14 +51,52 @@ _HOSTS_NOISE = frozenset(
 
 _COMMENT_PREFIXES = ("#", "!", ";", "//")
 
+# No real list line comes near this (a domain is at most 253 characters; the DNS policy's own
+# parser refuses lines over 2048). Longer lines are dropped unread rather than split.
+MAX_LINE_CHARS = 4096
 
-def _lines(text: str) -> Iterator[str]:
-    """Yield trimmed, non-empty, non-comment lines regardless of line endings."""
-    for raw in text.splitlines():
+Lines = str | Iterable[str]
+
+
+def bounded_lines(fh: IO[str], max_chars: int = MAX_LINE_CHARS) -> Iterator[str]:
+    """Yield the lines of an open text file, skipping any longer than `max_chars` without holding it.
+
+    An over-long line is read and discarded in `max_chars` pieces, so memory stays bounded by
+    `max_chars` however long the line is.
+    """
+    while True:
+        line = fh.readline(max_chars + 1)
+        if not line:
+            return
+        if len(line) > max_chars and line[-1] not in "\r\n":
+            while True:  # drain the rest of the over-long line
+                rest = fh.readline(max_chars + 1)
+                if not rest or rest[-1] in "\r\n":
+                    break
+            continue
+        yield line
+
+
+def _lines(text: Lines) -> Iterator[str]:
+    """Yield trimmed, non-empty, non-comment lines regardless of line endings.
+
+    `text` is the whole document or an iterable of lines. Lines over MAX_LINE_CHARS are
+    skipped before they are stripped or split.
+    """
+    raw_lines: Iterable[str] = text.splitlines() if isinstance(text, str) else text
+    for raw in raw_lines:
+        if len(raw) > MAX_LINE_CHARS + 2:  # + room for a line ending
+            continue
         line = raw.strip()
         if not line or line.startswith(_COMMENT_PREFIXES):
             continue
         yield line
+
+
+def _first_token(line: str) -> str:
+    """The first whitespace-separated token, without splitting the rest of the line."""
+    tokens = line.split(None, 1)
+    return tokens[0] if tokens else ""
 
 
 def _strip_inline_comment(line: str) -> str:
@@ -102,7 +146,7 @@ def _is_ip(token: str) -> bool:
     return True
 
 
-def parse_hosts(text: str) -> Iterator[str]:
+def parse_hosts(text: Lines) -> Iterator[str]:
     """Yield domains from hosts-file lines ("0.0.0.0 host [host ...]").
 
     IPv6 sink addresses (::, ::1) and scoped link-local addresses are accepted
@@ -125,7 +169,7 @@ def parse_hosts(text: str) -> Iterator[str]:
                 yield dom
 
 
-def parse_domains(text: str) -> Iterator[str]:
+def parse_domains(text: Lines) -> Iterator[str]:
     """Yield domains from a plain one-per-line list.
 
     Lenient on purpose: a "plain" list in the wild often carries stray
@@ -139,7 +183,7 @@ def parse_domains(text: str) -> Iterator[str]:
         if line.startswith("||"):
             dom = _adblock_domain(line)
         else:
-            tokens = line.split()
+            tokens = line.split(None, 2)
             if not tokens:
                 continue
             token = tokens[1] if (_is_ip(tokens[0]) and len(tokens) > 1) else tokens[0]
@@ -170,7 +214,7 @@ def _adblock_domain(rule: str) -> str | None:
     return normalize_domain(body)
 
 
-def parse_adblock(text: str) -> Iterator[str]:
+def parse_adblock(text: Lines) -> Iterator[str]:
     """Yield domains from an Adblock-Plus-style list (oisd, AdGuard DNS filter).
 
     Exceptions ("@@..."), cosmetic rules ("##"), regex rules and rules with
@@ -191,7 +235,7 @@ def parse_adblock(text: str) -> Iterator[str]:
         elif line.startswith("|") or "$" in line or "*" in line or "/" in line:
             dom = None
         else:
-            tokens = line.split()
+            tokens = line.split(None, 2)
             if not tokens:
                 continue
             token = tokens[1] if (_is_ip(tokens[0]) and len(tokens) > 1) else tokens[0]
@@ -201,7 +245,7 @@ def parse_adblock(text: str) -> Iterator[str]:
             yield dom
 
 
-def parse_wildcard(text: str) -> Iterator[str]:
+def parse_wildcard(text: Lines) -> Iterator[str]:
     """Yield domains from a "*.domain" wildcard list (hagezi onlydomains style).
 
     The wildcard prefix is dropped; the DNS policy applies suffix matching to
@@ -210,7 +254,7 @@ def parse_wildcard(text: str) -> Iterator[str]:
     seen: set[str] = set()
     for line in _lines(text):
         line = _strip_inline_comment(line)
-        token = line.split()[0] if line.split() else ""
+        token = _first_token(line)
         if token.startswith("*."):
             token = token[2:]
         elif token.startswith("."):
@@ -221,7 +265,7 @@ def parse_wildcard(text: str) -> Iterator[str]:
             yield dom
 
 
-def parse_urls(text: str) -> Iterator[str]:
+def parse_urls(text: Lines) -> Iterator[str]:
     """Yield the host part of URL lines (OpenPhish). IP-literal hosts are dropped.
 
     A DNS filter can only act on names, so a phishing URL served straight from
@@ -229,7 +273,9 @@ def parse_urls(text: str) -> Iterator[str]:
     """
     seen: set[str] = set()
     for line in _lines(text):
-        line = _strip_inline_comment(line).split()[0] if line.split() else ""
+        line = _first_token(_strip_inline_comment(line))
+        if not line:
+            continue
         if "://" not in line:
             line = "http://" + line
         try:
@@ -244,7 +290,7 @@ def parse_urls(text: str) -> Iterator[str]:
             yield dom
 
 
-def parse_ips(text: str) -> Iterator[ipaddress.IPv4Network]:
+def parse_ips(text: Lines) -> Iterator[ipaddress.IPv4Network]:
     """Yield IPv4 networks from a DROP-style list ("1.2.3.0/24 ; SBL123") or plain IPs.
 
     Only IPv4 is kept because the discovery/exposure code compares IPv4
@@ -253,7 +299,7 @@ def parse_ips(text: str) -> Iterator[ipaddress.IPv4Network]:
     seen: set[ipaddress.IPv4Network] = set()
     for line in _lines(text):
         line = _strip_inline_comment(line)
-        token = line.split()[0] if line.split() else ""
+        token = _first_token(line)
         token = token.split(";", 1)[0].split("#", 1)[0].strip()
         if not token:
             continue
@@ -277,7 +323,7 @@ def parse_feodo(json_text: str) -> Iterator[ipaddress.IPv4Network]:
     """
     try:
         data = json.loads(json_text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # RecursionError: "[[[[..." nested past the stack
         logger.warning("feodo json unparsable")
         return
     if not isinstance(data, list):
@@ -322,7 +368,7 @@ def kev_document(json_text: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """
     try:
         data = json.loads(json_text)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):  # RecursionError: "[[[[..." nested past the stack
         logger.warning("KEV json unparsable")
         return {}, []
     if not isinstance(data, dict):
@@ -435,7 +481,7 @@ def normalize_oui_prefix(prefix: str) -> str | None:
     return ":".join(kept[i : i + 2] for i in range(0, len(kept), 2)) + f"/{bits}"
 
 
-def parse_oui(text: str) -> dict[str, str]:
+def parse_oui(text: Lines) -> dict[str, str]:
     """Return {normalized prefix: vendor} from the Wireshark "manuf" file.
 
     Columns are tab-separated: prefix, short name, long name. The long name is
@@ -443,7 +489,7 @@ def parse_oui(text: str) -> dict[str, str]:
     """
     table: dict[str, str] = {}
     for line in _lines(text):
-        parts = [p.strip() for p in line.split("\t")]
+        parts = [p.strip() for p in line.split("\t", 3)]
         if len(parts) < 2:
             parts = line.split(None, 2)
             if len(parts) < 2:

@@ -4,11 +4,19 @@
 # Emits exactly ONE compact JSON object on stdout:
 #   run_keys : HKCU/HKLM Run + RunOnce (+ WOW6432Node) values
 #   startup  : shortcuts/files in the user and common Startup folders (with resolved .lnk targets)
-#   tasks    : scheduled tasks not authored by Microsoft and not under \Microsoft\
-#   services : Auto-start services whose binary is not under the Windows folder
+#   tasks    : scheduled tasks outside the \Microsoft\ task folder
+#   services : every Auto-start service, with the parsed executable and, for executables inside the
+#              Windows folder, the Authenticode signer when the signature is valid. persistence.py
+#              decides which services are part of Windows (is_windows_service); this probe does not.
 #              (fallback: System log event 7045 "new service installed" in the last 7 days)
+#   windir   : $env:SystemRoot, for that decision
 #   errors   : per-section 'ACCESS_DENIED' / 'ERROR: ...'
 # Non-admin readers see their own tasks plus world-readable ones; that is what we baseline.
+#
+# Security (second security round): nothing here filters on a field an attacker writes. A task's
+# Author is free text chosen by whoever registers it (a standard user can register a task in "\"
+# with <Author>Microsoft Corporation</Author>), so tasks are filtered only by the \Microsoft\ folder,
+# which standard users cannot write to. Services are no longer dropped by a string prefix test.
 
 param([int]$ServiceEventDays = 7)
 
@@ -100,8 +108,9 @@ if ($tl -is [string]) {
 } else {
     foreach ($t in @($tl)) {
         if ($null -eq $t) { continue }
+        # Only the \Microsoft\ folder is skipped (standard users have read-only access to it).
+        # Author is NOT a filter: it is attacker-chosen text.
         if ([string]$t.TaskPath -like '\Microsoft\*') { continue }
-        if ([string]$t.Author -like 'Microsoft*' -or [string]$t.Author -like '*Microsoft Corporation*') { continue }
         $actions = @()
         foreach ($a in @($t.Actions)) {
             if ($null -eq $a) { continue }
@@ -150,16 +159,41 @@ if ($sl -is [string]) {
     }
 } else {
     $winDir = [string]$env:SystemRoot
+    $winPrefix = if ($winDir) { $winDir.TrimEnd('\') + '\' } else { $null }
+    $signers = @{}
     foreach ($s in @($sl)) {
         if ($null -eq $s) { continue }
         if ([string]$s.StartMode -ne 'Auto') { continue }
         $path = [string]$s.PathName
-        $clean = $path.Trim('"')
-        if ($winDir -and $clean.StartsWith($winDir, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        # Executable = the quoted part, or everything up to the first space (same rule as
+        # persistence.split_command, which compares the two).
+        $trimmed = $path.Trim()
+        $exe = $null
+        if ($trimmed.StartsWith('"')) {
+            $end = $trimmed.IndexOf('"', 1)
+            $exe = if ($end -gt 0) { $trimmed.Substring(1, $end - 1) } else { $trimmed.Substring(1) }
+        } else {
+            $exe = ($trimmed -split ' ', 2)[0]
+        }
+        $signer = $null
+        if ($exe -and $winPrefix -and $exe.StartsWith($winPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $k = $exe.ToLowerInvariant()
+            if (-not $signers.ContainsKey($k)) {
+                $subject = $null
+                try {
+                    $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop
+                    if ($sig -and [string]$sig.Status -eq 'Valid' -and $sig.SignerCertificate) { $subject = [string]$sig.SignerCertificate.Subject }
+                } catch {}
+                $signers[$k] = $subject
+            }
+            $signer = $signers[$k]
+        }
         $services += @{
             name = [string]$s.Name
             display = [string]$s.DisplayName
             path = $path
+            exe = $exe
+            signer = $signer
             start_mode = [string]$s.StartMode
             state = [string]$s.State
             account = [string]$s.StartName
@@ -173,6 +207,7 @@ $result = @{
     startup = @($startup)
     tasks = @($tasks)
     services = @($services)
+    windir = [string]$env:SystemRoot
     errors = $errors
     elapsed_sec = [math]::Round($script:Stopwatch.Elapsed.TotalSeconds, 2)
 }

@@ -74,8 +74,12 @@ def run(cfg: "Config", conn: sqlite3.Connection, *, quick: bool = False,
         summary["outages_new"] = record_outages(conn)
         if progress:
             progress("rebuilding the dependency graph")
-        summary.update(refresh(conn, hours=hours, include_cloud=include_cloud))
-        ranked = criticality(conn, hours=hours)
+        # One build, used twice: criticality() ignores the cloud column of a handed-in graph, so
+        # this is the same ranking a second include_cloud=False build would produce, at half the
+        # cost — and the job runs in the process that also answers the house's DNS.
+        nodes, edges = build_graph(conn, hours=hours, include_cloud=include_cloud)
+        summary.update(graph.store(conn, nodes, edges, hours=hours))
+        ranked = criticality(conn, hours=hours, edges=edges)
         summary["load_bearing"] = [
             {k: item[k] for k in ("device_id", "label", "dependents", "weight")} for item in ranked[:5]
         ]
@@ -168,18 +172,27 @@ def _blocked_cloud_findings(conn: sqlite3.Connection, hours: int) -> list[Findin
 
     Every lookup for the domain in the window was blocked and none was ever answered, so
     whatever the device wanted from it, it has not been getting — quietly.
+
+    Two things about *who* asked. A lookup is credited to the device that held the client
+    address at the time (the same lease timeline the map uses), not to whoever holds it today —
+    so a recycled DHCP lease cannot move one device's history onto another. And the claim is
+    worded as what it is: the resolver knows the address a UDP packet said it came from, which
+    any host on a flat LAN can forge. The finding therefore says the lookups came *from the
+    device's address*, and its evidence records that attribution, rather than stating as fact
+    that a family member's laptop did something another device may have done in its name.
     """
     since = iso_ago(hours=max(1, int(hours)))
     subjects = _device_subjects(conn)
-    by_ip = {str(r["ip"]): int(r["id"]) for r in db.query(conn, "SELECT id, ip FROM devices WHERE ip IS NOT NULL")}
+    owners = infer._address_owners(conn, since)
     tally: dict[tuple[int, str], dict[str, Any]] = {}
     for row in db.query(
         conn,
-        "SELECT client, qname, action, COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
-        "FROM dns_queries WHERE ts >= ? GROUP BY client, qname, action ORDER BY client, qname, action",
-        (since,),
+        "SELECT client, substr(ts, 1, ?) AS bucket, qname, action, COUNT(*) AS n, MIN(ts) AS first_ts, "
+        "MAX(ts) AS last_ts FROM dns_queries WHERE ts >= ? GROUP BY client, bucket, qname, action "
+        "ORDER BY client, bucket, qname, action",
+        (infer._BUCKET_CHARS, since),
     ):
-        device_id = by_ip.get(str(row["client"]))
+        device_id = owners.owner_at(str(row["client"]), str(row["bucket"]))
         if device_id is None:
             continue
         domain = infer.registrable_domain(str(row["qname"]))
@@ -205,13 +218,15 @@ def _blocked_cloud_findings(conn: sqlite3.Connection, hours: int) -> list[Findin
         subject, name = subjects.get(device_id, (f"device:{device_id}", f"device {device_id}"))
         drafts.append(FindingDraft(
             finding_id="NET-DEP-003", subject=subject, device_id=device_id,
-            detail=(f"{name} asked for {domain} {counts['blocked']} times over {int(span)} hours and every "
-                    "lookup was blocked. "
+            detail=(f"Lookups for {domain} from {name}'s address were blocked {counts['blocked']} times "
+                    f"over {int(span)} hours, and none was ever answered. "
                     "If it needs that endpoint for something you use, that feature is quietly not working; "
-                    "if it does not, this is the filter doing its job."),
+                    "if it does not, this is the filter doing its job. "
+                    "Home SOC credits a lookup to the device holding the address it came from, and another "
+                    "device on the network can forge that address, so this is a report, not proof."),
             evidence={"key": domain, "domain": domain, "name": name, "blocked": counts["blocked"],
                       "failures": counts["blocked"], "hours": int(span),
-                      "label": infer.cloud_label(domain)},
+                      "label": infer.cloud_label(domain), "attributed_by": "source address"},
         ))
     return drafts
 

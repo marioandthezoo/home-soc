@@ -15,6 +15,7 @@ with type hints rather than dictionary spelunking.
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import json
 import logging
 import sqlite3
@@ -38,9 +39,9 @@ timezone = "local"                 # display only; storage is UTC ISO-8601
 log_level = "INFO"
 
 [web]
-host = "127.0.0.1"                 # set 0.0.0.0 to reach the dashboard from other devices (then set token!)
+host = "127.0.0.1"                 # set 0.0.0.0 to reach the dashboard from other devices (a token is generated if empty)
 port = 8787
-token = ""                         # if non-empty, required as ?token= or X-Token header / login cookie
+token = ""                         # required as ?token= / X-Token header / login cookie; 16+ characters off loopback
 refresh_seconds = 15
 
 [network]
@@ -147,6 +148,33 @@ class General:
     log_level: str = "INFO"
 
 
+#: Shorter than this, a hand-picked token falls to guessing even at the rate-limited pace
+#: (a 4-digit PIN goes in about a day against the dashboard's global guess budget). Anything
+#: that faces the LAN must have at least this much; ``init`` and the bind policy generate 32+.
+MIN_TOKEN_LENGTH = 16
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """True only for an address nothing off this machine can reach.
+
+    ``localhost`` (any case) or a literal loopback address, IPv4 (all of 127.0.0.0/8) or IPv6,
+    with or without brackets and a zone suffix. Everything else counts as exposed on purpose:
+    ``""``, ``0.0.0.0`` and ``::`` bind every interface, and a hostname or LAN address is
+    reachable by definition. Failing towards "exposed" is what makes the bind policy safe.
+    """
+    value = str(host or "").strip()
+    if not value:
+        return False
+    if value.lower() == "localhost":
+        return True
+    literal = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+    literal = literal.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(literal).is_loopback
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class Web:
     host: str = "127.0.0.1"
@@ -157,7 +185,25 @@ class Web:
     @property
     def exposed(self) -> bool:
         """True when the dashboard listens beyond loopback — the SOC-SYS-003 condition when no token is set."""
-        return self.host not in ("127.0.0.1", "localhost", "::1")
+        return not is_loopback_host(self.host)
+
+
+def lan_bind_problem(web: Web) -> str | None:
+    """Why this dashboard must not listen where it is configured to, or None when it may.
+
+    ``"no-token"``: reachable from the network with no credential at all, so every LAN host
+    gets the network map, the Settings page (DNS upstreams, webhooks, the token itself) and
+    Lens pairing. ``"weak-token"``: reachable, with a token short enough to guess. Loopback
+    is never a problem here: only this machine can connect, and Host validation guards it.
+    """
+    if not web.exposed:
+        return None
+    token = str(web.token or "")
+    if not token:
+        return "no-token"
+    if len(token) < MIN_TOKEN_LENGTH:
+        return "weak-token"
+    return None
 
 
 @dataclass(frozen=True)
@@ -655,6 +701,9 @@ __all__ = [
     "Schedule",
     "Lens",
     "Topology",
+    "MIN_TOKEN_LENGTH",
+    "is_loopback_host",
+    "lan_bind_problem",
     "load",
     "build",
     "with_overrides",

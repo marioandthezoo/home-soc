@@ -779,11 +779,19 @@ class TestVirusTotalFetch:
 
         captured: dict[str, object] = {}
 
-        def get(url, headers=None, timeout=None, stream=False):
-            captured.update(url=url, timeout=timeout, stream=stream, headers=headers or {})
-            return FakeResponse()
+        class FakeSession:
+            def __enter__(self):
+                return self
 
-        module = types.SimpleNamespace(get=get, RequestException=Exception)
+            def __exit__(self, *exc):
+                return False
+
+            def get(self, url, headers=None, timeout=None, stream=False, allow_redirects=True):
+                captured.update(url=url, timeout=timeout, stream=stream, headers=headers or {},
+                                allow_redirects=allow_redirects)
+                return FakeResponse()
+
+        module = types.SimpleNamespace(Session=FakeSession, RequestException=Exception)
         monkeypatch.setitem(sys.modules, "requests", module)
         return captured
 
@@ -792,6 +800,7 @@ class TestVirusTotalFetch:
         assert files.vt_fetch("k", "a" * 64) == (200, {"data": {"id": "x"}})
         assert captured["stream"] is True and captured["timeout"] == files.VT_TIMEOUT_SEC
         assert captured["headers"]["x-apikey"] == "k"
+        assert captured["allow_redirects"] is False
 
     def test_oversized_body_is_refused(self, monkeypatch):
         self._fake_requests(monkeypatch, status=200, body=b"{" + b"a" * (files.VT_MAX_BODY_BYTES + 1024))

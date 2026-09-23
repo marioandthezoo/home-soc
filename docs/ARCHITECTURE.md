@@ -28,10 +28,13 @@ instead of taking the dashboard down.
   |  "homesoc-scheduler" .... homesoc/scheduler.py — ONE worker, jobs run one at a time    |
   |                            calls cli.scan_* -> scanners -> findings.engine -> notify    |
   |                                                                                       |
-  |  "dns-udp" .............. socketserver.ThreadingUDPServer.serve_forever()             |
-  |     +-- one short-lived thread per datagram                                           |
+  |  "dns-udp" .............. socketserver.UDPServer.serve_forever(): listener only,      |
+  |                            source check, rate limit, queue of 1024 (full: TC=1)       |
+  |     +-- "dns-udp-worker-N" (8, fixed) .. parse, policy, cache                         |
+  |     +-- "dns-upstream_N" (<= 256) ...... upstream calls, off the worker pool          |
   |  "dns-tcp" .............. socketserver.ThreadingTCPServer.serve_forever()             |
-  |     +-- one thread per connection, 2-byte length framing, 10 s idle timeout           |
+  |     +-- one thread per connection (64 max, 8 per source; full: evict oldest idle),    |
+  |         2-byte length framing, 10 s idle timeout (2 s when more than half full)       |
   |                            both bind  dns.listen:dns.port  -> 0.0.0.0:53              |
   |  "dns-housekeeping" ..... 5 s tick: blocklist reload, rate-limiter cleanup,           |
   |                            cache expiry, DNS health findings (every 60 s)             |

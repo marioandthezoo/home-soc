@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import datetime as dt
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
@@ -47,6 +47,20 @@ QUEUE_MAX = 5000
 # One client may hold at most this many queue slots, so a device flooding new domains cannot crowd
 # everyone else's lookups out of the queue.
 QUEUE_PER_CLIENT_MAX = QUEUE_MAX // 10
+# Source addresses are forgeable, so ten invented sources could still fill the shared queue. Devices
+# in the inventory (``clients.KnownClients``) get a lane of their own that is served first and is not
+# part of QUEUE_MAX: each may hold this many slots there (the lane is bounded by the inventory size),
+# and only beyond that do they compete for the shared queue like everyone else.
+KNOWN_LANE_PER_CLIENT = 50
+# VirusTotal's daily quota is small and shared. No single client may spend more than this fraction of
+# it in a day, and sources outside the inventory together no more than VT_UNKNOWN_SHARE; beyond that
+# their domains are still checked with URLhaus.
+VT_CLIENT_SHARE = 0.10
+VT_UNKNOWN_SHARE = 0.50
+# Retention for the reputation table (run from the hourly dns_rollup job): a row per newly seen
+# domain from any source would otherwise grow forever. Malicious/suspicious rows are evicted last.
+REPUTATION_MAX_AGE_DAYS = 30
+REPUTATION_MAX_ROWS = 100_000
 # Hard caps on the dedupe tables, evicting the oldest entry (O(1)). The old "rebuild the dict when it
 # passes N" pruning removed nothing while every entry was recent, so past N each new domain rebuilt a
 # 50k-entry dict on the DNS answer path.
@@ -464,6 +478,38 @@ def lookup_domain(cfg, conn: sqlite3.Connection, domain: str, *, session=None, b
     return lookup_domain_detail(cfg, conn, domain, session=session, budget=budget).verdict
 
 
+def prune_reputation(
+    conn: sqlite3.Connection, *, max_age_days: int = REPUTATION_MAX_AGE_DAYS, max_rows: int = REPUTATION_MAX_ROWS
+) -> int:
+    """Drop clean/unknown verdicts older than ``max_age_days`` (they are long past every TTL), then
+    evict the oldest rows beyond ``max_rows``, malicious and suspicious ones last. Returns rows deleted."""
+    from homesoc.dnsfilter import db_query
+
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max(1, int(max_age_days)))).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    before = db_query(conn, "SELECT COUNT(*) AS n FROM reputation")
+    n_before = int(before[0]["n"]) if before else 0
+    if not n_before:
+        return 0
+    db_write(conn, "DELETE FROM reputation WHERE verdict IN ('clean', 'unknown') AND checked_at < ?", (cutoff,))
+    left = db_query(conn, "SELECT COUNT(*) AS n FROM reputation")
+    n_left = int(left[0]["n"]) if left else 0
+    excess = n_left - max(1, int(max_rows))
+    if excess > 0:
+        db_write(
+            conn,
+            "DELETE FROM reputation WHERE domain IN (SELECT domain FROM reputation ORDER BY"
+            " CASE verdict WHEN 'malicious' THEN 2 WHEN 'suspicious' THEN 1 ELSE 0 END, checked_at LIMIT ?)",
+            (excess,),
+        )
+    after = db_query(conn, "SELECT COUNT(*) AS n FROM reputation")
+    deleted = n_before - (int(after[0]["n"]) if after else 0)
+    if deleted:
+        logger.info("reputation table: pruned %d old rows", deleted)
+    return deleted
+
+
 def list_reputation(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
     from homesoc.dnsfilter import db_query
 
@@ -517,6 +563,72 @@ class MaliciousFindingEmitter:
 
 
 # ---- async worker -------------------------------------------------------------------------------
+class _Lanes:
+    """The lookup queue: a lane for inventory devices, served first, and the bounded shared lane.
+
+    ``put_nowait`` raises ``queue.Full`` only for the shared lane; the known lane is bounded by the
+    caller (``KNOWN_LANE_PER_CLIENT`` per inventory address).
+    """
+
+    def __init__(self, maxsize: int) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self._known: deque = deque()
+        self._shared: deque = deque()
+        self._cv = threading.Condition()
+
+    def put_nowait(self, item, *, known: bool = False) -> None:
+        with self._cv:
+            if known:
+                self._known.append(item)
+            elif len(self._shared) >= self.maxsize:
+                raise queue.Full
+            else:
+                self._shared.append(item)
+            self._cv.notify()
+
+    def _pop(self):
+        return self._known.popleft() if self._known else self._shared.popleft()
+
+    def get_nowait(self):
+        with self._cv:
+            if not self._known and not self._shared:
+                raise queue.Empty
+            return self._pop()
+
+    def get(self, timeout: float | None = None):
+        with self._cv:
+            end = None if timeout is None else time.monotonic() + timeout
+            while not self._known and not self._shared:
+                remaining = None if end is None else end - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise queue.Empty
+                self._cv.wait(remaining)
+            return self._pop()
+
+    def qsize(self) -> int:
+        with self._cv:
+            return len(self._known) + len(self._shared)
+
+
+class _ClientBudget:
+    """The worker's view of the VirusTotal budget for one lookup: the real (shared, persisted) budget,
+    but refused outright when the asking client has used its share today (``ReputationWorker._vt_share_ok``)."""
+
+    def __init__(self, worker: "ReputationWorker", client: str, known: bool) -> None:
+        self._worker = worker
+        self._client = client
+        self._known = known
+
+    def try_acquire(self, *, now: float | None = None) -> bool:
+        w = self._worker
+        if not w._vt_share_ok(self._client, self._known):
+            return False
+        ok = w._base_budget().try_acquire(now=now)
+        if ok:
+            w._vt_drawn(self._client, self._known)
+        return ok
+
+
 class ReputationWorker:
     """Background thread that looks up newly-seen registrable domains and reports malicious ones.
 
@@ -535,6 +647,7 @@ class ReputationWorker:
         budget: Budget | None = None,
         skip: Callable[[str], bool] | None = None,
         enabled: bool = True,
+        known=None,
     ) -> None:
         self.cfg = cfg
         self.conn = conn
@@ -543,11 +656,17 @@ class ReputationWorker:
         self.budget = budget
         self.skip = skip
         self.enabled = enabled
+        self.known = known  # ``client in known`` → inventory device (own lane, own VT share)
         self.emitter = MaliciousFindingEmitter(conn)
-        self._queue: queue.Queue[tuple[str, str, str]] = queue.Queue(maxsize=QUEUE_MAX)
+        self._queue = _Lanes(QUEUE_MAX)  # items: (registrable domain, qname, client, lane)
         self._seen: OrderedDict[str, float] = OrderedDict()
         self._seen_lock = threading.Lock()
-        self._pending_by_client: dict[str, int] = {}  # queue slots held per client (under _seen_lock)
+        self._pending_by_client: dict[str, int] = {}  # shared-lane slots held per client (under _seen_lock)
+        self._pending_known: dict[str, int] = {}      # known-lane slots held per inventory device
+        self._vt_lock = threading.Lock()
+        self._vt_day: str | None = None
+        self._vt_by_client: dict[str, int] = {}       # VirusTotal draws today per client
+        self._vt_unknown = 0                          # ... and by all sources outside the inventory
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.looked_up = 0
@@ -564,10 +683,7 @@ class ReputationWorker:
 
     def stop(self) -> None:
         self._stop.set()
-        try:
-            self._queue.put_nowait(("", "", ""))  # wake the worker
-        except queue.Full:
-            pass
+        self._queue.put_nowait(("", "", "", ""), known=True)  # wake the worker (the known lane is never full)
         t = self._thread
         if t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=5)
@@ -598,38 +714,52 @@ class ReputationWorker:
         reg = self.should_lookup(qname)
         if reg is None:
             return False
+        known = self._is_known(client)
         with self._seen_lock:
-            held = self._pending_by_client.get(client, 0)
-            if held >= QUEUE_PER_CLIENT_MAX:
-                self._forget(reg)
-                self.dropped += 1
-                return False
-            self._pending_by_client[client] = held + 1
+            if known and self._pending_known.get(client, 0) < KNOWN_LANE_PER_CLIENT:
+                lane = "known"
+                self._pending_known[client] = self._pending_known.get(client, 0) + 1
+            else:
+                held = self._pending_by_client.get(client, 0)
+                if held >= QUEUE_PER_CLIENT_MAX:
+                    self._forget(reg)
+                    self.dropped += 1
+                    return False
+                lane = "shared"
+                self._pending_by_client[client] = held + 1
         try:
-            self._queue.put_nowait((reg, qname, client))
+            self._queue.put_nowait((reg, qname, client, lane), known=lane == "known")
         except queue.Full:
             with self._seen_lock:
                 self._forget(reg)
-                self._release_slot(client)
+                self._release_slot(client, lane)
             self.dropped += 1
             return False
         return True
+
+    def _is_known(self, client: str) -> bool:
+        known = self.known
+        try:
+            return known is not None and client in known
+        except Exception:  # pragma: no cover - a misbehaving provider must not break the answer path
+            return False
 
     def _forget(self, reg: str) -> None:
         """Undo ``should_lookup``'s mark for a domain that never reached the queue, so its next query
         retries instead of being skipped for 24 h (caller holds ``_seen_lock``)."""
         self._seen.pop(reg, None)
 
-    def _release_slot(self, client: str) -> None:
-        n = self._pending_by_client.get(client, 0) - 1
+    def _release_slot(self, client: str, lane: str = "shared") -> None:
+        table = self._pending_known if lane == "known" else self._pending_by_client
+        n = table.get(client, 0) - 1
         if n > 0:
-            self._pending_by_client[client] = n
+            table[client] = n
         else:
-            self._pending_by_client.pop(client, None)
+            table.pop(client, None)
 
-    def _dequeued(self, client: str) -> None:
+    def _dequeued(self, client: str, lane: str = "shared") -> None:
         with self._seen_lock:
-            self._release_slot(client)
+            self._release_slot(client, lane)
 
     def pending(self) -> int:
         return self._queue.qsize()
@@ -638,12 +768,12 @@ class ReputationWorker:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                reg, qname, client = self._queue.get(timeout=1.0)
+                reg, qname, client, lane = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             if not reg:
                 continue
-            self._dequeued(client)
+            self._dequeued(client, lane)
             try:
                 self.process(reg, qname, client)
             except Exception:
@@ -651,7 +781,8 @@ class ReputationWorker:
 
     def process(self, reg: str, qname: str, client: str) -> ReputationResult:
         """Synchronous unit of work (also used by tests and ``dns-test``)."""
-        result = lookup_domain_detail(self.cfg, self.conn, reg, session=self.session, budget=self.budget)
+        budget = _ClientBudget(self, client, self._is_known(client))
+        result = lookup_domain_detail(self.cfg, self.conn, reg, session=self.session, budget=budget)
         self.looked_up += 1
         if result.source == "none":
             # Nobody answered: let the next query for this domain re-enqueue it after a short pause
@@ -669,16 +800,49 @@ class ReputationWorker:
                     logger.exception("on_malicious callback failed")
         return result
 
+    # ---- VirusTotal share per client -------------------------------------------------------
+    def _base_budget(self) -> Budget:
+        return self.budget if self.budget is not None else shared_budget(self.cfg, self.conn)
+
+    def _vt_roll_day(self) -> None:
+        today = Budget._today()
+        if today != self._vt_day:
+            self._vt_day = today
+            self._vt_by_client = {}
+            self._vt_unknown = 0
+
+    def _vt_share_ok(self, client: str, known: bool) -> bool:
+        """False once ``client`` (or all non-inventory sources together) used their share of today's
+        VirusTotal quota. Only consulted when a lookup would actually draw on VirusTotal."""
+        try:
+            limit = int(self._base_budget().daily_limit)
+        except Exception:
+            return True
+        with self._vt_lock:
+            self._vt_roll_day()
+            if self._vt_by_client.get(client, 0) >= max(1, int(limit * VT_CLIENT_SHARE)):
+                return False
+            if not known and self._vt_unknown >= max(1, int(limit * VT_UNKNOWN_SHARE)):
+                return False
+            return True
+
+    def _vt_drawn(self, client: str, known: bool) -> None:
+        with self._vt_lock:
+            self._vt_roll_day()
+            self._vt_by_client[client] = self._vt_by_client.get(client, 0) + 1  # <= daily limit keys per day
+            if not known:
+                self._vt_unknown += 1
+
     def drain(self, max_items: int = 1000) -> int:
         """Process queued items on the calling thread (tests / CLI); returns the number processed."""
         n = 0
         while n < max_items:
             try:
-                reg, qname, client = self._queue.get_nowait()
+                reg, qname, client, lane = self._queue.get_nowait()
             except queue.Empty:
                 break
             if reg:
-                self._dequeued(client)
+                self._dequeued(client, lane)
                 self.process(reg, qname, client)
                 n += 1
         return n

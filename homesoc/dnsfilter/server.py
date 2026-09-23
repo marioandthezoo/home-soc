@@ -3,18 +3,28 @@
 Pipeline per query: rate limit → parse → refuse non-IN/ANY → policy → block answer, or cache →
 upstream guard → upstream forward → cache store → query log → reputation enqueue. Policy runs before
 the cache so a name that was allowed (and cached) once is blocked the moment a list update or a
-reputation verdict says so. Everything after "parse" runs on a socketserver worker thread; nothing
-in the hot path touches the network except the upstream call.
+reputation verdict says so.
+
+Threads (UDP): the listener thread does O(1) work per datagram — local-source check, per-source rate
+limit, and a non-blocking put into a bounded queue — and never starts a thread. A fixed pool of
+``UDP_WORKERS`` runs the local part of the pipeline (parse, policy, cache). A query that needs the
+upstream is handed, with its upstream-guard slot already taken, to a separate pool of at most
+``UPSTREAM_INFLIGHT_TOTAL`` threads, so slow names can never occupy the workers that answer blocked
+and cached names. When the queue or the upstream pool is full the answer is a bare TC=1, never a
+drop and never a SERVFAIL. TCP keeps one thread per connection, bounded by the connection table.
 
 Fairness rule for every limit in this module: one source, one name or one zone must never be able
 to use up a resource that every other device in the house needs. UDP source addresses cost nothing
-to forge on a LAN, so no shared counter is allowed to *drop* queries (see ``handle_query``).
+to forge on a LAN, so no shared counter is allowed to *drop* queries or fail them: a shared UDP limit
+answers TC=1, and the client retries over TCP, whose connections cannot be forged and whose limits
+(``_TcpServer``, the TCP side of ``_UpstreamGuard``) are separate from the UDP ones.
 """
 from __future__ import annotations
 
 import ipaddress
 import logging
 import platform
+import queue
 import socket
 import socketserver
 import struct
@@ -22,13 +32,15 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dnslib import AAAA, CLASS, EDNS0, OPCODE, QTYPE, RCODE, RR, A, DNSError, DNSQuestion, DNSRecord
 
 from homesoc.dnsfilter import apply_findings, cfg_get, make_draft, record_event, record_metric
 from homesoc.dnsfilter.cache import DnsCache
+from homesoc.dnsfilter.clients import KnownClients
 from homesoc.dnsfilter.policy import Policy
 from homesoc.dnsfilter.querylog import QueryLog, distinct_clients, ensure_schema
 from homesoc.dnsfilter.reputation import ReputationWorker, registrable_domain, shared_budget
@@ -51,20 +63,27 @@ EDNS_UDP_SIZE = 1232          # DNS flag day 2020 recommendation
 MIN_UDP_SIZE = 512
 MAX_UDP_SIZE = EDNS_UDP_SIZE  # never honour a larger client-advertised size: it is the amplification factor
 TCP_IDLE_TIMEOUT = 10.0       # wait for the first byte of the next message
+TCP_IDLE_TIMEOUT_BUSY = 2.0   # ... shortened while the connection table is more than half full
 TCP_MESSAGE_DEADLINE = 5.0    # a whole message (length prefix + body) must arrive within this
 TCP_MAX_CONNECTION_SECONDS = 120.0
 TCP_MAX_QUERIES_PER_CONNECTION = 100
 TCP_MAX_CONNECTIONS = 64
 TCP_MAX_CONNECTIONS_PER_CLIENT = 8
+# UDP: listener → bounded queue → fixed worker pool (see the module docstring).
+UDP_WORKERS = 8
+UDP_QUEUE_MAX = 1024
 # Upstream guard (RFC 9520: resolution failures must be cached). One name's or one zone's trouble —
 # including an attacker's deliberately slow authoritative server — stays with that name or zone.
 FAIL_CACHE_SECONDS = 5.0      # a (qname, qtype) that failed on every path is SERVFAILed locally this long
 ZONE_FAIL_THRESHOLD = 3       # this many failures under one registrable domain within the window ...
 ZONE_FAIL_WINDOW = 30.0
 ZONE_HOLD_SECONDS = 30.0      # ... fail that zone fast for this long instead of tying up a thread per query
-UPSTREAM_INFLIGHT_PER_CLIENT = 32
+UPSTREAM_INFLIGHT_PER_CLIENT = 32  # per source address, counted separately for UDP and for TCP
 UPSTREAM_INFLIGHT_PER_ZONE = 32
-UPSTREAM_INFLIGHT_TOTAL = 1024  # thread-count safety valve, far above what a home network needs
+# UDP upstream work in flight = the upstream thread pool's size. Over it a UDP query is answered TC=1
+# (never SERVFAIL), so a client retries over TCP, whose upstream work is bounded by the TCP connection
+# table instead and so never meets this cap: forged UDP sources cannot fail anyone's lookups with it.
+UPSTREAM_INFLIGHT_TOTAL = 256
 GUARD_MAX_ENTRIES = 10000
 HOUSEKEEPING_TICK = 5.0
 HEALTH_INTERVAL = 60.0
@@ -135,7 +154,11 @@ class _UpstreamGuard:
     * A registrable domain with ``ZONE_FAIL_THRESHOLD`` failures in ``ZONE_FAIL_WINDOW`` is failed
       fast for ``ZONE_HOLD_SECONDS``: an attacker's slow authoritative server then costs a handful of
       upstream timeouts per half minute instead of a thread per query.
-    * Concurrent upstream work is capped per client and per zone, with a large total safety valve.
+    * Concurrent upstream work is capped per client (UDP and TCP counted apart) and per zone. UDP work
+      also has a total (the upstream pool's size); TCP work does not, because one TCP connection
+      carries one query at a time and the connections are bounded (``TCP_MAX_CONNECTIONS``). Forged
+      UDP sources can therefore pin the UDP total — callers answer that with TC=1 — but never the
+      capacity a client's TCP retry needs.
 
     Every table is bounded (``GUARD_MAX_ENTRIES``, oldest evicted first).
     """
@@ -147,7 +170,8 @@ class _UpstreamGuard:
         self._zone_hold: OrderedDict[str, float] = OrderedDict()                 # -> expiry
         self._inflight_client: dict[str, int] = {}
         self._inflight_zone: dict[str, int] = {}
-        self.inflight = 0
+        self.inflight = 0       # UDP + TCP
+        self.inflight_udp = 0   # the part the total applies to
         self.fast_failed = 0
         self.busy_rejected = 0
 
@@ -177,24 +201,30 @@ class _UpstreamGuard:
                 del self._zone_hold[zone]
         return None
 
-    def acquire(self, client: str, zone: str) -> bool:
+    def acquire(self, client: str, zone: str, *, tcp: bool = False) -> bool:
+        ckey = ("tcp:" if tcp else "udp:") + client
         with self._lock:
             if (
-                self.inflight >= UPSTREAM_INFLIGHT_TOTAL
-                or self._inflight_client.get(client, 0) >= UPSTREAM_INFLIGHT_PER_CLIENT
+                (not tcp and self.inflight_udp >= UPSTREAM_INFLIGHT_TOTAL)
+                or self._inflight_client.get(ckey, 0) >= UPSTREAM_INFLIGHT_PER_CLIENT
                 or self._inflight_zone.get(zone, 0) >= UPSTREAM_INFLIGHT_PER_ZONE
             ):
                 self.busy_rejected += 1
                 return False
             self.inflight += 1
-            self._inflight_client[client] = self._inflight_client.get(client, 0) + 1
+            if not tcp:
+                self.inflight_udp += 1
+            self._inflight_client[ckey] = self._inflight_client.get(ckey, 0) + 1
             self._inflight_zone[zone] = self._inflight_zone.get(zone, 0) + 1
             return True
 
-    def release(self, client: str, zone: str) -> None:
+    def release(self, client: str, zone: str, *, tcp: bool = False) -> None:
+        ckey = ("tcp:" if tcp else "udp:") + client
         with self._lock:
             self.inflight = max(0, self.inflight - 1)
-            for table, key in ((self._inflight_client, client), (self._inflight_zone, zone)):
+            if not tcp:
+                self.inflight_udp = max(0, self.inflight_udp - 1)
+            for table, key in ((self._inflight_client, ckey), (self._inflight_zone, zone)):
                 n = table.get(key, 0) - 1
                 if n > 0:
                     table[key] = n
@@ -216,16 +246,28 @@ class _UpstreamGuard:
 
     def stats(self) -> dict:
         with self._lock:
-            return {"inflight": self.inflight, "fast_failed": self.fast_failed, "busy_rejected": self.busy_rejected,
-                    "zones_held": len(self._zone_hold)}
+            return {"inflight": self.inflight, "inflight_udp": self.inflight_udp, "fast_failed": self.fast_failed,
+                    "busy_rejected": self.busy_rejected, "zones_held": len(self._zone_hold)}
 
 
 def _zone_of(qname: str) -> str:
-    """The unit a failing authority is charged to: the registrable domain, or one level up for PTRs
-    (``4.3.2.1.in-addr.arpa`` → ``3.2.1.in-addr.arpa``) so one slow reverse zone cannot hold them all."""
+    """The unit a failing authority is charged to: the registrable domain, or for reverse lookups an
+    IPv4 /16 (``4.3.2.1.in-addr.arpa`` → ``2.1.in-addr.arpa``) or an IPv6 /32 (8 nibbles).
+
+    Reverse names are free to invent and the Internet has plenty of lame reverse delegations, so
+    charging them per /24 (or per nibble) gave an attacker an unlimited supply of distinct slow
+    "zones" to rotate through the per-zone cap and the zone hold.
+    """
     name = qname.lower().rstrip(".")
     if name.endswith(".arpa"):
-        return name.split(".", 1)[1] if name.count(".") > 2 else name
+        labels = name.split(".")
+        if name.endswith(".in-addr.arpa"):
+            keep = 2 + 2      # two octets + in-addr.arpa
+        elif name.endswith(".ip6.arpa"):
+            keep = 8 + 2      # eight nibbles + ip6.arpa
+        else:
+            return name.split(".", 1)[1] if name.count(".") > 2 else name
+        return ".".join(labels[-keep:]) if len(labels) > keep else name
     return registrable_domain(name) or "."
 
 
@@ -236,34 +278,82 @@ class QueryOutcome:
     reply: DNSRecord | None
 
 
+@dataclass
+class _UpstreamWork:
+    """A query whose local pipeline is done and that holds an upstream-guard slot. Whoever gets one
+    must pass it to ``DnsServer._finish_query`` (which releases the slot) or ``_abandon`` it."""
+
+    request: DNSRecord
+    client: str
+    tcp: bool
+    qname: str
+    qtype: str
+    zone: str
+    reason: str | None
+    t0: float = field(default=0.0)
+
+
 # ---- socketserver plumbing ----------------------------------------------------------------------
+def _udp_send(sock: socket.socket, reply: bytes | None, addr) -> None:
+    if not reply:
+        return
+    try:
+        sock.sendto(reply, addr)
+    except OSError as exc:
+        logger.debug("udp send to %s failed: %s", addr, exc)
+
+
+def _finish_and_send(dns: "DnsServer", work: _UpstreamWork, sock: socket.socket, addr) -> None:
+    _udp_send(sock, dns._finish_query(work), addr)
+
+
 class _UdpHandler(socketserver.BaseRequestHandler):
+    """Runs on a UDP worker (never on the listener). The source was checked and rate-limited by
+    ``_UdpServer.process_request`` already. Upstream work goes to the upstream pool, so this worker
+    is free again at once."""
+
     def handle(self) -> None:
         data, sock = self.request
         server: _UdpServer = self.server  # type: ignore[assignment]
-        reply = server.dns.handle_query(data, self.client_address[0], tcp=False)
-        if reply:
-            try:
-                sock.sendto(reply, self.client_address)
-            except OSError as exc:
-                logger.debug("udp send to %s failed: %s", self.client_address, exc)
+        dns = server.dns
+        step = dns._begin_query(data, self.client_address[0], tcp=False, admitted=True)
+        if isinstance(step, _UpstreamWork):
+            pool = dns._upstream_pool
+            if pool is None:
+                step = dns._finish_query(step)
+            else:
+                try:
+                    pool.submit(_finish_and_send, dns, step, sock, self.client_address)
+                except RuntimeError:  # pool shut down: the resolver is stopping
+                    dns._abandon(step)
+                return
+        _udp_send(sock, step, self.client_address)
 
 
-def _recv_until(sock: socket.socket, n: int, deadline: float) -> bytes | None:
+TCP_WAIT_SLICE = 0.5  # how often a waiting handler checks whether its connection was evicted
+
+
+def _recv_until(sock: socket.socket, n: int, deadline: float, alive=None) -> bytes | None:
     """Exactly ``n`` bytes before ``deadline`` (monotonic), or None on EOF / timeout / error.
 
     The deadline covers the whole read: a per-``recv`` timeout alone lets a client that trickles one
-    byte every few seconds hold its handler thread forever.
+    byte every few seconds hold its handler thread forever. ``alive`` (optional callable) is polled
+    every ``TCP_WAIT_SLICE``; once it says False the read gives up, because shutting a socket down
+    from another thread does not wake a blocked ``recv`` on every platform (it does not on Windows).
     """
     buf = bytearray()
     while len(buf) < n:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return None
+        if alive is not None and not alive():
+            return None
         try:
-            sock.settimeout(remaining)
+            sock.settimeout(remaining if alive is None else min(remaining, TCP_WAIT_SLICE))
             part = sock.recv(n - len(buf))
-        except (OSError, socket.timeout):
+        except socket.timeout:
+            continue  # the deadline / liveness checks above decide
+        except OSError:
             return None
         if not part:
             return None
@@ -272,34 +362,46 @@ def _recv_until(sock: socket.socket, n: int, deadline: float) -> bytes | None:
 
 
 class _TcpHandler(socketserver.BaseRequestHandler):
-    """RFC 7766 framing with hard bounds: idle wait, per-message deadline, lifetime and query count."""
+    """RFC 7766 framing with hard bounds: idle wait, per-message deadline, lifetime and query count.
+
+    While it waits for (or reads) a message the connection is *idle* and may be closed by the server
+    to make room for a new one (RFC 7766 §6.2.3); while the resolver works on a query it is not."""
 
     def handle(self) -> None:
         server: _TcpServer = self.server  # type: ignore[assignment]
         sock: socket.socket = self.request
         client = self.client_address[0]
         closes_at = time.monotonic() + TCP_MAX_CONNECTION_SECONDS
+
+        def alive() -> bool:
+            return server.is_live(sock)
+
         for _ in range(TCP_MAX_QUERIES_PER_CONNECTION):
             now = time.monotonic()
-            first = _recv_until(sock, 1, min(now + TCP_IDLE_TIMEOUT, closes_at))
+            first = _recv_until(sock, 1, min(now + server.idle_timeout(), closes_at), alive)
             if first is None:
                 return
             deadline = min(time.monotonic() + TCP_MESSAGE_DEADLINE, closes_at)
-            rest = _recv_until(sock, 1, deadline)
+            rest = _recv_until(sock, 1, deadline, alive)
             if rest is None:
                 return
             (length,) = struct.unpack("!H", first + rest)
-            data = _recv_until(sock, length, deadline) if length else b""
+            data = _recv_until(sock, length, deadline, alive) if length else b""
             if data is None:
                 return
-            reply = server.dns.handle_query(data, client, tcp=True)
-            if not reply:
-                return
+            if not server.mark_busy(sock):
+                return  # evicted while the message arrived
             try:
-                sock.settimeout(TCP_MESSAGE_DEADLINE)
-                sock.sendall(struct.pack("!H", len(reply)) + reply)
-            except (OSError, socket.timeout):
-                return
+                reply = server.dns.handle_query(data, client, tcp=True)
+                if not reply:
+                    return
+                try:
+                    sock.settimeout(TCP_MESSAGE_DEADLINE)
+                    sock.sendall(struct.pack("!H", len(reply)) + reply)
+                except (OSError, socket.timeout):
+                    return
+            finally:
+                server.mark_idle(sock)
 
 
 class _QuietMixin:
@@ -309,10 +411,74 @@ class _QuietMixin:
         logger.debug("handler error for %s", client_address, exc_info=True)
 
 
-class _UdpServer(_QuietMixin, socketserver.ThreadingUDPServer):
+class _UdpServer(_QuietMixin, socketserver.UDPServer):
+    """Single listener thread feeding a bounded queue served by a fixed pool of workers.
+
+    Round one's ThreadingUDPServer started a thread per datagram *before* any limit ran; here the
+    listener only checks the source, applies the per-source rate limit and enqueues, so a flood costs
+    no threads, and a full queue is answered with a bare TC=1 (the client retries over TCP) instead of
+    silently falling behind for every client.
+    """
+
     max_packet_size = 65535
     allow_reuse_address = False  # keep bind failing loudly when another resolver owns the port
     dns: "DnsServer"
+
+    def __init__(self, server_address, handler_class, bind_and_activate: bool = True, *,
+                 workers: int | None = None, queue_max: int | None = None) -> None:
+        self._work: queue.Queue = queue.Queue(maxsize=max(1, int(queue_max or UDP_QUEUE_MAX)))
+        self._n_workers = max(1, int(workers or UDP_WORKERS))
+        self._workers: list[threading.Thread] = []
+        self.shed = 0          # datagrams answered TC=1 because the queue was full
+        super().__init__(server_address, handler_class, bind_and_activate)
+
+    # ---- listener thread: O(1) per datagram, never starts a thread ----
+    def process_request(self, request, client_address) -> None:
+        data, sock = request
+        dns = getattr(self, "dns", None)
+        if dns is not None and not dns.ratelimit.allow(client_address[0]):
+            dns.rate_limit_slipped += 1
+            _udp_send(sock, _truncated_bytes(data), client_address)
+            return
+        try:
+            self._work.put_nowait((request, client_address))
+        except queue.Full:
+            self.shed += 1
+            _udp_send(sock, _truncated_bytes(data), client_address)
+
+    # ---- worker pool ----
+    def start_workers(self) -> None:
+        for i in range(self._n_workers - len(self._workers)):
+            t = threading.Thread(target=self._worker_loop, name=f"dns-udp-worker-{i}", daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    def stop_workers(self, timeout: float = 2.0) -> None:
+        while True:  # drop what is still queued so every worker is sure to see its sentinel
+            try:
+                self._work.get_nowait()
+            except queue.Empty:
+                break
+        for _ in self._workers:
+            try:
+                self._work.put(None, timeout=timeout)
+            except queue.Full:  # pragma: no cover - the queue was just emptied
+                break
+        for t in self._workers:
+            if t is not threading.current_thread():
+                t.join(timeout=timeout)
+        self._workers.clear()
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is None:
+                return
+            request, client_address = item
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
 
     def server_bind(self) -> None:
         super().server_bind()
@@ -329,9 +495,23 @@ class _UdpServer(_QuietMixin, socketserver.ThreadingUDPServer):
         return _accept_source(getattr(self, "dns", None), client_address[0])
 
 
+@dataclass
+class _TcpConn:
+    sock: socket.socket
+    client: str
+    last: float           # monotonic time of the last completed message (or of the accept)
+    busy: bool = False    # the resolver is working on one of its queries: never evicted then
+
+
 class _TcpServer(_QuietMixin, socketserver.ThreadingTCPServer):
     """One thread per connection, but only ``TCP_MAX_CONNECTIONS`` of them (and
-    ``TCP_MAX_CONNECTIONS_PER_CLIENT`` per source); extra connections are closed at accept time."""
+    ``TCP_MAX_CONNECTIONS_PER_CLIENT`` per source).
+
+    A full table does not refuse the newcomer: TCP is where a client goes when its UDP source is being
+    forged, so a device holding every slot open would otherwise cut that fallback. Instead the idle
+    connection of the source holding the most connections, least recently active first, is closed
+    (RFC 7766 §6.2.3), and the idle timeout shrinks while the table is more than half full.
+    """
 
     allow_reuse_address = platform.system() != "Windows"  # avoid TIME_WAIT bind failures on POSIX only
     request_queue_size = 64
@@ -340,46 +520,98 @@ class _TcpServer(_QuietMixin, socketserver.ThreadingTCPServer):
     def __init__(self, *args, **kwargs) -> None:
         self._conn_lock = threading.Lock()
         self._conn_by_client: dict[str, int] = {}
+        self._conns: dict[socket.socket, _TcpConn] = {}
         self.active_connections = 0
         self.refused_connections = 0
+        self.evicted_connections = 0
         super().__init__(*args, **kwargs)
 
     def verify_request(self, request, client_address) -> bool:  # noqa: D401 - socketserver hook
         client = client_address[0]
         if not _accept_source(getattr(self, "dns", None), client):
             return False
+        victim: _TcpConn | None = None
         with self._conn_lock:
-            if (
-                self.active_connections >= TCP_MAX_CONNECTIONS
-                or self._conn_by_client.get(client, 0) >= TCP_MAX_CONNECTIONS_PER_CLIENT
-            ):
+            if self._conn_by_client.get(client, 0) >= TCP_MAX_CONNECTIONS_PER_CLIENT:
                 self.refused_connections += 1
                 return False
+            if self.active_connections >= TCP_MAX_CONNECTIONS:
+                victim = self._pick_evictee()
+                if victim is None:  # every connection is mid-query: nothing idle to reclaim
+                    self.refused_connections += 1
+                    return False
+                self._forget_locked(victim.sock)
+                self.evicted_connections += 1
+            self._conns[request] = _TcpConn(request, client, time.monotonic())
             self.active_connections += 1
             self._conn_by_client[client] = self._conn_by_client.get(client, 0) + 1
+        if victim is not None:
+            try:
+                victim.sock.shutdown(socket.SHUT_RDWR)  # wakes its handler's recv; it then exits
+            except OSError:
+                pass
         return True
 
-    def _release(self, client: str) -> None:
+    def _pick_evictee(self) -> _TcpConn | None:
+        idle = [c for c in self._conns.values() if not c.busy]
+        if not idle:
+            return None
+        return min(idle, key=lambda c: (-self._conn_by_client.get(c.client, 0), c.last))
+
+    def _forget_locked(self, sock) -> bool:
+        conn = self._conns.pop(sock, None)
+        if conn is None:
+            return False  # already released (evicted earlier)
+        self.active_connections = max(0, self.active_connections - 1)
+        n = self._conn_by_client.get(conn.client, 0) - 1
+        if n > 0:
+            self._conn_by_client[conn.client] = n
+        else:
+            self._conn_by_client.pop(conn.client, None)
+        return True
+
+    def _release(self, sock) -> None:
         with self._conn_lock:
-            self.active_connections = max(0, self.active_connections - 1)
-            n = self._conn_by_client.get(client, 0) - 1
-            if n > 0:
-                self._conn_by_client[client] = n
-            else:
-                self._conn_by_client.pop(client, None)
+            self._forget_locked(sock)
+
+    def is_live(self, sock) -> bool:
+        """False once the connection was evicted (or released)."""
+        return sock in self._conns
+
+    def mark_busy(self, sock) -> bool:
+        """The handler starts working on a query; False when the connection was evicted meanwhile."""
+        with self._conn_lock:
+            conn = self._conns.get(sock)
+            if conn is None:
+                return False
+            conn.busy = True
+            conn.last = time.monotonic()
+            return True
+
+    def mark_idle(self, sock) -> None:
+        with self._conn_lock:
+            conn = self._conns.get(sock)
+            if conn is not None:
+                conn.busy = False
+                conn.last = time.monotonic()
+
+    def idle_timeout(self) -> float:
+        if self.active_connections * 2 > TCP_MAX_CONNECTIONS:
+            return min(TCP_IDLE_TIMEOUT, TCP_IDLE_TIMEOUT_BUSY)
+        return TCP_IDLE_TIMEOUT
 
     def process_request(self, request, client_address) -> None:
         try:
             super().process_request(request, client_address)
         except BaseException:  # the thread never started, so its finally below never runs
-            self._release(client_address[0])
+            self._release(request)
             raise
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._release(client_address[0])
+            self._release(request)
 
 
 def _accept_source(dns: "DnsServer | None", client: str) -> bool:
@@ -421,8 +653,15 @@ class DnsServer:
             str(cfg_get(cfg, "dns", "doh_upstream", "") or ""),
         )
         self.cache = cache or DnsCache(int(cfg_get(cfg, "dns", "cache_max_entries", 20000) or 20000))
+        # Inventory devices: reserved query-log budget and reputation lane that forged sources cannot use up.
+        self.known_clients = KnownClients(conn)
         self.querylog = querylog or QueryLog(conn, enabled=bool(cfg_get(cfg, "dns", "log_queries", True)))
+        if getattr(self.querylog, "known", None) is None:
+            self.querylog.known = self.known_clients
         self.reputation = reputation
+        if reputation is not None and getattr(reputation, "known", None) is None:
+            reputation.known = self.known_clients
+        self._upstream_pool: ThreadPoolExecutor | None = None
         self.ratelimit = _RateLimiter(RATE_LIMIT_QPS)          # UDP, keyed on the (forgeable) source
         self.tcp_ratelimit = _RateLimiter(RATE_LIMIT_QPS)      # TCP sources are real: their own buckets
         self.global_ratelimit = _RateLimiter(GLOBAL_RATE_LIMIT_QPS)  # large UDP answers only (see handle_query)
@@ -469,6 +708,7 @@ class DnsServer:
                 on_malicious=self._on_malicious,
                 budget=shared_budget(self.cfg, self.conn),
                 skip=self.policy.is_never_block,
+                known=self.known_clients,
             )
 
     def start(self) -> bool:
@@ -493,9 +733,13 @@ class DnsServer:
                 return False
             self._stop.clear()
             self._started_at = time.monotonic()
+            self.known_clients.refresh()
             self.querylog.start()
             if self.reputation is not None:
                 self.reputation.start()
+            self._upstream_pool = ThreadPoolExecutor(max_workers=UPSTREAM_INFLIGHT_TOTAL,
+                                                     thread_name_prefix="dns-upstream")
+            self._udp.start_workers()
             for name, target in (
                 ("dns-udp", self._udp.serve_forever),
                 ("dns-tcp", self._tcp.serve_forever),
@@ -517,6 +761,13 @@ class DnsServer:
                         srv.shutdown()
                     except Exception:  # pragma: no cover
                         pass
+            if self._udp is not None:
+                self._udp.stop_workers()
+            if self._upstream_pool is not None:
+                # In-flight upstream calls finish on their own (bounded by the upstream timeouts) and
+                # release their guard slots; their replies go nowhere once the socket is closed.
+                self._upstream_pool.shutdown(wait=False)
+                self._upstream_pool = None
             self._close_sockets()
             for t in self._threads:
                 if t is not threading.current_thread():
@@ -540,23 +791,38 @@ class DnsServer:
 
     # ---- query pipeline -------------------------------------------------------------------
     def handle_query(self, data: bytes, client: str, *, tcp: bool = False) -> bytes | None:
-        """Wire-format in → wire-format out (None = drop silently). Never raises."""
+        """Wire-format in → wire-format out (None = drop silently). Never raises.
+
+        Runs the whole pipeline on the calling thread, upstream call included (TCP handlers, tests,
+        ``dns-test``). The UDP workers use ``_begin_query``/``_finish_query`` directly so the upstream
+        wait happens on the upstream pool instead.
+        """
+        step = self._begin_query(data, client, tcp=tcp)
+        if isinstance(step, _UpstreamWork):
+            return self._finish_query(step)
+        return step
+
+    def _begin_query(self, data: bytes, client: str, *, tcp: bool, admitted: bool = False):
+        """Everything up to the upstream call. Returns the reply bytes (or None to drop), or an
+        ``_UpstreamWork`` holding a guard slot. ``admitted`` = the UDP listener already checked the
+        source and charged its rate limit."""
         t0 = time.perf_counter()
-        if not _client_is_local(client):
-            # A home resolver only serves the LAN; queries from the Internet (a port-forward, or a
-            # spoofed victim address) are dropped without an answer so we cannot be used as a reflector.
-            self.dropped_foreign += 1
-            return None
-        # Only per-source limits here: a shared counter that drops queries lets a few forged sources
-        # silence every device in the house. A UDP source over its limit gets a bare TC=1 reply instead
-        # of silence, so a genuine client whose address is being forged retries over TCP (unforgeable,
-        # separate bucket), while the forger gets back no more bytes than it sent.
-        if tcp:
-            if not self.tcp_ratelimit.allow(client):
+        if not admitted:
+            if not _client_is_local(client):
+                # A home resolver only serves the LAN; queries from the Internet (a port-forward, or a
+                # spoofed victim address) are dropped without an answer so we cannot be used as a reflector.
+                self.dropped_foreign += 1
                 return None
-        elif not self.ratelimit.allow(client):
-            self.rate_limit_slipped += 1
-            return _truncated_bytes(data)
+            # Only per-source limits here: a shared counter that drops queries lets a few forged sources
+            # silence every device in the house. A UDP source over its limit gets a bare TC=1 reply
+            # instead of silence, so a genuine client whose address is being forged retries over TCP
+            # (unforgeable, separate bucket), while the forger gets back no more bytes than it sent.
+            if tcp:
+                if not self.tcp_ratelimit.allow(client):
+                    return None
+            elif not self.ratelimit.allow(client):
+                self.rate_limit_slipped += 1
+                return _truncated_bytes(data)
         try:
             request = DNSRecord.parse(data)
         except (DNSError, Exception):
@@ -566,11 +832,28 @@ class DnsServer:
         if request.header.opcode != OPCODE.QUERY:
             return _rcode_reply(request, RCODE.NOTIMP)
         try:
-            outcome = self._process(request, client)
+            outcome = self._process_local(request, client, tcp=tcp)
         except Exception:
             logger.exception("unexpected error handling query from %s", client)
-            outcome = QueryOutcome("error", "internal", request.reply(ra=1, aa=0))
-            outcome.reply.header.rcode = RCODE.SERVFAIL
+            outcome = QueryOutcome("error", "internal", _servfail(request))
+        if isinstance(outcome, _UpstreamWork):
+            outcome.t0 = t0
+            return outcome
+        return self._respond(request, client, outcome, t0, tcp=tcp)
+
+    def _finish_query(self, work: _UpstreamWork) -> bytes | None:
+        """The upstream call and everything after it; releases the work's guard slot. Never raises."""
+        try:
+            outcome = self._process_upstream(work)
+        except Exception:
+            logger.exception("unexpected error handling query from %s", work.client)
+            outcome = QueryOutcome("error", "internal", _servfail(work.request))
+        return self._respond(work.request, work.client, outcome, work.t0, tcp=work.tcp)
+
+    def _abandon(self, work: _UpstreamWork) -> None:
+        self.guard.release(work.client, work.zone, tcp=work.tcp)
+
+    def _respond(self, request: DNSRecord, client: str, outcome: QueryOutcome, t0: float, *, tcp: bool) -> bytes | None:
         ms = (time.perf_counter() - t0) * 1000.0
         q = request.q
         qname = str(q.qname).rstrip(".") or "."
@@ -587,7 +870,14 @@ class DnsServer:
         """Global amplification ceiling, consulted only for UDP answers above ``MIN_UDP_SIZE``."""
         return self.global_ratelimit.allow(GLOBAL_CLIENT_KEY)
 
-    def _process(self, request: DNSRecord, client: str) -> QueryOutcome:
+    def _process(self, request: DNSRecord, client: str, *, tcp: bool = False) -> QueryOutcome:
+        """The whole decision for one parsed query, on the calling thread."""
+        step = self._process_local(request, client, tcp=tcp)
+        if isinstance(step, _UpstreamWork):
+            return self._process_upstream(step)
+        return step
+
+    def _process_local(self, request: DNSRecord, client: str, *, tcp: bool = False) -> "QueryOutcome | _UpstreamWork":
         if self.policy is None:
             self.ensure_components()
         q: DNSQuestion = request.q
@@ -611,15 +901,24 @@ class DnsServer:
         refusal = self.guard.check(qname, qtype, zone)
         if refusal is not None:
             return QueryOutcome("error", refusal, _servfail(request))
-        if not self.guard.acquire(client, zone):
-            return QueryOutcome("error", "upstream:busy", _servfail(request))
+        if not self.guard.acquire(client, zone, tcp=tcp):
+            if tcp:
+                return QueryOutcome("error", "upstream:busy", _servfail(request))
+            # UDP limits can be pinned by forged sources, so they never fail a query: TC=1 sends the
+            # client to TCP, whose upstream capacity forged packets cannot reach.
+            return QueryOutcome("error", "upstream:busy", _truncated_reply(request))
+        return _UpstreamWork(request, client, tcp, qname, qtype, zone,
+                             decision.reason if decision.reason != "default" else None)
+
+    def _process_upstream(self, work: _UpstreamWork) -> QueryOutcome:
+        request, client, qname, qtype, zone = work.request, work.client, work.qname, work.qtype, work.zone
         error: UpstreamError | None = None
         try:
-            reply = self.upstream.resolve(_upstream_request(q))
+            reply = self.upstream.resolve(_upstream_request(request.q))
         except UpstreamError as exc:
             error = exc
         finally:
-            self.guard.release(client, zone)
+            self.guard.release(client, zone, tcp=work.tcp)
         if error is not None:
             if not isinstance(error, CircuitOpenError):
                 logger.warning("upstream failure for %s/%s: %s", qname, qtype, error)
@@ -632,7 +931,7 @@ class DnsServer:
         self.cache.put(qname, qtype, reply)
         if self.reputation is not None and reply.header.rcode == RCODE.NOERROR:
             self.reputation.enqueue(qname, client)
-        return QueryOutcome("allow", decision.reason if decision.reason != "default" else None, reply)
+        return QueryOutcome("allow", work.reason, reply)
 
     def _block_reply(self, request: DNSRecord, qname: str, qtype: str) -> DNSRecord:
         reply = request.reply(ra=1, aa=0)
@@ -678,6 +977,10 @@ class DnsServer:
 
     def housekeeping(self, *, now: float | None = None, force_health: bool = False) -> None:
         now = time.monotonic() if now is None else now
+        try:
+            self.known_clients.maybe_refresh(now)
+        except Exception:
+            logger.debug("known DNS clients refresh failed", exc_info=True)
         if self.policy is not None:
             lists_changed = self.policy.maybe_reload(now=now)
             overrides_changed = self.policy.refresh_overrides_if_changed()
@@ -804,6 +1107,10 @@ class DnsServer:
             "rate_limit_slipped": self.rate_limit_slipped,
             "upstream_guard": self.guard.stats(),
             "tcp_refused": self._tcp.refused_connections if self._tcp is not None else 0,
+            "tcp_evicted": self._tcp.evicted_connections if self._tcp is not None else 0,
+            "udp_shed": self._udp.shed if self._udp is not None else 0,
+            "log_overflowed": getattr(self.querylog, "overflowed", 0),
+            "known_clients": len(self.known_clients),
             "dropped_foreign": self.dropped_foreign,
             "block_mode": self.block_mode,
             "listen": self.listen,
@@ -867,6 +1174,13 @@ def _client_opt(request: DNSRecord):
 def _servfail(request: DNSRecord) -> DNSRecord:
     reply = request.reply(ra=1, aa=0)
     reply.header.rcode = RCODE.SERVFAIL
+    return reply
+
+
+def _truncated_reply(request: DNSRecord) -> DNSRecord:
+    """Empty NOERROR answer with TC=1: "ask me again over TCP"."""
+    reply = request.reply(ra=1, aa=0)
+    reply.header.tc = 1
     return reply
 
 

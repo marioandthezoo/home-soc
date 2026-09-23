@@ -22,6 +22,7 @@ produce a confident, daily, completely wrong alert.
 
 from __future__ import annotations
 
+import bisect
 import logging
 import sqlite3
 import statistics
@@ -213,21 +214,27 @@ def discovery_cycles(conn: sqlite3.Connection, *, since: str | None = None, inte
         (start_iso,),
     )
     gap = max(5.0, min(interval / 4.0, 60.0))
-    cycles: list[Cycle] = []
-    current: list[int] = []
-    start = end = 0.0
+    # Ordered by the parsed instant, not the stored text. The two agree for every stamp Home SOC
+    # writes (fixed-width UTC), but only an instant order guarantees what detection relies on:
+    # each cycle ends strictly after the one before it.
+    stamped: list[tuple[float, int]] = []
     for row in rows:
         parsed = parse_iso(str(row["seen_at"]))
         if parsed is None:
             continue
-        ts = parsed.timestamp()
+        stamped.append((parsed.timestamp(), int(row["device_id"])))
+    stamped.sort()
+    cycles: list[Cycle] = []
+    current: list[int] = []
+    start = end = 0.0
+    for ts, device_id in stamped:
         if current and ts - end > gap:
             cycles.append(Cycle(len(cycles), start, end, frozenset(current)))
             current = []
         if not current:
             start = ts
         end = ts
-        current.append(int(row["device_id"]))
+        current.append(device_id)
     if current:
         cycles.append(Cycle(len(cycles), start, end, frozenset(current)))
     return cycles
@@ -258,7 +265,13 @@ def device_tolerances(cycles: Sequence[Cycle], window_seconds: float) -> dict[in
 
 
 def presence(cycles: Sequence[Cycle], tolerances: Mapping[int, float]) -> list[dict[int, bool]]:
-    """Per cycle, whether each device counts as present — seen within its own tolerance."""
+    """Per cycle, whether each device counts as present — seen within its own tolerance.
+
+    A dense cycles x devices matrix, kept for diagnostics and tests. **Detection does not use
+    it**: every device that ever appeared costs one entry per cycle, so a LAN device minting
+    identities at discovery's caps drove it past a gigabyte. :func:`detect_outages` works from
+    :func:`absence_tracks` instead, which is proportional to the sightings themselves.
+    """
     everyone = sorted({d for c in cycles for d in c.seen})
     last_seen: dict[int, float] = {}
     out: list[dict[int, bool]] = []
@@ -274,7 +287,12 @@ def presence(cycles: Sequence[Cycle], tolerances: Mapping[int, float]) -> list[d
 
 
 def device_baselines(cycles: Sequence[Cycle], present: Sequence[Mapping[int, bool]]) -> dict[int, Baseline]:
-    """Per-device absence baseline: how often, and at what hour (C3's false-positive guard)."""
+    """Per-device absence baseline: how often, and at what hour (C3's false-positive guard).
+
+    Reads the dense :func:`presence` matrix, so it is for diagnostics and tests only; detection
+    builds the identical :class:`Baseline` sparsely, and only for devices that actually dropped
+    (:class:`_BaselineIndex`).
+    """
     first_seen: dict[int, int] = {}
     for cycle in cycles:
         for device_id in cycle.seen:
@@ -304,6 +322,126 @@ def device_baselines(cycles: Sequence[Cycle], present: Sequence[Mapping[int, boo
     }
 
 
+# ------------------------------------------------------------ sparse presence
+
+
+@dataclass(frozen=True)
+class AbsenceTrack:
+    """One device's presence history, stored as the runs of cycles in which it counts as absent.
+
+    ``absences`` holds half-open ``[start, stop)`` cycle-index ranges. ``start`` is the first
+    cycle in which the device had gone unseen for longer than its tolerance — so it was present
+    in ``start - 1``, and ``start`` is a drop — and ``stop`` is the next cycle it was seen in, or
+    ``len(cycles)`` when it has not come back. Everything :func:`presence` says about the device
+    is recoverable from this, at a cost proportional to its sightings rather than to every
+    cycle in the history.
+    """
+
+    device_id: int
+    first: int
+    absences: tuple[tuple[int, int], ...]
+
+
+def absence_tracks(cycles: Sequence[Cycle], tolerances: Mapping[int, float]) -> dict[int, AbsenceTrack]:
+    """The sparse equivalent of :func:`presence`: per device, the ranges where it is absent.
+
+    ``presence(...)[i][d]`` is False exactly for ``i`` before the device's first cycle and for
+    ``i`` inside one of its absence ranges. Requires strictly increasing cycle ends, which
+    :func:`discovery_cycles` guarantees.
+    """
+    ends = [cycle.end for cycle in cycles]
+    total = len(cycles)
+    seen_in: dict[int, list[int]] = {}
+    for position, cycle in enumerate(cycles):
+        for device_id in cycle.seen:
+            seen_in.setdefault(device_id, []).append(position)
+    out: dict[int, AbsenceTrack] = {}
+    for device_id, seen in seen_in.items():
+        # presence() treats a device with no tolerance as always within it.
+        tolerance = float(tolerances.get(device_id, float("inf")))
+        ranges: list[tuple[int, int]] = []
+        for j, seen_at in enumerate(seen):
+            stop = seen[j + 1] if j + 1 < len(seen) else total
+            # First cycle after this sighting whose distance from it exceeds the tolerance. The
+            # same subtraction presence() performs, so float rounding cannot make them disagree.
+            anchor = ends[seen_at]
+            low, high = seen_at + 1, stop
+            while low < high:
+                mid = (low + high) // 2
+                if ends[mid] - anchor <= tolerance:
+                    low = mid + 1
+                else:
+                    high = mid
+            if low < stop:
+                ranges.append((low, stop))
+        out[device_id] = AbsenceTrack(device_id, seen[0], tuple(ranges))
+    return out
+
+
+class _BaselineIndex:
+    """Builds :class:`Baseline` objects from absence tracks, on demand.
+
+    Only devices that actually dropped ever need one, so a device minted by MAC churn and seen
+    once costs a handful of binary searches instead of a row in every cycle of the history.
+    Produces exactly what :func:`device_baselines` produces from the dense matrix.
+    """
+
+    #: Ranges at most this long are tallied cycle by cycle; longer ones by binary search per hour.
+    _SHORT = 48
+
+    def __init__(self, cycles: Sequence[Cycle]) -> None:
+        self.total = len(cycles)
+        self.hour_of: list[int] = []
+        self.slot_of: list[int] = []  # index of the (UTC day, hour) run each cycle falls in
+        self.slot_hour: list[int] = []
+        self.cycles_at_hour: dict[int, list[int]] = {}
+        self.slots_at_hour: dict[int, list[int]] = {}
+        previous: tuple[str, int] | None = None
+        for position, cycle in enumerate(cycles):
+            hour = cycle.hour
+            key = (cycle.started_at[:10], hour)
+            if key != previous:
+                previous = key
+                self.slots_at_hour.setdefault(hour, []).append(len(self.slot_hour))
+                self.slot_hour.append(hour)
+            self.hour_of.append(hour)
+            self.slot_of.append(len(self.slot_hour) - 1)
+            self.cycles_at_hour.setdefault(hour, []).append(position)
+
+    @classmethod
+    def _by_hour(cls, ranges: Sequence[tuple[int, int]], per_hour: Mapping[int, list[int]],
+                 hour_of: Sequence[int]) -> dict[int, int]:
+        """hour -> how many positions inside ``ranges`` (half-open) fall in that hour."""
+        out: dict[int, int] = {}
+        for low, high in ranges:
+            if high - low <= cls._SHORT:
+                for position in range(low, high):
+                    hour = hour_of[position]
+                    out[hour] = out.get(hour, 0) + 1
+                continue
+            for hour, items in per_hour.items():
+                n = bisect.bisect_left(items, high) - bisect.bisect_left(items, low)
+                if n:
+                    out[hour] = out.get(hour, 0) + n
+        return out
+
+    def baseline(self, track: AbsenceTrack) -> Baseline:
+        hour_total = self._by_hour([(track.first, self.total)], self.cycles_at_hour, self.hour_of)
+        hour_absent = self._by_hour(track.absences, self.cycles_at_hour, self.hour_of)
+        # Distinct days per hour == distinct (day, hour) slots, and a range of cycles covers a
+        # contiguous run of slots. Runs that share a slot are merged so no day counts twice.
+        slot_runs: list[tuple[int, int]] = []
+        for low, high in track.absences:
+            run = (self.slot_of[low], self.slot_of[high - 1] + 1)
+            if slot_runs and run[0] < slot_runs[-1][1]:
+                slot_runs[-1] = (slot_runs[-1][0], max(slot_runs[-1][1], run[1]))
+            else:
+                slot_runs.append(run)
+        days = self._by_hour(slot_runs, self.slots_at_hour, self.slot_hour)
+        absent = sum(high - low for low, high in track.absences)
+        return Baseline(track.device_id, self.total - track.first, absent, hour_absent, hour_total, days)
+
+
 # -------------------------------------------------------------------- detection
 
 
@@ -313,43 +451,60 @@ def detect_outages(conn: sqlite3.Connection, *, min_members: int = 3, window_sec
     ``window_seconds`` defaults to 2 × the discovery interval (C3) and is the grace period
     before a missing device counts as gone. Returned outages have ``id = 0``; they are given
     one by :func:`record_outages`.
+
+    Works from :func:`absence_tracks`, never the dense :func:`presence` matrix: its cost is
+    proportional to the sightings in the window plus the drops found, so identities minted by
+    MAC churn — each seen once and never again — cost a few entries each rather than one per
+    cycle of thirty days of history. The result is identical to evaluating the dense matrix,
+    which ``tests/test_security2_topology.py`` checks against randomised histories.
     """
     interval = discovery_interval_seconds(conn)
     window = int(window_seconds) if window_seconds else 2 * interval
     cycles = discovery_cycles(conn, interval_seconds=interval)
     if len(cycles) < MIN_HISTORY_CYCLES + 1:
         return []
-    present = presence(cycles, device_tolerances(cycles, window))
-    baselines = device_baselines(cycles, present)
-    first_seen: dict[int, int] = {}
-    for cycle in cycles:
-        for device_id in cycle.seen:
-            first_seen.setdefault(device_id, cycle.index)
+    tracks = absence_tracks(cycles, device_tolerances(cycles, window))
+
+    # cycle index -> [(device, the cycle it was next seen in)] for every drop old enough to count
+    drops: dict[int, list[tuple[int, int]]] = {}
+    for device_id, track in tracks.items():
+        for start, stop in track.absences:
+            if start - track.first < MIN_HISTORY_CYCLES:
+                continue  # too new to have a normal
+            drops.setdefault(start, []).append((device_id, stop))
 
     kinds = _device_kinds(conn)
     gateway_id = _gateway_device_id(conn)
     minimum = max(2, int(min_members))
+    index = _BaselineIndex(cycles)
+    baselines: dict[int, Baseline] = {}
     outages: list[Outage] = []
-    for index in range(1, len(cycles)):
-        cycle = cycles[index]
+    for position in sorted(drops):
+        candidates = drops[position]
+        if len(candidates) < minimum:
+            continue  # the routine guard only ever removes members, so this cycle cannot qualify
+        cycle = cycles[position]
         droppers: list[int] = []
-        for device_id, is_present in sorted(present[index].items()):
-            if is_present or not present[index - 1].get(device_id):
-                continue
-            if index - first_seen.get(device_id, index) < MIN_HISTORY_CYCLES:
-                continue  # too new to have a normal
+        returns: list[int] = []
+        for device_id, stop in sorted(candidates):
             baseline = baselines.get(device_id)
-            if baseline is not None and baseline.is_routine(cycle.hour):
+            if baseline is None:
+                baseline = baselines[device_id] = index.baseline(tracks[device_id])
+            if baseline.is_routine(cycle.hour):
                 continue  # the phone that leaves the house every evening
             droppers.append(device_id)
+            returns.append(stop)
         if len(droppers) < minimum:
             continue
         trigger_id, trigger_kind = _classify_trigger(droppers, kinds, gateway_id)
+        # When the last member came back, or None while any of them is still missing.
+        ended_at = (None if any(stop >= len(cycles) for stop in returns)
+                    else max(cycles[stop].started_at for stop in returns))
         outages.append(Outage(
             id=0,
             started_at=cycle.started_at,
-            ended_at=_ended_at(cycles, present, droppers, index),
-            cycle_seconds=measured_cycle_seconds(cycles, index, interval),
+            ended_at=ended_at,
+            cycle_seconds=measured_cycle_seconds(cycles, position, interval),
             members=sorted(droppers),
             trigger_device_id=trigger_id,
             trigger_kind=trigger_kind,
@@ -358,7 +513,7 @@ def detect_outages(conn: sqlite3.Connection, *, min_members: int = 3, window_sec
 
 
 def _ended_at(cycles: Sequence[Cycle], present: Sequence[Mapping[int, bool]], members: Sequence[int], index: int) -> str | None:
-    """When the last member came back, or None while any of them is still missing."""
+    """When the last member came back, or None while any is still missing (dense form, for tests)."""
     returns: list[str] = []
     for device_id in members:
         when = next((cycles[j].started_at for j in range(index + 1, len(cycles)) if present[j].get(device_id)), None)
@@ -689,7 +844,7 @@ __all__ = [
     "EVIDENCE_MAX_DATES", "INFRASTRUCTURE_KINDS",
     "Outage", "Cycle", "Baseline",
     "discovery_interval_seconds", "resolution_note", "measured_cycle_seconds",
-    "discovery_cycles", "presence", "device_tolerances", "device_baselines",
+    "discovery_cycles", "presence", "device_tolerances", "device_baselines", "absence_tracks", "AbsenceTrack",
     "detect_outages", "record_outages", "stored_outages",
     "co_drop_matrix", "trigger_counts", "trigger_members", "observed_blast_radius",
 ]
