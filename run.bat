@@ -58,6 +58,10 @@ if errorlevel 1 goto bad_venv
 
 rem ---- dependencies: only when requirements.txt actually changed --------------
 rem Re-running pip at every logon is slow and, offline, prints a wall of errors.
+rem requirements.txt is the hash-locked lock file (every transitive package, pip included), so
+rem its SHA-256 below changes whenever any locked version is bumped - that is how a security fix
+rem in urllib3/werkzeug/... reaches an existing .venv. --require-hashes makes pip refuse anything
+rem unpinned, unlisted or whose bytes differ from the lock.
 set "STAMP=.venv\.requirements.sha"
 set "REQHASH="
 for /f "skip=1 delims=" %%h in ('certutil -hashfile requirements.txt SHA256 2^>nul') do if not defined REQHASH set "REQHASH=%%h"
@@ -67,7 +71,7 @@ if exist "%STAMP%" set /p OLDHASH=<"%STAMP%"
 if "%OLDHASH%"=="%REQHASH%" goto deps_ready
 :pip_install
 echo [Home SOC] installing dependencies ...
-python -m pip install -r requirements.txt -q --disable-pip-version-check
+python -m pip install --require-hashes -r requirements.txt -q --disable-pip-version-check
 if errorlevel 1 goto pip_failed
 if not defined REQHASH goto deps_ready
 >"%STAMP%" echo %REQHASH%
@@ -103,7 +107,7 @@ set "MSG=the .venv virtual environment runs %FOUNDVER%, but Home SOC needs Pytho
 goto fail
 
 :pip_failed
-set "MSG=dependency install failed - this usually means no internet connection. Connect and run run.bat again; see data\logs\launcher.log."
+set "MSG=dependency install failed - this usually means no internet connection. Connect and run run.bat again. If it keeps failing with a HASH mismatch, a download did not match requirements.txt - do not work around it; report it. See data\logs\launcher.log."
 goto fail
 
 :init_failed

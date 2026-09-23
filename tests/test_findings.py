@@ -896,7 +896,10 @@ def test_toast_script_escapes_xml_and_encodes():
     xml = channels.build_toast_xml("A <b> & 'c' \"d\"", "line")
     assert "<b>" not in xml and "&lt;b&gt;" in xml and "&apos;c&apos;" in xml and "&quot;d&quot;" in xml
     script = channels.build_toast_script("x'y", "$(calc)")
-    assert "x'y" not in script and "x&apos;y" in script
+    # Alert text never appears in the script body: it is base64 (see test_security_critic.py).
+    assert "x'y" not in script and "$(calc)" not in script
+    b64 = script.split("FromBase64String('", 1)[1].split("'", 1)[0]
+    assert "x&apos;y" in base64.b64decode(b64).decode("utf-8")
     assert "ToastNotificationManager" in script
     # Windows silently drops toasts raised under an AppUserModelID nothing registered, and Home SOC
     # registers none (make-autostart.ps1 writes a plain Startup shortcut). Borrow PowerShell's own
@@ -909,7 +912,8 @@ def test_toast_script_escapes_xml_and_encodes():
     argv = channels.build_toast_argv("t", "b")
     assert argv[0] == "powershell" and "-EncodedCommand" in argv and "-NonInteractive" in argv
     decoded = base64.b64decode(argv[-1]).decode("utf-16-le")
-    assert decoded == channels.build_toast_script("t", "b") and "ToastGeneric" in decoded
+    assert decoded == channels.build_toast_script("t", "b") and "FromBase64String" in decoded
+    assert "ToastGeneric" in channels.build_toast_xml("t", "b")
 
 
 def test_notify_new_findings_filters_and_batches(conn):

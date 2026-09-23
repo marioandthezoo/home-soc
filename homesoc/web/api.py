@@ -8,14 +8,17 @@ imported; each fallback is marked with a SPEC-GAP comment.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import ipaddress
 import json
 import logging
 import platform
 import secrets
 import sqlite3
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -108,6 +111,9 @@ class WebContext:
     scheduler: Any = None
     dns_server: Any = None
     token: str = ""
+    #: Results of aggregates that turned out to be slow, keyed by query (see :func:`throttled`).
+    slow_cache: dict = field(default_factory=dict)
+    slow_lock: Any = field(default_factory=threading.Lock)
 
 
 def ctx() -> WebContext:
@@ -260,6 +266,251 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def _bool(value: Any) -> bool:
     return bool(value) and str(value).lower() not in ("0", "false", "no", "")
+
+
+#: An aggregate that took longer than this is served from memory for a while afterwards.
+SLOW_QUERY_SECONDS = 0.25
+#: ...for at least this long, and never for less than ten times what it cost to compute.
+SLOW_QUERY_MIN_TTL = 15.0
+SLOW_QUERY_MAX_TTL = 300.0
+
+
+def throttled(c: WebContext, key: tuple, compute: Any) -> Any:
+    """Run ``compute()`` — unless it was slow last time, in which case reuse that answer for a bit.
+
+    Every query holds the one connection lock every thread shares, so an aggregate that has grown
+    slow (a LAN device flooding the DNS log, a device table swollen by MAC churn) stalls the
+    scheduler, the query-log flush and every other request for as long as it runs. A dashboard
+    left polling every 15 s, several open tabs, or a page looping a request must not multiply
+    that: a result that took longer than :data:`SLOW_QUERY_SECONDS` is reused for ten times its
+    cost (15 s to 5 min), which caps the share of the lock such a query can take at about 10%.
+    Fast answers are never cached, so a normal-sized home sees live numbers exactly as before.
+    """
+    now = time.monotonic()
+    with c.slow_lock:
+        hit = c.slow_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    started = time.monotonic()
+    value = compute()
+    took = time.monotonic() - started
+    with c.slow_lock:
+        if took >= SLOW_QUERY_SECONDS:
+            ttl = min(SLOW_QUERY_MAX_TTL, max(SLOW_QUERY_MIN_TTL, took * 10))
+            if len(c.slow_cache) >= 256:
+                c.slow_cache.clear()
+            c.slow_cache[key] = (time.monotonic() + ttl, value)
+            logger.info("%s took %.2fs; reusing its result for %.0fs", key[0], took, ttl)
+        else:
+            c.slow_cache.pop(key, None)
+    return value
+
+
+# --------------------------------------------------------------------------- dashboard sessions
+#
+# The browser cookie is a random session id, never ``web.token`` itself. Cookies are not isolated
+# by port, so any other server on 127.0.0.1 the owner is lured to (another local account's, a dev
+# server) receives this cookie; what it gets is a session that expires, dies on logout and dies when
+# the token changes — not the master credential that also works as ``X-Token`` from a script.
+# Only a SHA-256 of each id is stored, in the settings table under a key that is not a config key.
+
+DASHBOARD_COOKIE = "homesoc_token"
+#: The name under --tls: ``__Host-`` makes the browser refuse it unless Secure, Path=/ and host-only.
+DASHBOARD_COOKIE_SECURE = "__Host-homesoc_token"
+SESSION_PREFIX = "websession."
+SESSION_TOKEN_KEY = "websession-token-check"
+SESSION_TTL_SECONDS = 7 * 86400
+#: A session used within its last six days is extended, so a wall-mounted dashboard stays signed in.
+SESSION_RENEW_AFTER_SECONDS = 86400
+SESSION_MAX = 20
+_TOKEN_CHECK_ITERATIONS = 100_000
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _token_check(token: str, salt: str) -> str:
+    """A slow, salted fingerprint of ``web.token``: enough to notice it changed, useless to guess it."""
+    digest = hashlib.pbkdf2_hmac("sha256", token.encode("utf-8"), bytes.fromhex(salt), _TOKEN_CHECK_ITERATIONS)
+    return f"pbkdf2_sha256${_TOKEN_CHECK_ITERATIONS}${salt}${digest.hex()}"
+
+
+def _session_keys(conn: sqlite3.Connection) -> list[dict]:
+    return rows(conn, "SELECT key, value FROM settings WHERE key LIKE ? ORDER BY key", (SESSION_PREFIX + "%",))
+
+
+def sessions_revoke_all(conn: sqlite3.Connection) -> int:
+    keys = [str(r["key"]) for r in _session_keys(conn)]
+    for key in keys:
+        write(conn, "DELETE FROM settings WHERE key=?", (key,))
+    return len(keys)
+
+
+def sessions_sync_token(conn: sqlite3.Connection, token: str) -> None:
+    """At startup: sign every browser out when ``web.token`` is not the one the sessions were made under.
+
+    Rotating a leaked token has to end the sessions it opened, or the person who had it keeps a
+    live cookie for another week.
+    """
+    try:
+        stored = str(get_setting(conn, SESSION_TOKEN_KEY, "") or "")
+        if token and stored.count("$") == 3:
+            _algo, _iters, salt, _digest = stored.split("$")
+            try:
+                if secrets.compare_digest(_token_check(token, salt), stored):
+                    return
+            except ValueError:
+                pass
+        revoked = sessions_revoke_all(conn)
+        if token:
+            set_setting(conn, SESSION_TOKEN_KEY, _token_check(token, secrets.token_hex(16)))
+        else:
+            write(conn, "DELETE FROM settings WHERE key=?", (SESSION_TOKEN_KEY,))
+        if revoked:
+            logger.info("web.token changed: signed out %d browser session(s)", revoked)
+    except sqlite3.Error as exc:  # pragma: no cover - a pre-settings database
+        logger.warning("could not check dashboard sessions: %s", exc)
+
+
+def _session_state(raw: Any) -> dict:
+    state = loads(raw, {})
+    return state if isinstance(state, dict) else {}
+
+
+def session_create(conn: sqlite3.Connection) -> str:
+    """Mint a session for a browser that just presented the right token; returns the cookie value."""
+    now = utcnow()
+    live: list[tuple[str, str]] = []
+    for r in _session_keys(conn):
+        state = _session_state(r["value"])
+        expires = str(state.get("expires_at") or "")
+        if not expires or expires <= now.strftime("%Y-%m-%dT%H:%M:%SZ"):
+            write(conn, "DELETE FROM settings WHERE key=?", (str(r["key"]),))
+        else:
+            live.append((str(state.get("created_at") or ""), str(r["key"])))
+    for _created, key in sorted(live)[: max(0, len(live) - SESSION_MAX + 1)]:
+        write(conn, "DELETE FROM settings WHERE key=?", (key,))  # oldest first, so the table stays small
+    sid = secrets.token_urlsafe(32)
+    set_setting(conn, SESSION_PREFIX + _sha256(sid), json.dumps({
+        "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": (now + timedelta(seconds=SESSION_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }))
+    return sid
+
+
+def session_check(conn: sqlite3.Connection, sid: str | None) -> str | None:
+    """``"ok"``, ``"renewed"`` (extended: re-send the cookie) or ``None`` for no valid session."""
+    if not sid or len(sid) > 128:
+        return None
+    key = SESSION_PREFIX + _sha256(sid)
+    raw = get_setting(conn, key)
+    if raw is None:
+        return None
+    state = _session_state(raw)
+    expires = parse_ts(state.get("expires_at"))
+    now = utcnow()
+    if expires is None or expires <= now:
+        write(conn, "DELETE FROM settings WHERE key=?", (key,))
+        return None
+    if (expires - now).total_seconds() < SESSION_TTL_SECONDS - SESSION_RENEW_AFTER_SECONDS:
+        state["expires_at"] = (now + timedelta(seconds=SESSION_TTL_SECONDS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        set_setting(conn, key, json.dumps(state))
+        return "renewed"
+    return "ok"
+
+
+def session_revoke(conn: sqlite3.Connection, sid: str | None) -> None:
+    if sid and len(sid) <= 128:
+        write(conn, "DELETE FROM settings WHERE key=?", (SESSION_PREFIX + _sha256(sid),))
+
+
+def presented_session() -> str | None:
+    return request.cookies.get(DASHBOARD_COOKIE_SECURE) or request.cookies.get(DASHBOARD_COOKIE)
+
+
+# --------------------------------------------------------------------------- token guessing
+#
+# Every place that compares a presented ``web.token`` counts failures per source address, and
+# across all addresses, in memory: a LAN host (or another local account) otherwise gets thousands
+# of guesses a second at a token the owner may have picked by hand, and leaves no trace. A valid
+# session cookie is not a guess and keeps working while an address is locked out, so the owner's
+# own open dashboard is never the thing that gets refused.
+
+TOKEN_GUESS_LIMIT = 10
+TOKEN_GUESS_GLOBAL_LIMIT = 100
+TOKEN_GUESS_WINDOW_SECONDS = 600
+TOKEN_GUESS_LOCKOUT_SECONDS = 900
+_GLOBAL_GUESSES = "*"
+_guess_lock = threading.Lock()
+_guesses: dict[str, list[float]] = {}  # source -> [window_start, failures, blocked_until]
+
+
+def _guess_source_is_loopback(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return bool((mapped or addr).is_loopback)
+
+
+def token_guess_retry_after(ip: str) -> int:
+    """Seconds this source (or everyone, during a spread-out attack) must wait; 0 when it may try.
+
+    The all-addresses lockout exists to stop a guesser that hops between LAN addresses. It is not
+    applied to this machine's own loopback address: that source cannot hop, its own per-address
+    limit still holds, and otherwise any host that can reach an exposed dashboard could lock the
+    owner out of signing in at the desk.
+    """
+    now = time.monotonic()
+    keys = (ip,) if _guess_source_is_loopback(ip) else (ip, _GLOBAL_GUESSES)
+    with _guess_lock:
+        waits = [state[2] - now for key in keys if (state := _guesses.get(key)) and state[2] > now]
+    return int(max(waits)) + 1 if waits else 0
+
+
+def token_guess_failed(conn: sqlite3.Connection, ip: str) -> None:
+    now = time.monotonic()
+    tripped: list[tuple[str, int]] = []
+    with _guess_lock:
+        if len(_guesses) > 4096:
+            for key in [k for k, s in _guesses.items() if s[2] <= now and now - s[0] > TOKEN_GUESS_WINDOW_SECONDS]:
+                del _guesses[key]
+            if len(_guesses) > 4096:  # an address-hopping flood: keep the global counter, drop the rest
+                _guesses.clear()
+        for key, limit in ((ip, TOKEN_GUESS_LIMIT), (_GLOBAL_GUESSES, TOKEN_GUESS_GLOBAL_LIMIT)):
+            state = _guesses.setdefault(key, [now, 0.0, 0.0])
+            if now - state[0] > TOKEN_GUESS_WINDOW_SECONDS:
+                state[0], state[1] = now, 0.0
+            state[1] += 1
+            if state[1] >= limit and state[2] <= now:
+                state[2] = now + TOKEN_GUESS_LOCKOUT_SECONDS
+                tripped.append((key, int(state[1])))
+    for key, count in tripped:
+        who = "from all addresses together" if key == _GLOBAL_GUESSES else f"from {ip}"
+        _record_event(conn, "warning", "web",
+                      f"{count} wrong dashboard tokens {who}; refusing token sign-ins "
+                      f"{'from anywhere' if key == _GLOBAL_GUESSES else 'from there'} for "
+                      f"{TOKEN_GUESS_LOCKOUT_SECONDS // 60} minutes",
+                      {"source": key, "failures": count})
+
+
+def token_guess_reset(ip: str) -> None:
+    with _guess_lock:
+        _guesses.pop(ip, None)
+
+
+def check_token_guess(conn: sqlite3.Connection, expected: str, presented: str | None, ip: str) -> bool:
+    """Compare a presented token, counting it when wrong. Always False while the source is locked out."""
+    if not presented or not expected:
+        return False
+    if token_guess_retry_after(ip):
+        return False
+    if secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8")):
+        return True
+    token_guess_failed(conn, ip)
+    return False
 
 
 # --------------------------------------------------------------------------- findings
@@ -590,15 +841,53 @@ def _device_row(d: dict) -> dict:
     return d
 
 
+def _device_ids_for_subject(subject: str, by_mac: dict[str, int]) -> set[int]:
+    """Devices a ``device:<mac>`` / ``device:<mac>:<rest>`` finding subject names.
+
+    MACs contain colons themselves, so every colon-delimited prefix of the remainder is tried
+    (a handful of dictionary probes), which matches ``subject = 'device:'||mac`` and
+    ``subject LIKE 'device:'||mac||':%'`` without a per-device scan.
+    """
+    if not subject.startswith("device:"):
+        return set()
+    rest = subject[len("device:"):].lower()
+    found: set[int] = set()
+    cut = len(rest)
+    while cut > 0:
+        device_id = by_mac.get(rest[:cut])
+        if device_id is not None:
+            found.add(device_id)
+        cut = rest.rfind(":", 0, cut)
+    return found
+
+
 def devices_list(conn: sqlite3.Connection) -> list[dict]:
-    data = rows(
-        conn,
-        "SELECT d.*, "
-        "(SELECT count(*) FROM services s WHERE s.device_id=d.id AND s.state='open') AS open_ports, "
-        "(SELECT count(*) FROM findings f WHERE f.status='open' AND "
-        " (f.device_id=d.id OR f.subject=('device:'||d.mac) OR f.subject LIKE ('device:'||d.mac||':%'))) AS open_findings "
-        "FROM devices d ORDER BY d.online DESC, d.last_seen DESC",
-    )
+    """Every device with its open-port and open-finding counts.
+
+    Three linear queries joined in Python, not a correlated subquery per device: the old
+    ``(SELECT count(*) FROM findings WHERE device_id=d.id OR subject=... OR subject LIKE ...)``
+    could not use an index, so it scanned every open finding once per device — quadratic in a
+    table a LAN device can grow at will by answering ARP with fresh MACs, and all of it under
+    the connection lock every other thread waits on.
+    """
+    data = rows(conn, "SELECT d.* FROM devices d ORDER BY d.online DESC, d.last_seen DESC")
+    ports = {
+        int(r["device_id"]): int(r["n"] or 0)
+        for r in rows(conn, "SELECT device_id, count(*) AS n FROM services WHERE state='open' GROUP BY device_id")
+        if r.get("device_id") is not None
+    }
+    ids = {int(d["id"]) for d in data}
+    by_mac = {str(d["mac"]).lower(): int(d["id"]) for d in data if d.get("mac")}
+    findings_open: dict[int, int] = {}
+    for f in rows(conn, "SELECT device_id, subject FROM findings WHERE status='open'"):
+        owners = _device_ids_for_subject(str(f.get("subject") or ""), by_mac)
+        if f.get("device_id") is not None and int(f["device_id"]) in ids:
+            owners.add(int(f["device_id"]))
+        for device_id in owners:
+            findings_open[device_id] = findings_open.get(device_id, 0) + 1
+    for d in data:
+        d["open_ports"] = ports.get(int(d["id"]), 0)
+        d["open_findings"] = findings_open.get(int(d["id"]), 0)
     return [_device_row(d) for d in data]
 
 
@@ -960,15 +1249,89 @@ def dns_running(c: WebContext) -> bool:
     return True if flag is None else bool(flag)
 
 
-def dns_summary(c: WebContext) -> dict:
-    conn = c.conn
-    since = cutoff_iso(24)
+#: How many of the newest raw rows the cache-hit rate and average latency are measured over.
+DNS_SAMPLE_ROWS = 20000
+
+
+def _dns_window(conn: sqlite3.Connection, hours: float) -> tuple[str, str | None, str | None]:
+    """Split a trailing window into ``(since, first_hourly, rolled_up_until)``.
+
+    ``dns_hourly`` is rewritten for the last 48 h by every hourly ``dns_rollup`` run, so every
+    hour strictly before its newest row is complete. The window is read as: raw rows for the
+    partial first hour, rolled-up rows for the whole hours in the middle, and raw rows again only
+    from the newest rolled-up hour on — at most an hour or two of raw rows however long the
+    window, instead of every query of the last day (or fortnight) under the shared lock.
+    ``rolled_up_until`` is ``None`` when there is nothing rolled up to use, in which case the
+    caller reads the window from raw rows alone, exactly as before.
+    """
+    since = cutoff_iso(hours)
+    start = parse_ts(since) or utcnow()
+    first_hourly = (start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00")
+    newest = scalar(conn, "SELECT max(hour) FROM dns_hourly WHERE hour>=?", (first_hourly,), default=None)
+    if not newest or str(newest) <= first_hourly:
+        return since, None, None
+    return since, first_hourly, str(newest)
+
+
+def _hour_to_ts(hour: str) -> str:
+    """``2026-09-04T12:00`` -> ``2026-09-04T12:00:00``: comparable with raw ``ts`` values."""
+    return hour[:13] + ":00:00"
+
+
+def dns_window_counts(conn: sqlite3.Connection, hours: float = 24) -> dict[str, int]:
+    """``{total, blocked, clients}`` over the trailing window, mostly from ``dns_hourly``."""
+    since, first_hourly, newest = _dns_window(conn, hours)
+    if newest is None:
+        agg = one(
+            conn,
+            "SELECT count(*) AS total, sum(action='block') AS blocked, count(DISTINCT client) AS clients "
+            "FROM dns_queries WHERE ts>=?",
+            (since,),
+        ) or {}
+        return {k: int(agg.get(k) or 0) for k in ("total", "blocked", "clients")}
+    head_end, tail_start = _hour_to_ts(first_hourly), _hour_to_ts(newest)
     agg = one(
         conn,
-        "SELECT count(*) AS total, sum(action='block') AS blocked, sum(action='cache') AS cached, "
-        "count(DISTINCT client) AS clients, avg(ms) AS avg_ms FROM dns_queries WHERE ts>=?",
-        (since,),
+        "SELECT sum(total) AS total, sum(blocked) AS blocked FROM ("
+        " SELECT count(*) AS total, sum(action='block') AS blocked FROM dns_queries WHERE ts>=? AND ts<?"
+        " UNION ALL SELECT sum(total), sum(blocked) FROM dns_hourly WHERE hour>=? AND hour<?"
+        " UNION ALL SELECT count(*), sum(action='block') FROM dns_queries WHERE ts>=?)",
+        (since, head_end, first_hourly, newest, tail_start),
     ) or {}
+    clients = scalar(
+        conn,
+        "SELECT count(*) FROM ("
+        " SELECT client FROM dns_queries WHERE ts>=? AND ts<?"
+        " UNION SELECT client FROM dns_hourly WHERE hour>=? AND hour<?"
+        " UNION SELECT client FROM dns_queries WHERE ts>=?)",
+        (since, head_end, first_hourly, newest, tail_start),
+    )
+    return {"total": int(agg.get("total") or 0), "blocked": int(agg.get("blocked") or 0), "clients": int(clients or 0)}
+
+
+def _dns_recent_sample(conn: sqlite3.Connection, since: str) -> dict[str, Any]:
+    """Cache hits and mean latency over the newest :data:`DNS_SAMPLE_ROWS` rows of the window."""
+    return one(
+        conn,
+        "SELECT count(*) AS n, sum(action='cache') AS cached, avg(ms) AS avg_ms FROM "
+        "(SELECT action, ms FROM dns_queries WHERE ts>=? ORDER BY ts DESC LIMIT ?)",
+        (since, DNS_SAMPLE_ROWS),
+    ) or {}
+
+
+def dns_summary(c: WebContext) -> dict:
+    conn = c.conn
+
+    def compute() -> dict:
+        counts = dns_window_counts(conn, 24)
+        sample = _dns_recent_sample(conn, cutoff_iso(24))
+        sampled = int(sample.get("n") or 0)
+        cached = int(sample.get("cached") or 0)
+        if sampled and counts["total"] > sampled:
+            cached = round(cached * counts["total"] / sampled)  # an estimate once the day outgrows the sample
+        return {**counts, "cached": cached, "avg_ms": sample.get("avg_ms")}
+
+    agg = throttled(c, ("dns_summary",), compute)
     total = int(agg.get("total") or 0)
     blocked = int(agg.get("blocked") or 0)
     today = utcnow().strftime("%Y-%m-%d")
@@ -998,15 +1361,31 @@ def dns_summary(c: WebContext) -> dict:
 
 
 def dns_series(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
-    """Per-hour totals straight from dns_queries so the current (not yet rolled-up) hour is
-    included; missing hours are zero-filled so charts always show the full window."""
+    """Per-hour totals; the current (not yet rolled-up) hour is included from raw rows and whole
+    rolled-up hours come from dns_hourly (see :func:`_dns_window`). Missing hours are zero-filled
+    so charts always show the full window."""
     hours = max(1, min(int(hours), 24 * 14))
-    data = rows(
-        conn,
-        "SELECT substr(ts,1,13) AS hour, count(*) AS total, sum(action='block') AS blocked "
-        "FROM dns_queries WHERE ts>=? GROUP BY hour ORDER BY hour",
-        (cutoff_iso(hours),),
-    )
+    since, first_hourly, newest = _dns_window(conn, hours)
+    if newest is None:
+        data = rows(
+            conn,
+            "SELECT substr(ts,1,13) AS hour, count(*) AS total, sum(action='block') AS blocked "
+            "FROM dns_queries WHERE ts>=? GROUP BY hour ORDER BY hour",
+            (since,),
+        )
+    else:
+        data = rows(
+            conn,
+            "SELECT hour, sum(total) AS total, sum(blocked) AS blocked FROM ("
+            " SELECT substr(ts,1,13) AS hour, count(*) AS total, sum(action='block') AS blocked"
+            "  FROM dns_queries WHERE ts>=? AND ts<? GROUP BY 1"
+            " UNION ALL SELECT substr(hour,1,13), sum(total), sum(blocked)"
+            "  FROM dns_hourly WHERE hour>=? AND hour<? GROUP BY 1"
+            " UNION ALL SELECT substr(ts,1,13), count(*), sum(action='block')"
+            "  FROM dns_queries WHERE ts>=? GROUP BY 1"
+            ") GROUP BY hour ORDER BY hour",
+            (since, _hour_to_ts(first_hourly), first_hourly, newest, _hour_to_ts(newest)),
+        )
     by_hour = {r["hour"]: r for r in data}
     now = utcnow().replace(minute=0, second=0, microsecond=0)
     out = []
@@ -1018,14 +1397,27 @@ def dns_series(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
 
 
 def dns_top(conn: sqlite3.Connection, kind: str = "blocked", hours: int = 24, limit: int = 20) -> list[dict]:
-    since = cutoff_iso(max(1, min(int(hours), 24 * 30)))
+    hours = max(1, min(int(hours), 24 * 30))
+    since = cutoff_iso(hours)
     limit = max(1, min(int(limit), 200))
     if kind == "clients":
+        _, first_hourly, newest = _dns_window(conn, hours)
+        if newest is None:
+            return rows(
+                conn,
+                "SELECT client, count(*) AS total, sum(action='block') AS blocked FROM dns_queries "
+                "WHERE ts>=? GROUP BY client ORDER BY total DESC LIMIT ?",
+                (since, limit),
+            )
         return rows(
             conn,
-            "SELECT client, count(*) AS total, sum(action='block') AS blocked FROM dns_queries "
-            "WHERE ts>=? GROUP BY client ORDER BY total DESC LIMIT ?",
-            (since, limit),
+            "SELECT client, sum(total) AS total, sum(blocked) AS blocked FROM ("
+            " SELECT client, count(*) AS total, sum(action='block') AS blocked"
+            "  FROM dns_queries WHERE ts>=? AND ts<? GROUP BY client"
+            " UNION ALL SELECT client, sum(total), sum(blocked) FROM dns_hourly WHERE hour>=? AND hour<? GROUP BY client"
+            " UNION ALL SELECT client, count(*), sum(action='block') FROM dns_queries WHERE ts>=? GROUP BY client"
+            ") GROUP BY client ORDER BY total DESC LIMIT ?",
+            (since, _hour_to_ts(first_hourly), first_hourly, newest, _hour_to_ts(newest), limit),
         )
     return rows(
         conn,
@@ -1367,6 +1759,14 @@ def trigger_device_scan(c: WebContext, device_id: int) -> dict:
 # --------------------------------------------------------------------------- settings
 
 
+def _unknown_blocklists(value: Any) -> list[str]:
+    """dns.lists entries that are not feed names from the registry (paths, "..", UNC shares...)."""
+    from homesoc.dnsfilter.policy import valid_list_name
+
+    names = json.loads(_encode_setting("list", value))
+    return [str(n)[:64] for n in names if not valid_list_name(str(n))]
+
+
 def _encode_setting(kind: str, value: Any) -> str:
     """Overrides are stored as strings (db.set_setting). SPEC-GAP: encoding is not specified;
     bools as true/false, lists as a JSON array, everything else str()."""
@@ -1394,12 +1794,90 @@ def _display_value(kind: str, value: Any) -> Any:
     return "" if value is None else value
 
 
+#: Overrides that matter most when they silently beat config.toml: a credential, where the
+#: dashboard listens, and where the whole house's DNS goes.
+SHADOW_WARN_KEYS: frozenset[str] = frozenset({
+    "web.token", "web.host", "web.port", "notify.ntfy_url", "notify.discord_webhook", "notify.webhook_url",
+    "vulns.nvd_api_key", "dns.virustotal_api_key", "dns.urlhaus_auth_key", "dns.upstreams", "dns.doh_upstream",
+    "dns.listen", "dns.enabled",
+})
+
+
+def _config_file_values() -> dict[str, Any]:
+    """Dotted key -> value as written in config.toml (not merged with anything), or {}."""
+    try:
+        import tomllib
+
+        from homesoc import paths
+
+        with open(paths.config_path(), "rb") as handle:
+            data = tomllib.load(handle)
+    except (ImportError, OSError, ValueError):
+        return {}
+    out: dict[str, Any] = {}
+    for section, values in (data or {}).items():
+        if isinstance(values, dict):
+            for name, value in values.items():
+                out[f"{section}.{name}"] = value
+    return out
+
+
+def _same_setting(kind: str, stored: str, file_value: Any) -> bool:
+    try:
+        return _encode_setting(kind, file_value) == stored
+    except (TypeError, ValueError):
+        return False
+
+
+def shadowed_overrides(conn: sqlite3.Connection, keys: Any = None) -> list[str]:
+    """Editable keys whose Settings-page override differs from what config.toml says.
+
+    The override wins (config.load merges the settings table last), so an owner who rotates a
+    leaked token or webhook in config.toml, as every doc tells them to, otherwise changes nothing.
+    """
+    kinds = dict(EDITABLE_SETTINGS)
+    wanted = [k for k in (keys if keys is not None else kinds) if k in kinds]
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    overrides = {str(r["key"]): str(r["value"])
+                 for r in rows(conn, f"SELECT key, value FROM settings WHERE key IN ({placeholders})", wanted)}
+    if not overrides:
+        return []  # the common case: nothing to compare, so config.toml is not even opened
+    file_values = _config_file_values()
+    return [key for key in wanted
+            if key in overrides and key in file_values
+            and not _same_setting(kinds[key], overrides[key], file_values[key])]
+
+
+def warn_shadowed_overrides(conn: sqlite3.Connection) -> list[str]:
+    """At startup: say loudly when a sensitive Settings-page override is hiding config.toml."""
+    try:
+        keys = shadowed_overrides(conn, [k for k, _ in EDITABLE_SETTINGS if k in SHADOW_WARN_KEYS])
+    except sqlite3.Error:  # pragma: no cover - a pre-settings database
+        return []
+    if keys:
+        message = ("Settings-page values are overriding config.toml for " + ", ".join(keys) + ". Changing them "
+                   "in config.toml has no effect until the override is cleared on the Settings page.")
+        logger.warning(message)
+        try:
+            _record_event(conn, "warning", "web", message, {"keys": keys})
+        except sqlite3.Error:  # pragma: no cover
+            pass
+    return keys
+
+
 def settings_get(c: WebContext) -> list[dict]:
     out = []
+    shadowed = set(shadowed_overrides(c.conn))
     for key, kind in EDITABLE_SETTINGS:
         override = get_setting(c.conn, key)
         raw = override if override is not None else cfg_get(c.cfg, key, "")
         item = {"key": key, "section": key.split(".")[0], "type": kind, "source": "override" if override is not None else "config"}
+        # Secrets too: which file a secret comes from is not itself secret, and it is exactly
+        # what the owner needs to know to rotate one that leaked.
+        item["clearable"] = override is not None
+        item["shadows_config"] = key in shadowed
         if kind == "secret":
             item["value"] = ""
             item["set"] = bool(raw)
@@ -1407,6 +1885,29 @@ def settings_get(c: WebContext) -> list[dict]:
             item["value"] = _display_value(kind, raw)
         out.append(item)
     return out
+
+
+def settings_clear(c: WebContext, keys: Any) -> dict:
+    """Drop Settings-page overrides so config.toml (or the default) applies again after a restart.
+
+    Clearing ``web.token`` also signs out every browser: its sessions were opened with the token
+    that is going away.
+    """
+    allowed = dict(EDITABLE_SETTINGS)
+    wanted = [keys] if isinstance(keys, str) else list(keys or [])
+    cleared, errors = [], {}
+    for key in (str(k) for k in wanted):
+        if key not in allowed:
+            errors[key] = "not editable"
+            continue
+        if get_setting(c.conn, key) is None:
+            continue
+        write(c.conn, "DELETE FROM settings WHERE key=?", (key,))
+        cleared.append(key)
+        logger.info("config override %s cleared from the dashboard", key)
+    if "web.token" in cleared:
+        sessions_revoke_all(c.conn)
+    return {"ok": not errors, "cleared": cleared, "errors": errors, "restart_required": bool(cleared)}
 
 
 def settings_post(c: WebContext, payload: dict) -> dict:
@@ -1419,6 +1920,11 @@ def settings_post(c: WebContext, payload: dict) -> dict:
             continue
         if kind == "secret" and not value:
             continue  # blank secret field means "keep what is there"
+        if key == "dns.lists":
+            bad = _unknown_blocklists(value)
+            if bad:
+                errors[str(key)] = "not a blocklist feed: " + ", ".join(bad[:5])
+                continue
         try:
             set_setting(c.conn, str(key), _encode_setting(kind, value))
             saved.append(str(key))
@@ -1693,8 +2199,47 @@ def _split_graph(result: Any) -> tuple[list, list]:
     raise TopologyUnavailable("build_graph did not return (nodes, edges)")
 
 
+_MAP_SLOW: dict[tuple, tuple[float, dict, Any]] = {}
+_MAP_SLOW_LOCK = threading.Lock()
+
+
 def map_graph(conn: sqlite3.Connection, *, hours: int = DEFAULT_MAP_HOURS, include_cloud: bool = True,
               engine_out: list | None = None) -> dict:
+    """The dependency graph, reusing a recent build when building it was slow.
+
+    The overview page, /map, /api/map and every Lens card build the graph from a week of
+    ``dns_queries`` under the shared connection lock. Same rule as :func:`throttled`: a build that
+    took SLOW_QUERY_SECONDS or more is reused for ten times its cost (15 s to 5 min); fast builds
+    are never cached. Callers get a shallow copy, so the keys they add stay their own.
+    """
+    key = (id(conn), max(1, min(int(hours or DEFAULT_MAP_HOURS), MAX_MAP_HOURS)), bool(include_cloud))
+    now = time.monotonic()
+    with _MAP_SLOW_LOCK:
+        hit = _MAP_SLOW.get(key)
+    if hit is not None and hit[0] > now:
+        if engine_out is not None:
+            engine_out.append(hit[2])
+        return dict(hit[1])
+    built: list = []
+    started = time.monotonic()
+    payload = _map_graph_build(conn, hours=hours, include_cloud=include_cloud, engine_out=built)
+    took = time.monotonic() - started
+    engine = built[0] if built else None
+    if engine_out is not None and built:
+        engine_out.append(engine)
+    with _MAP_SLOW_LOCK:
+        if took >= SLOW_QUERY_SECONDS:
+            if len(_MAP_SLOW) >= 32:
+                _MAP_SLOW.clear()
+            _MAP_SLOW[key] = (time.monotonic() + min(SLOW_QUERY_MAX_TTL, max(SLOW_QUERY_MIN_TTL, took * 10)), dict(payload), engine)
+            logger.info("dependency graph took %.2fs; reusing it for a while", took)
+        else:
+            _MAP_SLOW.pop(key, None)
+    return payload
+
+
+def _map_graph_build(conn: sqlite3.Connection, *, hours: int = DEFAULT_MAP_HOURS, include_cloud: bool = True,
+                     engine_out: list | None = None) -> dict:
     """The ``{nodes, edges, legend, generated_at, note}`` payload of C7.
 
     Node and edge order is the engine's, untouched: C9 requires the same data to produce the same
@@ -2063,7 +2608,8 @@ def api_finding_status(row_id: int):
 
 @bp.get("/devices")
 def api_devices():
-    return jsonify(devices_list(ctx().conn))
+    c = ctx()
+    return jsonify(throttled(c, ("devices_list",), lambda: devices_list(c.conn)))
 
 
 @bp.get("/devices/<int:device_id>")
@@ -2135,13 +2681,16 @@ def api_dns_summary():
 
 @bp.get("/dns/series")
 def api_dns_series():
-    return jsonify(dns_series(ctx().conn, _int_arg("hours", 24, 1, 24 * 14)))
+    c, hours = ctx(), _int_arg("hours", 24, 1, 24 * 14)
+    return jsonify(throttled(c, ("dns_series", hours), lambda: dns_series(c.conn, hours)))
 
 
 @bp.get("/dns/top")
 def api_dns_top():
-    kind = request.args.get("kind", "blocked")
-    return jsonify(dns_top(ctx().conn, "clients" if kind == "clients" else "blocked", _int_arg("hours", 24, 1, 24 * 30), _int_arg("limit", 20, 1, 200)))
+    c = ctx()
+    kind = "clients" if request.args.get("kind", "blocked") == "clients" else "blocked"
+    hours, limit = _int_arg("hours", 24, 1, 24 * 30), _int_arg("limit", 20, 1, 200)
+    return jsonify(throttled(c, ("dns_top", kind, hours, limit), lambda: dns_top(c.conn, kind, hours, limit)))
 
 
 @bp.get("/dns/log")
@@ -2220,6 +2769,19 @@ def api_settings_get():
 @bp.post("/settings")
 def api_settings_post():
     result = settings_post(ctx(), _payload())
+    return jsonify(result), (200 if result["ok"] else 400)
+
+
+@bp.post("/settings/clear")
+def api_settings_clear():
+    """``{"keys": [...]}``: forget Settings-page overrides so config.toml applies again."""
+    result = settings_clear(ctx(), _payload().get("keys"))
+    return jsonify(result), (200 if result["ok"] else 400)
+
+
+@bp.delete("/settings/<key>")
+def api_settings_clear_one(key: str):
+    result = settings_clear(ctx(), [key])
     return jsonify(result), (200 if result["ok"] else 400)
 
 
@@ -2393,8 +2955,6 @@ LENS_ACTIONS: tuple[str, ...] = ("rescan", "acknowledge", "set_trusted")
 LENS_SCOPE_READ = "read"
 LENS_SCOPE_ACT = "act"
 _LOOPBACK: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
-# Mirrors app.COOKIE_NAME; importing app here would be circular.
-DASHBOARD_COOKIE = "homesoc_token"
 
 
 def _lens_module() -> Any | None:
@@ -2450,8 +3010,10 @@ def _dashboard_session() -> bool:
     c = ctx()
     if not c.token:
         return _is_loopback(_client_ip())
-    presented = request.headers.get("X-Token") or request.cookies.get(DASHBOARD_COOKIE) or ""
-    return bool(presented) and secrets.compare_digest(presented.encode(), c.token.encode())
+    presented = request.headers.get("X-Token")
+    if presented:
+        return check_token_guess(c.conn, c.token, presented, _client_ip())
+    return session_check(c.conn, presented_session()) is not None
 
 
 def lens_principal() -> tuple[dict | None, tuple[Response, int] | None]:
@@ -2629,11 +3191,25 @@ def api_lens_learn():
     kind = "ignored" if device_id is None else str(body.get("kind") or "learned")
     if kind not in ("learned", "sticker", "ignored"):
         return _json_no_store({"ok": False, "error": "kind must be learned, sticker or ignored"}, 400)
+    owner = principal.get("kind") == "dashboard"
+    if kind == "sticker" and not owner:
+        # Sticker rows are what the printed sheet reuses (B9); only the dashboard mints them.
+        return _json_no_store(
+            {"ok": False, "code": "sticker_kind", "error": "Only the dashboard creates sticker codes."}, 403
+        )
+    # B8 lets any paired phone teach Lens a code it has never seen; B10 keeps a phone without the
+    # ``act`` scope read-only. So such a phone may only *add*: moving, or ignoring, a code that is
+    # already known (a printed sticker above all) is the same destruction api_lens_forget refuses.
+    may_change = owner or lens_can_act(c, principal)
     try:
         tag_id = lens.learn_tag(
             c.conn, body.get("code"), device_id, kind=kind,
             label=body.get("label"), created_by=str(principal.get("label") or "lens")[:40],
+            overwrite=may_change,
         )
+    except lens.TagExists:
+        denial = _lens_act_denial(c, principal)
+        return denial if denial is not None else _json_no_store({"ok": False, "error": "that code is already known"}, 409)
     except ValueError as exc:
         return _json_no_store({"ok": False, "error": str(exc)}, 404 if "no such" in str(exc) else 400)
     return _json_no_store({"ok": True, "tag_id": tag_id, "device_id": device_id, "kind": kind})

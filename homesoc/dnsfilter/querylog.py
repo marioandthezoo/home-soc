@@ -15,13 +15,25 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-from homesoc.dnsfilter import db_query, db_write, db_writemany, utcnow_iso
+from homesoc.dnsfilter import db_query, db_write, db_writemany, record_event, utcnow_iso
 
 logger = logging.getLogger(__name__)
 
 FLUSH_INTERVAL = 2.0
 BATCH_SIZE = 500
 ACTIONS = ("allow", "block", "cache", "error")
+# Logging budgets. Every answered query used to become a row, so one LAN device at its rate limit
+# could write ~10 GB a day and make every dashboard aggregate (which runs under the shared DB lock)
+# slower by the hour. Queries over budget are still answered and still counted in qps; they are just
+# not written. A busy household device averages well under 1 query a second.
+LOG_BUDGET_PER_CLIENT = 600       # rows per client per minute
+LOG_BUDGET_TOTAL = 30000          # rows per minute across all clients (forged sources each get a budget)
+LOG_BUDGET_MAX_CLIENTS = 4096     # budget table bound; beyond it new sources are not logged that minute
+MAX_QNAME_LOG = 255               # a wire name is at most 255 octets; dnslib's escaped text can be longer
+MAX_LOG_ROWS = 2_000_000          # hard cap on dns_queries, oldest rows evicted first
+ROW_CAP_CHECK_SECONDS = 300.0
+ROW_CAP_CHUNK = 50_000            # delete in slices so no single statement holds the DB lock for long
+BUDGET_EVENTS_PER_HOUR = 20       # "client X exceeded its log budget" events, per client at most hourly
 
 # Only the dnsfilter-owned tables (SPEC §4); identical to core's schema so both are idempotent.
 SCHEMA = (
@@ -78,19 +90,34 @@ class QueryLog:
         enabled: bool = True,
         flush_interval: float = FLUSH_INTERVAL,
         batch_size: int = BATCH_SIZE,
+        client_budget: int = LOG_BUDGET_PER_CLIENT,
+        total_budget: int = LOG_BUDGET_TOTAL,
+        max_rows: int = MAX_LOG_ROWS,
     ) -> None:
         self.conn = conn
         self.enabled = enabled
         self.flush_interval = flush_interval
         self.batch_size = batch_size
+        self.client_budget = max(1, int(client_budget))
+        self.total_budget = max(1, int(total_budget))
+        self.max_rows = max(1, int(max_rows))
         self._queue: deque[QueryRecord] = deque()
-        self._recent: deque[float] = deque()  # monotonic timestamps for qps_1m (kept even when logging is off)
+        # [second, count] pairs for qps_1m (kept even when logging is off); at most 61 entries however
+        # fast queries arrive, unlike one timestamp per query.
+        self._recent: deque[list[int]] = deque()
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._budget_minute: int | None = None
+        self._budget_used: dict[str, int] = {}
+        self._budget_total = 0
+        self._over_budget: dict[str, int] = {}          # client -> rows not logged, reported by flush()
+        self._budget_events: dict[str, float] = {}      # client -> monotonic time of its last event
+        self._last_cap_check = time.monotonic()
         self.total = 0
         self.dropped = 0
+        self.suppressed = 0
 
     # ---- lifecycle ------------------------------------------------------------------------
     def start(self) -> None:
@@ -117,6 +144,12 @@ class QueryLog:
                 self.flush()
             except Exception:
                 logger.exception("query log flush failed")
+            if time.monotonic() - self._last_cap_check >= ROW_CAP_CHECK_SECONDS:
+                self._last_cap_check = time.monotonic()
+                try:
+                    enforce_row_cap(self.conn, self.max_rows)
+                except Exception:
+                    logger.exception("query log row cap failed")
 
     # ---- recording ------------------------------------------------------------------------
     def record(
@@ -132,35 +165,87 @@ class QueryLog:
     ) -> None:
         now = time.monotonic()
         with self._lock:
-            self._recent.append(now)
+            sec = int(now)
+            if self._recent and self._recent[-1][0] == sec:
+                self._recent[-1][1] += 1
+            else:
+                self._recent.append([sec, 1])
             self._trim_recent(now)
             self.total += 1
             if not self.enabled:
+                return
+            if not self._within_budget(client, now):
+                self.suppressed += 1
                 return
             if len(self._queue) >= self.batch_size * 20:  # disk stalled: drop rather than eat memory
                 self.dropped += 1
                 return
             self._queue.append(
-                QueryRecord(ts or utcnow_iso(), client, qname, qtype, action, reason, None if ms is None else round(ms, 2))
+                QueryRecord(ts or utcnow_iso(), str(client)[:64], str(qname)[:MAX_QNAME_LOG], str(qtype)[:16], action,
+                            None if reason is None else str(reason)[:200], None if ms is None else round(ms, 2))
             )
             wake = len(self._queue) >= self.batch_size
         if wake:
             self._wake.set()
 
+    def _within_budget(self, client: str, now: float) -> bool:
+        """Per-client and total rows-per-minute budget (caller holds the lock)."""
+        minute = int(now // 60)
+        if minute != self._budget_minute:
+            self._budget_minute = minute
+            self._budget_used.clear()
+            self._budget_total = 0
+        used = self._budget_used.get(client)
+        if used is None and len(self._budget_used) >= LOG_BUDGET_MAX_CLIENTS:
+            return False
+        used = used or 0
+        if used >= self.client_budget or self._budget_total >= self.total_budget:
+            if len(self._over_budget) < LOG_BUDGET_MAX_CLIENTS or client in self._over_budget:
+                self._over_budget[client] = self._over_budget.get(client, 0) + 1
+            return False
+        self._budget_used[client] = used + 1
+        self._budget_total += 1
+        return True
+
     def _trim_recent(self, now: float) -> None:
-        while self._recent and now - self._recent[0] > 60.0:
+        while self._recent and now - self._recent[0][0] > 60.0:
             self._recent.popleft()
 
     def qps_1m(self) -> float:
         with self._lock:
             self._trim_recent(time.monotonic())
-            return round(len(self._recent) / 60.0, 3)
+            return round(sum(n for _, n in self._recent) / 60.0, 3)
 
     def pending(self) -> int:
         with self._lock:
             return len(self._queue)
 
+    def _report_over_budget(self) -> None:
+        """One event per noisy client per hour (at most ``BUDGET_EVENTS_PER_HOUR`` in total), written
+        from the flush thread so the resolver's answer path never waits on the DB lock."""
+        with self._lock:
+            over, self._over_budget = self._over_budget, {}
+        if not over:
+            return
+        now = time.monotonic()
+        for c in [c for c, t in self._budget_events.items() if now - t >= 3600]:
+            del self._budget_events[c]
+        for client, n in sorted(over.items(), key=lambda kv: -kv[1]):
+            if client in self._budget_events or len(self._budget_events) >= BUDGET_EVENTS_PER_HOUR:
+                continue
+            self._budget_events[client] = now
+            record_event(
+                self.conn, "warning", "dns",
+                f"{client} sent more DNS queries than the query log keeps ({self.client_budget}/min); "
+                f"{n} were answered but not logged",
+                {"client": client, "not_logged": n, "budget_per_minute": self.client_budget},
+            )
+
     def flush(self) -> int:
+        try:
+            self._report_over_budget()
+        except Exception:
+            logger.debug("could not report query-log budget overruns", exc_info=True)
         with self._lock:
             if not self._queue:
                 return 0
@@ -215,13 +300,42 @@ def purge(conn: sqlite3.Connection, retention_days: int) -> int:
     return n
 
 
+def enforce_row_cap(conn: sqlite3.Connection, max_rows: int = MAX_LOG_ROWS, *, chunk: int = ROW_CAP_CHUNK) -> int:
+    """Evict the oldest ``dns_queries`` rows beyond ``max_rows``; returns how many were deleted.
+
+    Retention alone is time-based, so a flood could still fill the disk within the window. ``id`` is
+    the rowid and only grows, so ``id <= MAX(id) - max_rows`` is the oldest excess (a gap-free
+    upper bound), and deleting it in ``chunk``-sized id ranges keeps each statement short.
+    """
+    max_rows = max(1, int(max_rows))
+    row = db_query(conn, "SELECT MIN(id) AS lo, MAX(id) AS hi FROM dns_queries")
+    if not row or row[0]["hi"] is None:
+        return 0
+    lo, cutoff = int(row[0]["lo"]), int(row[0]["hi"]) - max_rows
+    if lo > cutoff:
+        return 0
+    n_row = db_query(conn, "SELECT COUNT(*) AS n FROM dns_queries WHERE id <= ?", (cutoff,))
+    n = int(n_row[0]["n"]) if n_row else 0
+    while lo <= cutoff:
+        upto = min(cutoff, lo + max(1, int(chunk)) - 1)
+        db_write(conn, "DELETE FROM dns_queries WHERE id BETWEEN ? AND ?", (lo, upto))
+        lo = upto + 1
+    if n:
+        logger.warning("DNS query log over %d rows; evicted the %d oldest", max_rows, n)
+    return n
+
+
 def maintenance(cfg, conn: sqlite3.Connection) -> dict:
-    """One call for the scheduler's ``dns_rollup`` job: rollup + purge."""
+    """One call for the scheduler's ``dns_rollup`` job: rollup + purge (+ the row cap)."""
     from homesoc.dnsfilter import cfg_get
 
     days = int(cfg_get(cfg, "dns", "log_retention_days", 14) or 14)
     written = rollup(conn)
     purged = purge(conn, days)
+    try:
+        enforce_row_cap(conn)
+    except sqlite3.Error:
+        logger.exception("query log row cap failed")
     return {"rollup_rows": written, "purged": purged}
 
 

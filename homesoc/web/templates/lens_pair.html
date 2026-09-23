@@ -41,7 +41,7 @@
       </ul>
       {% if blocked %}
       <p class="warn-strip">Pairing is held back until the {{ blocked|length }} item{{ '' if blocked|length == 1 else 's' }} marked
-        <b>Fix</b> above {{ 'is' if blocked|length == 1 else 'are' }} sorted. Reload this page afterwards to mint a code.</p>
+        <b>Fix</b> above {{ 'is' if blocked|length == 1 else 'are' }} sorted. Reload this page afterwards, then press <b>Show a pairing code</b>.</p>
       {% endif %}
     </section>
 
@@ -52,13 +52,22 @@
         <p class="pair-url mono">{{ claim_url }}</p>
         <p class="muted small">
           The code is single-use and expires in five minutes{% if pairing.expires_at %} (at {{ pairing.expires_at }}){% endif %}.
-          Reload this page for a fresh one. Open the phone's camera app, point it at the square above, and tap the link.
+          Press <b>New pairing code</b> below for a fresh one. Open the phone's camera app, point it at the square above, and tap the link.
         </p>
+        <form method="post" action="/lens/pair" class="pair-mint">
+          <button class="btn" type="submit">New pairing code</button>
+        </form>
         <ol class="steps pair-steps">
           <li>The phone will warn that the certificate is not trusted — this is expected for a self-signed certificate on your own LAN.</li>
           <li>Check the fingerprint the phone shows against the one printed below, then choose <b>Advanced → Proceed</b>.</li>
           <li>Lens claims the code, stores a token on the phone, and opens the viewfinder.</li>
         </ol>
+      {% elif can_mint and not minted %}
+        <p class="muted">A pairing code is only created when you ask for one, and it stops working after five minutes
+          or once a phone has used it. Have the phone ready, then press the button.</p>
+        <form method="post" action="/lens/pair" class="pair-mint">
+          <button class="btn btn-primary" type="submit">Show a pairing code</button>
+        </form>
       {% elif not blocked %}
         <p class="warn-strip">The pairing service is not installed in this build, so no code could be minted.
           Everything else on this page is live. Install the Lens package and reload.</p>

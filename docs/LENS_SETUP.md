@@ -186,9 +186,10 @@ Things worth knowing about it:
   certificate from somewhere else into `data/tls/`** and expect it to survive — if it does not
   cover all of those names, the next `--tls` start replaces it with a fresh self-signed one.
 - **It expires in 825 days** and is renewed automatically inside the last 30 (`tls.RENEW_WITHIN_DAYS`). The pairing page starts *warning* about the expiry earlier than that, at 14 days.
-- **The key is `data/tls/key.pem`.** On Linux and macOS it is written `0600`. On Windows it simply
-  inherits the ACL of the `data` directory — that is a real difference, not a chmod that quietly
-  did nothing, so keep the data directory off shared drives.
+- **The key is `data/tls/key.pem`.** On Linux and macOS it is written `0600`. On Windows the key
+  and the certificate get an explicit ACL (you and SYSTEM only, nothing inherited). A key that still
+  inherits its ACL from a folder outside your user profile is not reused: it is regenerated once,
+  with a warning, and phones re-accept the new fingerprint.
 - **Without `cryptography` installed**, nothing here works and the error says so, naming both the
   `pip install` and this document.
 
@@ -388,8 +389,9 @@ Fix   Reachable from your phone      Home SOC is bound to 127.0.0.1, which only 
                                        Private firewall profile.
 ```
 
-When everything passes, the page shows a QR code, the link underneath it, and the certificate
-fingerprint in readable groups:
+When everything passes, press **Show a pairing code**. The page then shows a QR code, the link
+underneath it, and the certificate fingerprint in readable groups. (Loading the page never creates
+a code by itself, so no other web page can quietly cancel the one you are about to scan.)
 
 ```
 https://192.168.1.105:8443/lens/claim#c=TS5HSZUX
@@ -408,7 +410,7 @@ page exchanges the code for a token, stores it, and drops you into the viewfinde
 The pairing code is **8 characters, single-use, and valid for five minutes**. It travels in the URL
 *fragment* (`#c=`), which browsers never send to a server, and the claim page strips it out of the
 address bar the moment it has read it, so it does not linger in history or in a screenshot.
-Reloading `/lens/pair` mints a fresh one.
+Pressing **New pairing code** mints a fresh one and cancels the previous one.
 
 ### From the terminal
 
@@ -521,9 +523,12 @@ options along the top:
 | **Devices** | Only devices that still need a sticker, or all devices | Only those that need one |
 | **Nickname** | Print the nickname under each code, or not | On |
 
-Press **Print…**. The print stylesheet sets exact millimetre geometry, drops the site chrome, and
-avoids breaking a label across pages. Each label carries the QR, the nickname (if you asked for
-it) and a small Home SOC mark.
+Devices that have no code yet show an empty box; press **Create codes and show the sheet** to make
+them (loading the page on its own never creates anything). Then press **Print…**. The print
+stylesheet sets exact millimetre geometry, drops the site chrome, and avoids breaking a label
+across pages. Each label carries the QR, the caption (if you asked for it) and a small Home SOC
+mark. The caption is the nickname you gave the device, or its kind ("camera") when it has none,
+never its hostname, IP address or MAC address.
 
 Two things that matter in practice:
 
@@ -730,7 +735,8 @@ address, a hostname, a device name, your SSID, or a URL. A visitor who photograp
 a stranger who sees one in the background of a photo you post — learns nothing about your network.
 
 The only thing a sticker can reveal is what *you* chose to print next to it: the human-readable
-nickname, which is optional ("Print the nickname under each code").
+nickname, which is optional ("Print the nickname under each code"). A device without a nickname
+gets its kind ("camera") as the caption, never a hostname, IP or MAC.
 
 Learned tags are the manufacturer's own barcode, which was already printed on the device before
 Home SOC existed.
@@ -823,7 +829,7 @@ None of these appear on the Settings page: they live in `config.toml`.
 
 ```
 data/tls/cert.pem      the certificate  (fingerprint printed at startup)
-data/tls/key.pem       its private key  (0600 on Linux/macOS; inherits the data ACL on Windows)
+data/tls/key.pem       its private key  (0600 on Linux/macOS; owner + SYSTEM ACL on Windows)
 data/homesoc.db        lens_tokens (hashes only) and lens_tags (code → device)
 ```
 

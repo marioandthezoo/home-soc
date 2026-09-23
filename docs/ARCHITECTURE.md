@@ -267,8 +267,8 @@ dashboard's Run buttons still work, but nothing runs on a timer.
         |
    1.   is the source address private / loopback / link-local?  ---- no ---> DROP, no answer
         |                                                                    (never an open reflector)
-   2.   per-client rate limit  (> 300 q/s)                       ---- over -> DROP
-        global rate limit      (> 3000 q/s)                      ---- over -> DROP
+   2.   per-client rate limit  (> 300 q/s, UDP and TCP apart)    ---- over -> TC=1 slip (UDP; retry over TCP)
+        global ceiling only for UDP answers > 512 bytes          ---- over -> truncated, never dropped
         |
    3.   DNSRecord.parse(data)                                    ---- fails -> FORMERR
         response bit set? -> DROP.  no question? -> FORMERR.  opcode != QUERY -> NOTIMP

@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import time
 import datetime as dt
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote
@@ -43,6 +44,14 @@ SEEN_WINDOW_HOURS = 24
 # A lookup that produced no verdict (budget spent, offline) is retried after this long, not 24 h.
 NO_VERDICT_RETRY_HOURS = 1
 QUEUE_MAX = 5000
+# One client may hold at most this many queue slots, so a device flooding new domains cannot crowd
+# everyone else's lookups out of the queue.
+QUEUE_PER_CLIENT_MAX = QUEUE_MAX // 10
+# Hard caps on the dedupe tables, evicting the oldest entry (O(1)). The old "rebuild the dict when it
+# passes N" pruning removed nothing while every entry was recent, so past N each new domain rebuilt a
+# 50k-entry dict on the DNS answer path.
+SEEN_MAX = 50000
+EMITTED_MAX = 10000
 # Hostname grammar (same as policy._DOMAIN_RE): DNS labels may legally contain '/', '?', '#' or '%',
 # which must never reach the VirusTotal URL path or the URLhaus form field.
 _HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9_](?:[a-z0-9_-]{0,62}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,62}[a-z0-9_])?)+$")
@@ -250,29 +259,67 @@ def _session_or_default(session):
     return requests.Session()
 
 
+#: VirusTotal and URLhaus answers are a few KB; anything past this is not a real answer.
+MAX_API_RESPONSE_BYTES = 1_000_000
+
+
+def _close(resp) -> None:
+    close = getattr(resp, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # pragma: no cover - closing must never mask the real result
+            pass
+
+
+def _capped_json(resp):
+    """The response body as JSON, read with a hard size cap (the request was made with
+    ``stream=True``, so nothing has been buffered yet). Raises ValueError when too large."""
+    if not hasattr(resp, "iter_content"):
+        return resp.json()  # test doubles and non-requests sessions
+    headers = getattr(resp, "headers", None) or {}
+    length = str(headers.get("Content-Length") or "")
+    if length.isdigit() and int(length) > MAX_API_RESPONSE_BYTES:
+        raise ValueError("response too large")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536):
+        total += len(chunk)
+        if total > MAX_API_RESPONSE_BYTES:
+            raise ValueError("response too large")
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks).decode("utf-8", "replace"))
+
+
 def vt_lookup(domain: str, api_key: str, *, session=None, timeout: float = HTTP_TIMEOUT) -> dict | None:
     """VirusTotal v3 ``/domains/<d>`` → ``last_analysis_stats`` dict, or None on any failure."""
     if not _HOSTNAME_RE.match(domain):
         return None
     s = _session_or_default(session)
     try:
-        resp = s.get(VT_URL.format(domain=quote(domain, safe="")), headers={"x-apikey": api_key, "accept": "application/json"}, timeout=timeout)
+        # No redirects: requests strips only Authorization on a cross-host redirect, so the
+        # x-apikey header would follow a 3xx to whatever host it names.
+        resp = s.get(VT_URL.format(domain=quote(domain, safe="")), headers={"x-apikey": api_key, "accept": "application/json"},
+                     timeout=timeout, stream=True, allow_redirects=False)
     except Exception as exc:
         logger.debug("VT request failed for %s: %s", domain, exc)
         return None
-    status = getattr(resp, "status_code", 0)
-    if status == 404:
-        return {"malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0, "_not_found": True}
-    if status != 200:
-        logger.info("VT returned HTTP %s for %s", status, domain)
-        return None
     try:
-        body = resp.json()
-        stats = body["data"]["attributes"]["last_analysis_stats"]
-        return {k: int(stats.get(k, 0) or 0) for k in ("malicious", "suspicious", "harmless", "undetected")}
-    except (ValueError, KeyError, TypeError, AttributeError):
-        logger.debug("VT response unparsable for %s", domain)
-        return None
+        status = getattr(resp, "status_code", 0)
+        if status == 404:
+            return {"malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0, "_not_found": True}
+        if status != 200:
+            logger.info("VT returned HTTP %s for %s", status, domain)
+            return None
+        try:
+            body = _capped_json(resp)
+            stats = body["data"]["attributes"]["last_analysis_stats"]
+            return {k: int(stats.get(k, 0) or 0) for k in ("malicious", "suspicious", "harmless", "undetected")}
+        except Exception:
+            logger.debug("VT response unparsable or too large for %s", domain)
+            return None
+    finally:
+        _close(resp)
 
 
 def urlhaus_lookup(domain: str, *, auth_key: str = "", session=None, timeout: float = HTTP_TIMEOUT) -> dict | None:
@@ -284,16 +331,19 @@ def urlhaus_lookup(domain: str, *, auth_key: str = "", session=None, timeout: fl
     if auth_key:
         headers["Auth-Key"] = auth_key
     try:
-        resp = s.post(URLHAUS_URL, data={"host": domain}, headers=headers, timeout=timeout)
+        resp = s.post(URLHAUS_URL, data={"host": domain}, headers=headers, timeout=timeout,
+                      stream=True, allow_redirects=False)  # Auth-Key must not follow a redirect
     except Exception as exc:
         logger.debug("URLhaus request failed for %s: %s", domain, exc)
         return None
-    if getattr(resp, "status_code", 0) != 200:
-        return None
     try:
-        body = resp.json()
-    except ValueError:
+        if getattr(resp, "status_code", 0) != 200:
+            return None
+        body = _capped_json(resp)
+    except Exception:
         return None
+    finally:
+        _close(resp)
     if not isinstance(body, dict):
         return None
     qs = str(body.get("query_status", ""))
@@ -432,7 +482,7 @@ class MaliciousFindingEmitter:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
-        self._emitted: dict[tuple[str, str], float] = {}
+        self._emitted: OrderedDict[tuple[str, str], float] = OrderedDict()
         self._lock = threading.Lock()
         self.drafts_emitted = 0
 
@@ -443,10 +493,7 @@ class MaliciousFindingEmitter:
             last = self._emitted.get(key)
             if last is not None and now - last < FINDING_DEDUPE_HOURS * 3600:
                 return None
-            self._emitted[key] = now
-            if len(self._emitted) > 10000:  # bounded memory on a long-running resolver
-                cutoff = now - FINDING_DEDUPE_HOURS * 3600
-                self._emitted = {k: v for k, v in self._emitted.items() if v >= cutoff}
+            _bounded_put(self._emitted, key, now, EMITTED_MAX)  # bounded memory on a long-running resolver
         draft = make_draft(
             "NET-DNS-004",
             f"dns:{client}",
@@ -498,8 +545,9 @@ class ReputationWorker:
         self.enabled = enabled
         self.emitter = MaliciousFindingEmitter(conn)
         self._queue: queue.Queue[tuple[str, str, str]] = queue.Queue(maxsize=QUEUE_MAX)
-        self._seen: dict[str, float] = {}
+        self._seen: OrderedDict[str, float] = OrderedDict()
         self._seen_lock = threading.Lock()
+        self._pending_by_client: dict[str, int] = {}  # queue slots held per client (under _seen_lock)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.looked_up = 0
@@ -541,10 +589,7 @@ class ReputationWorker:
             last = self._seen.get(reg)
             if last is not None and now - last < SEEN_WINDOW_HOURS * 3600:
                 return None
-            self._seen[reg] = now
-            if len(self._seen) > 50000:
-                cutoff = now - SEEN_WINDOW_HOURS * 3600
-                self._seen = {k: v for k, v in self._seen.items() if v >= cutoff}
+            _bounded_put(self._seen, reg, now, SEEN_MAX)
         return reg
 
     def enqueue(self, qname: str, client: str) -> bool:
@@ -553,12 +598,38 @@ class ReputationWorker:
         reg = self.should_lookup(qname)
         if reg is None:
             return False
+        with self._seen_lock:
+            held = self._pending_by_client.get(client, 0)
+            if held >= QUEUE_PER_CLIENT_MAX:
+                self._forget(reg)
+                self.dropped += 1
+                return False
+            self._pending_by_client[client] = held + 1
         try:
             self._queue.put_nowait((reg, qname, client))
         except queue.Full:
+            with self._seen_lock:
+                self._forget(reg)
+                self._release_slot(client)
             self.dropped += 1
             return False
         return True
+
+    def _forget(self, reg: str) -> None:
+        """Undo ``should_lookup``'s mark for a domain that never reached the queue, so its next query
+        retries instead of being skipped for 24 h (caller holds ``_seen_lock``)."""
+        self._seen.pop(reg, None)
+
+    def _release_slot(self, client: str) -> None:
+        n = self._pending_by_client.get(client, 0) - 1
+        if n > 0:
+            self._pending_by_client[client] = n
+        else:
+            self._pending_by_client.pop(client, None)
+
+    def _dequeued(self, client: str) -> None:
+        with self._seen_lock:
+            self._release_slot(client)
 
     def pending(self) -> int:
         return self._queue.qsize()
@@ -572,6 +643,7 @@ class ReputationWorker:
                 continue
             if not reg:
                 continue
+            self._dequeued(client)
             try:
                 self.process(reg, qname, client)
             except Exception:
@@ -586,7 +658,7 @@ class ReputationWorker:
             # instead of the full 24 h window, so a domain first seen at budget exhaustion is not
             # left unchecked until tomorrow's queries have long gone.
             with self._seen_lock:
-                self._seen[reg] = time.time() - (SEEN_WINDOW_HOURS - NO_VERDICT_RETRY_HOURS) * 3600
+                _bounded_put(self._seen, reg, time.time() - (SEEN_WINDOW_HOURS - NO_VERDICT_RETRY_HOURS) * 3600, SEEN_MAX)
         if result.verdict == "malicious":
             self.malicious_found += 1
             self.emitter.emit(client, qname, result)
@@ -606,6 +678,7 @@ class ReputationWorker:
             except queue.Empty:
                 break
             if reg:
+                self._dequeued(client)
                 self.process(reg, qname, client)
                 n += 1
         return n
@@ -627,3 +700,11 @@ def _is_ip(token: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _bounded_put(table: OrderedDict, key, value, cap: int) -> None:
+    """Insert/refresh ``key`` as the newest entry and evict the oldest beyond ``cap`` (O(1) each)."""
+    table[key] = value
+    table.move_to_end(key)
+    while len(table) > cap:
+        table.popitem(last=False)

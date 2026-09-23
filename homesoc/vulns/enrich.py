@@ -190,21 +190,34 @@ def _fetch(
             _sleep(wait)
         limiter.record()
         try:
-            resp = http.get(NVD_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC)
+            # stream=True: without it requests downloads (and gunzips) the whole body before
+            # _read_limited sees a byte, so the size cap bounded nothing. allow_redirects=False:
+            # the apiKey header is custom, and requests only strips Authorization on a cross-host
+            # redirect, so a redirect would hand the key to whatever host it names. The NVD API
+            # never redirects; a 3xx is treated like any other non-200 answer.
+            resp = http.get(NVD_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SEC,
+                            stream=True, allow_redirects=False)
         except requests.RequestException as exc:
             logger.warning("NVD request failed: %s", exc)
             return None
-        status = getattr(resp, "status_code", 0)
-        if status in (429, 403):
-            if attempt == 2 or not budget.can_spend(RETRY_SLEEP_SEC + REQUEST_TIMEOUT_SEC):
-                logger.warning("NVD rate limited (%s); giving up on %s", status, params)
+        try:
+            status = getattr(resp, "status_code", 0)
+            if status in (429, 403):
+                if attempt == 2 or not budget.can_spend(RETRY_SLEEP_SEC + REQUEST_TIMEOUT_SEC):
+                    logger.warning("NVD rate limited (%s); giving up on %s", status, params)
+                    return None
+                _sleep(RETRY_SLEEP_SEC)
+                continue
+            if status != 200:
+                logger.warning("NVD returned %s for %s", status, params)
                 return None
-            _sleep(RETRY_SLEEP_SEC)
-            continue
-        if status != 200:
-            logger.warning("NVD returned %s for %s", status, params)
-            return None
-        raw = _read_limited(resp)
+            try:
+                raw = _read_limited(resp)
+            except requests.RequestException as exc:
+                logger.warning("NVD response read failed: %s", exc)
+                return None
+        finally:
+            _close(resp)
         if raw is None:
             return None
         try:
@@ -214,6 +227,13 @@ def _fetch(
             return None
         return body if isinstance(body, dict) else None
     return None
+
+
+def _close(resp) -> None:
+    """Release a streamed response's connection (whatever was or was not read from it)."""
+    close = getattr(resp, "close", None)
+    if callable(close):
+        close()
 
 
 def _read_limited(resp) -> bytes | None:

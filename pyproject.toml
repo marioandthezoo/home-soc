@@ -55,7 +55,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9"]
+# pytest is development-only and is deliberately NOT in requirements.txt (the hash-locked
+# runtime lock the launchers install), so it never lands in a production .venv.
+# >=9.0.3: PYSEC-2026-1845 (predictable /tmp/pytest-of-{user} basetemp on POSIX).
+dev = ["pytest>=9.0.3,<10"]
 # SPEC addendum B3: Lens serves the phone camera viewer over HTTPS, and a browser only
 # grants getUserMedia in a secure context. Generating the self-signed certificate needs
 # `cryptography`; nothing else does, so it stays out of the core dependency list and

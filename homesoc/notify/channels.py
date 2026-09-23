@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,15 @@ TOAST_TIMEOUT = 20
 MAX_BODY_CHARS = 3500          # Discord embed description limit is 4096; keep headroom
 MAX_TOAST_CHARS = 200
 MAX_LISTED_FINDINGS = 10
+# Finding titles and subjects carry LAN-controlled text (hostnames, banners, the description a device
+# gives its UPnP port mapping). A CR/LF in it would forge an extra "[CRITICAL] ..." line in the alert,
+# so each is flattened to one line here even for rows stored before the catalog started doing so.
+_UNSAFE_TEXT = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
+# Discord renders embed descriptions as Markdown: masked links [text](url), autolinks, <url>,
+# mentions, spoilers. Every such metacharacter is backslash-escaped (Discord drops the backslash and
+# shows the character) so device-chosen text can never become a disguised or clickable link.
+_DISCORD_MARKDOWN = re.compile(r"([\\*_~`|<>\[\]()@:#])")
+MAX_LINE_CHARS = 400
 
 # poster(url, *, json=None, data=None, headers=None) -> (ok, error)
 Poster = Callable[..., tuple[bool, str | None]]
@@ -87,11 +97,22 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _one_line(value: Any, limit: int = MAX_LINE_CHARS) -> str:
+    """One printable line: control, line-separator and bidi characters become spaces."""
+    return _truncate(_UNSAFE_TEXT.sub(" ", str(value)), limit)
+
+
+def escape_discord_markdown(text: str) -> str:
+    return _DISCORD_MARKDOWN.sub(r"\\\1", text)
+
+
 # --- payload builders (pure) ----------------------------------------------------------------------
 def format_findings_body(findings: list[dict]) -> str:
     lines = []
     for f in findings[:MAX_LISTED_FINDINGS]:
-        lines.append(f"[{str(f.get('severity', 'info')).upper()}] {f.get('title', f.get('finding_id', '?'))}  ({f.get('subject', '')})")
+        severity = _one_line(f.get("severity", "info"), 20).upper()
+        title = _one_line(f.get("title", f.get("finding_id", "?")))
+        lines.append(f"[{severity}] {title}  ({_one_line(f.get('subject', ''), 200)})")
     if len(findings) > MAX_LISTED_FINDINGS:
         lines.append(f"... and {len(findings) - MAX_LISTED_FINDINGS} more")
     return "\n".join(lines)
@@ -100,7 +121,10 @@ def format_findings_body(findings: list[dict]) -> str:
 def _slim(findings: list[dict] | None) -> list[dict]:
     """Only the fields a receiver needs; keeps webhook payloads small and free of remediation prose."""
     keys = ("id", "finding_id", "subject", "severity", "title", "status", "first_seen", "last_seen", "occurrences")
-    return [{k: f.get(k) for k in keys if k in f} for f in (findings or [])]
+    return [
+        {k: (_one_line(f[k]) if k in ("title", "subject") and isinstance(f[k], str) else f.get(k)) for k in keys if k in f}
+        for f in (findings or [])
+    ]
 
 
 def build_ntfy(subject: str, body: str, severity: str) -> dict:
@@ -123,10 +147,12 @@ def build_discord(subject: str, body: str, severity: str, findings: list[dict] |
         "embeds": [
             {
                 "title": _truncate(f"{sev.upper()} - {len(findings or [])} finding(s)" if findings else sev.upper(), 250),
-                "description": _truncate(body, MAX_BODY_CHARS),
+                "description": _truncate(escape_discord_markdown(body), MAX_BODY_CHARS),
                 "color": DISCORD_COLOR.get(sev, DISCORD_COLOR["info"]),
             }
         ],
+        # Nothing in an alert may ping @everyone/@here, a role or a user.
+        "allowed_mentions": {"parse": []},
     }
 
 
@@ -141,10 +167,19 @@ def build_webhook(subject: str, body: str, severity: str, findings: list[dict] |
     }
 
 
+#: Characters outside the XML 1.0 ``Char`` production. Escaping cannot represent them, so a
+#: hostname carrying one (say ``cam\x0b``) would make LoadXml throw and the toast never appear.
+_XML_INVALID = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def _xml_chars(value: str) -> str:
+    return _XML_INVALID.sub("", value)
+
+
 def build_toast_xml(subject: str, body: str) -> str:
     """Toast XML with every user-controlled string escaped; finding titles carry device names and banners."""
-    title = _xml_escape(_truncate(subject, 100), {'"': "&quot;", "'": "&apos;"})
-    text = _xml_escape(_truncate(body, MAX_TOAST_CHARS), {'"': "&quot;", "'": "&apos;"})
+    title = _xml_escape(_xml_chars(_truncate(subject, 100)), {'"': "&quot;", "'": "&apos;"})
+    text = _xml_escape(_xml_chars(_truncate(body, MAX_TOAST_CHARS)), {'"': "&quot;", "'": "&apos;"})
     return (
         '<toast><visual><binding template="ToastGeneric">'
         f"<text>{title}</text><text>{text}</text>"
@@ -159,19 +194,21 @@ def build_toast_script(subject: str, body: str) -> str:
     error, powershell.exe still exits 0 and Home SOC records the notification as sent while the
     user saw nothing. With it, the runner sees exit 1 plus the message on stderr.
     """
-    xml = build_toast_xml(subject, body)
-    # After XML escaping no single quote remains, so a single-quoted PS literal is injection-safe;
-    # doubling is kept as belt-and-braces.
-    xml_ps = xml.replace("'", "''")
-    app_id = TOAST_APP_ID.replace("'", "''")
+    # No alert text is ever spliced into the script as a string literal. PowerShell also ends a
+    # single-quoted literal at U+2018..U+201B (typographic quotes), which XML escaping leaves
+    # alone, so a device-chosen name such as a UPnP mapping description could close the literal
+    # and run code as the owner. The XML travels as base64 (alphabet A-Z a-z 0-9 + / =, no quote
+    # character of any kind) and is decoded inside PowerShell; every other part of the script
+    # is a constant.
+    xml_b64 = base64.b64encode(build_toast_xml(subject, body).encode("utf-8")).decode("ascii")
     return (
         "$ErrorActionPreference = 'Stop'; "
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null; "
         "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null; "
         "$x = New-Object Windows.Data.Xml.Dom.XmlDocument; "
-        f"$x.LoadXml('{xml_ps}'); "
+        f"$x.LoadXml([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{xml_b64}'))); "
         "$t = [Windows.UI.Notifications.ToastNotification]::new($x); "
-        f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{app_id}').Show($t); "
+        f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{TOAST_APP_ID}').Show($t); "
         "exit 0"
     )
 

@@ -56,7 +56,10 @@ fi
 min_version_ok python || fail "the .venv virtual environment runs $(python --version 2>&1), but Home SOC needs Python 3.12 or newer. Delete the .venv directory and run ./run.sh again."
 
 # Dependencies only when requirements.txt actually changed: re-running pip at every login is
-# slow and, offline, prints a wall of errors.
+# slow and, offline, prints a wall of errors. requirements.txt is the hash-locked lock file (every
+# transitive package, pip included), so its SHA-256 changes whenever any locked version is bumped -
+# that is how a security fix in urllib3/werkzeug/... reaches an existing .venv. --require-hashes
+# makes pip refuse anything unpinned, unlisted or whose bytes differ from the lock.
 STAMP=".venv/.requirements.sha"
 REQHASH=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -68,8 +71,8 @@ OLDHASH=""
 [ -f "$STAMP" ] && OLDHASH="$(cat "$STAMP" 2>/dev/null)"
 if [ -z "$REQHASH" ] || [ "$REQHASH" != "$OLDHASH" ]; then
     echo "[Home SOC] installing dependencies ..."
-    python -m pip install -r requirements.txt -q --disable-pip-version-check \
-        || fail "dependency install failed - this usually means no internet connection. Connect and run ./run.sh again; see data/logs/launcher.log."
+    python -m pip install --require-hashes -r requirements.txt -q --disable-pip-version-check \
+        || fail "dependency install failed - this usually means no internet connection. Connect and run ./run.sh again. If it keeps failing with a HASH mismatch, a download did not match requirements.txt - do not work around it; report it. See data/logs/launcher.log."
     [ -n "$REQHASH" ] && printf '%s\n' "$REQHASH" > "$STAMP"
 fi
 

@@ -996,6 +996,14 @@ def slow_igd_server():
     yield from _serve(_SlowIgdHandler)
 
 
+@pytest.fixture
+def loopback_is_lan(monkeypatch):
+    """exposure now refuses loopback as an IGD address (SSRF fix). These tests use a loopback
+    server as a stand-in for a real LAN gateway, so treat 127.0.0.1 as a LAN host for them only."""
+    real = exposure._is_lan_address
+    monkeypatch.setattr(exposure, "_is_lan_address", lambda host: host == "127.0.0.1" or real(host))
+
+
 class TestExposure:
     def test_parse_ssdp_response(self):
         text = "HTTP/1.1 200 OK\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nLOCATION: http://192.168.1.254:1900/igd.xml\r\nSERVER: Linux UPnP/1.0 MiniUPnPd/2.1\r\nUSN: uuid:1::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n"
@@ -1010,7 +1018,7 @@ class TestExposure:
         assert exposure.parse_mapping_response(FAULT_XML) is None
         assert exposure.parse_mapping_response("<garbage") is None
 
-    def test_igd_walk_against_local_server(self, igd_server):
+    def test_igd_walk_against_local_server(self, igd_server, loopback_is_lan):
         port = igd_server.server_address[1]
         svcs = exposure.igd_services(f"http://127.0.0.1:{port}/desc.xml")
         assert [s["service_type"] for s in svcs] == ["urn:schemas-upnp-org:service:WANIPConnection:1"]  # evil host dropped
@@ -1027,7 +1035,7 @@ class TestExposure:
             with pytest.raises(ValueError):
                 exposure._http(url, timeout=1.0)
 
-    def test_redirects_are_not_followed(self, redirect_server):
+    def test_redirects_are_not_followed(self, redirect_server, loopback_is_lan):
         """The SSDP LOCATION is attacker-controlled: following a 302 would let a rogue device aim the
         description GET (and the SOAP POSTs after it) at any host, private-IP check already passed."""
         port, hits = redirect_server
@@ -1038,14 +1046,14 @@ class TestExposure:
         assert exposure.enumerate_mappings(f"http://127.0.0.1:{port}/ctl", "urn:x:WANIPConnection:1") == []
         assert hits == ["/desc.xml", "/desc.xml", "/ctl"]
 
-    def test_enumerate_mappings_stops_at_the_deadline(self, igd_server):
+    def test_enumerate_mappings_stops_at_the_deadline(self, igd_server, loopback_is_lan):
         port = igd_server.server_address[1]
         url = f"http://127.0.0.1:{port}/ctl/IPConn"
         st = "urn:schemas-upnp-org:service:WANIPConnection:1"
         assert exposure.enumerate_mappings(url, st, deadline=time.monotonic() - 1) == []
         assert len(exposure.enumerate_mappings(url, st, deadline=time.monotonic() + 30)) == 2
 
-    def test_enumerate_mappings_gives_up_on_a_slow_gateway(self, slow_igd_server, monkeypatch):
+    def test_enumerate_mappings_gives_up_on_a_slow_gateway(self, slow_igd_server, monkeypatch, loopback_is_lan):
         port, hits = slow_igd_server
         monkeypatch.setattr(exposure, "SLOW_RESPONSE_SEC", 0.05)
         maps = exposure.enumerate_mappings(f"http://127.0.0.1:{port}/ctl", "urn:x:WANIPConnection:1")

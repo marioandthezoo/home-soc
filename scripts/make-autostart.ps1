@@ -208,8 +208,12 @@ if ($Elevated) {
         Write-Host "    * When you do want those checks, run them on demand from an elevated prompt:"
         Write-Host "      .venv\Scripts\python.exe -m homesoc scan --only host"
         Write-Host "    * Or reinstall Home SOC somewhere only administrators can write, e.g."
-        Write-Host "      C:\Program Files\HomeSOC (copy the tree there, let it inherit that folder's ACL,"
-        Write-Host "      set HOMESOC_DATA to a writable data directory), then re-run this script with -Elevated."
+        Write-Host "      C:\Program Files\HomeSOC (copy the tree there and let it inherit that folder's ACL),"
+        Write-Host "      and keep the data under your own profile: set HOMESOC_DATA to"
+        Write-Host "      %LOCALAPPDATA%\HomeSOC\data. Do not use a folder such as C:\HomeSOC-data: folders"
+        Write-Host "      under C:\ let every local account modify them. (Home SOC resets a data folder"
+        Write-Host "      outside your profile to owner + SYSTEM + Administrators on first start, but the"
+        Write-Host "      profile is the safe place.) Then re-run this script with -Elevated."
         exit 1
     }
     Write-Host "[Home SOC] tree is admin-only; an elevated task is safe here."

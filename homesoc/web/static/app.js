@@ -223,6 +223,14 @@
       });
     },
     'settings-save': function () { return saveSettings(); },
+    'settings-clear': function (b) {
+      var key = b.dataset.key;
+      return postJSON('/api/settings/clear', { keys: [key] }).then(function (r) {
+        toast((r.cleared && r.cleared.length ? key + ' now follows config.toml' : 'Nothing to clear') +
+              (r.restart_required ? ' — restart Home SOC to apply' : ''), 'ok');
+        setTimeout(function () { location.reload(); }, 900);
+      });
+    },
     toggle: function (b) {
       var t = $(b.dataset.target);
       if (t) {

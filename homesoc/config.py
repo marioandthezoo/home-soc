@@ -490,12 +490,27 @@ def coerce(dotted: str, raw: Any) -> Any:
     if isinstance(default, float):
         return _to_float(raw, dotted)
     if isinstance(default, list):
-        return _to_tuple(raw, dotted, default)
+        values = _to_tuple(raw, dotted, default)
+        if dotted == "dns.lists":
+            values = _known_blocklists(values)
+        return values
     if isinstance(default, str):
         if isinstance(raw, (list, tuple, dict)):
             raise ValueError(f"{dotted}: expected text")
         return "" if raw is None else str(raw)
     return raw
+
+
+def _known_blocklists(names: tuple) -> tuple:
+    """Only feed names from the registry: a dns.lists entry is joined onto the feeds folder, so a
+    path, "..", a drive letter or a UNC share must never get that far."""
+    from homesoc.dnsfilter.policy import valid_list_name  # lazy: dnsfilter imports config helpers
+
+    kept = tuple(n for n in names if valid_list_name(str(n)))
+    dropped = [n for n in names if n not in kept]
+    if dropped:
+        logger.warning("dns.lists: ignoring %d name(s) that are not blocklist feeds: %r", len(dropped), dropped[:5])
+    return kept
 
 
 def _to_bool(raw: Any, dotted: str) -> bool:

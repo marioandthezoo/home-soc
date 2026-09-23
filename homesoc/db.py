@@ -463,6 +463,12 @@ def connect(path: Path | str | None = None, *, init: bool = True) -> sqlite3.Con
     if target != ":memory:":
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
+        # The database holds the network map and the secrets saved from the Settings page;
+        # sqlite creates it (and its -wal/-shm) 0644, and existing installs already have that.
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            candidate = Path(f"{target}{suffix}")
+            if candidate.exists():
+                paths.restrict_path(candidate, paths.PRIVATE_FILE_MODE)
     if init:
         init_schema(conn)
     return conn
@@ -485,6 +491,16 @@ def init_schema(conn: sqlite3.Connection) -> None:
                 (version, utcnow_iso()),
             )
             logger.info("applied schema migration %d", version)
+        # Not a numbered migration (idempotent, no schema change): lets the per-device open-findings
+        # count on /api/devices use an index instead of scanning every open finding.
+        # Per-device DNS figures (Lens card, device page) filter on client + time; without the
+        # second index they scan the whole window of every client under the shared lock.
+        for table, ddl in (
+            ("findings", "CREATE INDEX IF NOT EXISTS idx_findings_status_device ON findings(status, device_id)"),
+            ("dns_queries", "CREATE INDEX IF NOT EXISTS idx_dns_queries_client_ts ON dns_queries(client, ts)"),
+        ):
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                conn.execute(ddl)
         conn.commit()
 
 
@@ -700,8 +716,8 @@ LENS_CLAIM_LIMIT = 10
 LENS_CLAIM_WINDOW_SECONDS = 3600
 
 #: Control characters are stripped from every phone-supplied label before it is stored,
-#: logged or printed (see lens_mint_token). Same class lens.normalise_code refuses.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+#: logged or printed (see lens_mint_token). Includes the C1 range: U+009B is a one-byte CSI.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 _LENS_PAIRING_PREFIX = "lens.pairing."
 _LENS_CLAIM_PREFIX = "lens.claim."

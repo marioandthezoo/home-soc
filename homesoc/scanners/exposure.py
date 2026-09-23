@@ -8,16 +8,20 @@ Three cheap, read-only questions, all answered with the standard library:
 3. The router's UPnP IGD, if it answers SSDP - which port mappings exist,
    because that is how malware and "helpful" apps quietly expose the LAN.
 
-Every response is untrusted: sizes are capped, XML is parsed with
-ElementTree only, and control URLs must stay on the same private host that
-answered SSDP.
+Every response is untrusted: sizes are capped, every HTTP exchange has a
+wall-clock deadline, XML is parsed with ElementTree only, the description URL
+must point at the LAN host that answered SSDP, and control URLs must stay on
+that same host.
 """
 
 from __future__ import annotations
 
+import functools
+import http.client
 import ipaddress
 import json
 import logging
+import re
 import select
 import socket
 import time
@@ -30,7 +34,7 @@ from xml.etree import ElementTree as ET
 from homesoc import db
 from homesoc.models import FindingDraft, ScanResult
 from homesoc.scanners import discovery
-from homesoc.util import utcnow_iso
+from homesoc.util import device_text, utcnow_iso
 
 if TYPE_CHECKING:
     import sqlite3
@@ -60,6 +64,18 @@ RUN_BUDGET_SEC = 60.0
 SOAP_TIMEOUT_SEC = 3.0
 SLOW_RESPONSE_SEC = 2.0
 MAX_CONSECUTIVE_SLOW = 2
+# Every SSDP responder can claim to be a gateway; a real home has one or two.
+MAX_IGDS = 4
+MAX_HEADER_VALUE = 512
+_READ_CHUNK = 64 * 1024
+# The only service types we ever SOAP; the value goes into the request body and SOAPAction header.
+_WAN_SERVICE_RE = re.compile(r"urn:schemas-upnp-org:service:WAN(?:IP|PPP)Connection:[12]")
+_SERVICE_TYPE_OK = re.compile(r"[A-Za-z0-9:._-]{1,128}")
+# C0/C1 controls, DEL and the Unicode line separators: a device-supplied header value carrying any of
+# these is forging log lines or terminal escapes, never describing a gateway.
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_URL_BAD_CHARS = re.compile("[\x00-\x20\x7f-\x9f\u2028\u2029]")
+_THIS_NETWORK = ipaddress.ip_network("0.0.0.0/8")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -69,7 +85,63 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+class _DeadlineSocket(socket.socket):
+    """A socket whose sends and receives share one wall-clock deadline.
+
+    urllib's ``timeout`` bounds each socket operation separately, so a LAN device that drips one
+    byte every few seconds (status line, headers or body) would never trip it and could hold the
+    single scheduler thread for days.  Here every operation only gets what is left of the budget.
+    """
+
+    deadline = 0.0
+
+    def _arm(self) -> None:
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("HTTP exchange exceeded its wall-clock budget")
+        self.settimeout(left)
+
+    def recv(self, *args, **kwargs):  # noqa: D102 - socket API
+        self._arm()
+        return super().recv(*args, **kwargs)
+
+    def recv_into(self, *args, **kwargs):  # noqa: D102 - socket API
+        self._arm()
+        return super().recv_into(*args, **kwargs)
+
+    def send(self, *args, **kwargs):  # noqa: D102 - socket API
+        self._arm()
+        return super().send(*args, **kwargs)
+
+    def sendall(self, *args, **kwargs):  # noqa: D102 - socket API
+        self._arm()
+        return super().sendall(*args, **kwargs)
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, deadline: float, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        super().connect()
+        raw = self.sock
+        sock = _DeadlineSocket(raw.family, raw.type, raw.proto, fileno=raw.detach())
+        sock.deadline = self._deadline
+        self.sock = sock
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    """Plain http (the LAN side: IGD description + SOAP) runs on :class:`_DeadlineSocket`."""
+
+    def http_open(self, req):  # noqa: D401 - urllib hook
+        deadline = getattr(req, "homesoc_deadline", None)
+        if deadline is None:
+            return super().http_open(req)
+        return self.do_open(functools.partial(_DeadlineHTTPConnection, deadline=deadline), req)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect, _DeadlineHTTPHandler)
 _SOAP_ENVELOPE = (
     '<?xml version="1.0"?>'
     '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -82,26 +154,82 @@ _SOAP_ENVELOPE = (
 
 # --------------------------------------------------------------------------- HTTP helpers
 
-def _http(url: str, *, timeout: float, data: bytes | None = None, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
-    """GET/POST with a size cap and no redirects; returns (status, body). Raises URLError to the caller."""
+def _read_capped(resp: Any, deadline: float) -> bytes:
+    """Read at most MAX_BODY bytes, giving up at ``deadline`` even if the peer keeps dripping."""
+    read = getattr(resp, "read1", None) or resp.read
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_BODY:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("HTTP body exceeded its wall-clock budget")
+        chunk = read(min(_READ_CHUNK, MAX_BODY + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)[:MAX_BODY]
+
+
+def _http(url: str, *, timeout: float, data: bytes | None = None, headers: dict[str, str] | None = None,
+          deadline: float | None = None) -> tuple[int, bytes]:
+    """GET/POST with a size cap and no redirects; returns (status, body). Raises OSError to the caller.
+
+    ``timeout`` is a wall-clock limit for the whole exchange (plain http: connect, headers and body;
+    https: the body, plus ``timeout`` per operation before it), cut shorter by ``deadline`` (monotonic).
+    """
     scheme = urllib.parse.urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) URL scheme {scheme!r}")
+    limit = time.monotonic() + timeout
+    if deadline is not None:
+        limit = min(limit, deadline)
+    left = limit - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("no time left for this HTTP request")
     req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, **(headers or {})})
+    req.homesoc_deadline = limit  # type: ignore[attr-defined] - read by _DeadlineHTTPHandler
     try:
-        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 - fixed https/LAN urls only
-            return resp.status, resp.read(MAX_BODY + 1)[:MAX_BODY]
+        with _OPENER.open(req, timeout=left) as resp:  # noqa: S310 - fixed https/LAN urls only
+            return resp.status, _read_capped(resp, limit)
     except urllib.error.HTTPError as exc:
-        body = exc.read(MAX_BODY + 1)[:MAX_BODY] if hasattr(exc, "read") else b""
+        body = _read_capped(exc, limit) if hasattr(exc, "read") else b""
         return exc.code, body
+    except http.client.HTTPException as exc:
+        # IncompleteRead, InvalidURL, BadStatusLine...: a garbled answer, not a crash of the whole run.
+        raise OSError(f"bad HTTP exchange: {type(exc).__name__}") from exc
+
+
+def _is_lan_address(host: str) -> bool:
+    """A unicast private address another box on the LAN could own: no loopback, link-local,
+    unspecified, "this network", multicast or reserved space (all of which ``is_private`` admits)."""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _THIS_NETWORK:
+        return False
+    return addr.is_private and not (addr.is_loopback or addr.is_link_local or addr.is_unspecified
+                                    or addr.is_multicast or addr.is_reserved)
 
 
 def _is_private_url(url: str) -> bool:
+    """True for a URL whose host is a literal LAN address (see :func:`_is_lan_address`)."""
     try:
         host = urllib.parse.urlparse(url).hostname or ""
-        return ipaddress.ip_address(host).is_private
     except ValueError:
         return False
+    return _is_lan_address(host)
+
+
+def _url_host(url: str) -> str | None:
+    """Canonical literal IP of ``url``'s host, or None for a name / garbage."""
+    try:
+        host = urllib.parse.urlparse(url).hostname
+        return str(ipaddress.ip_address(host)) if host else None
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------- public IP / InternetDB
@@ -149,6 +277,8 @@ def internetdb(ip: str, timeout: float = 8.0) -> dict[str, Any]:
 # --------------------------------------------------------------------------- UPnP / IGD
 
 def parse_ssdp_response(text: str) -> dict[str, str] | None:
+    """Headers of an SSDP 200 response.  A value carrying control characters (log forging, terminal
+    escapes) or longer than MAX_HEADER_VALUE is dropped: it never describes a real gateway."""
     lines = text.replace("\r\n", "\n").split("\n")
     if not lines or "200" not in lines[0]:
         return None
@@ -156,7 +286,10 @@ def parse_ssdp_response(text: str) -> dict[str, str] | None:
     for line in lines[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
-            hdr[k.strip().lower()] = v.strip()
+            v = v.strip()
+            if len(v) > MAX_HEADER_VALUE or _CONTROL_CHARS.search(v):
+                v = ""
+            hdr[k.strip().lower()] = v
     return {"location": hdr.get("location", ""), "server": hdr.get("server", ""), "st": hdr.get("st", ""),
             "usn": hdr.get("usn", "")}
 
@@ -198,7 +331,14 @@ def discover_igd(interface_ip: str, seconds: float = 3.0) -> list[dict[str, str]
                 continue
             if "InternetGatewayDevice" not in parsed["st"] and "InternetGatewayDevice" not in parsed["usn"]:
                 continue
+            # The description must live on the box that answered: otherwise any LAN device could aim
+            # our GET (and the SOAP POSTs after it) at localhost or at a third host that trusts this PC.
+            if not _is_lan_address(addr[0]) or _url_host(parsed["location"]) != addr[0]:
+                logger.info("ignoring SSDP gateway answer from %s: LOCATION is not on the responder", addr[0])
+                continue
             parsed["from"] = addr[0]
+            if parsed["location"] not in found and len(found) >= MAX_IGDS:
+                continue
             found.setdefault(parsed["location"], parsed)
     except OSError as exc:
         logger.debug("SSDP IGD search failed: %s", exc)
@@ -212,9 +352,13 @@ def _local(tag: str) -> str:
 
 
 def igd_services(location: str, timeout: float = 5.0) -> list[dict[str, str]]:
-    """Fetch the IGD description and return WAN*Connection services with absolute control URLs."""
+    """Fetch the IGD description and return WAN*Connection services with absolute control URLs.
+
+    ``timeout`` bounds the whole fetch in wall-clock seconds, not each socket read.
+    """
     if not _is_private_url(location):
-        logger.warning("ignoring IGD description outside private space: %s", location)
+        # %r: the URL is device-supplied, and a raw CR/ESC in it would forge log lines.
+        logger.warning("ignoring IGD description outside the LAN: %r", location[:MAX_HEADER_VALUE])
         return []
     try:
         status, body = _http(location, timeout=timeout)
@@ -240,12 +384,19 @@ def igd_services(location: str, timeout: float = 5.0) -> list[dict[str, str]]:
                 stype = (child.text or "").strip()
             elif _local(child.tag) == "controlURL":
                 ctrl = (child.text or "").strip()
-        if not any(w in stype for w in WAN_SERVICE_TYPES) or not ctrl:
+        # Exact allow-list: the service type is echoed into the SOAP body and SOAPAction header.
+        if not _WAN_SERVICE_RE.fullmatch(stype) or not ctrl:
             continue
-        control_url = urllib.parse.urljoin(base, ctrl)
+        try:
+            control_url = urllib.parse.urljoin(base, ctrl)
+            ctrl_host = urllib.parse.urlparse(control_url).hostname
+        except ValueError:
+            continue
         # The description is untrusted: never let it point us at another host.
-        if urllib.parse.urlparse(control_url).hostname != igd_host:
-            logger.warning("IGD control URL host mismatch; skipped: %s", control_url)
+        if ctrl_host != igd_host:
+            logger.warning("IGD control URL host mismatch; skipped: %r", control_url[:MAX_HEADER_VALUE])
+            continue
+        if len(control_url) > MAX_HEADER_VALUE or _URL_BAD_CHARS.search(control_url):
             continue
         out.append({"service_type": stype, "control_url": control_url})
     return out
@@ -270,14 +421,23 @@ def parse_mapping_response(xml_text: str | bytes) -> dict[str, Any] | None:
     def as_int(v: str) -> int | None:
         return int(v) if v.isdigit() else None
 
+    def as_ipv4(v: str) -> str:
+        # Whoever answers the SOAP call writes these fields; only a real IPv4 address is kept, so
+        # a newline or markup cannot ride into a finding title through "internal_client".
+        try:
+            return str(ipaddress.IPv4Address(v.strip()))
+        except ValueError:
+            return ""
+
+    protocol = fields.get("NewProtocol", "").strip().upper()
     return {
-        "remote_host": fields.get("NewRemoteHost", ""),
+        "remote_host": as_ipv4(fields.get("NewRemoteHost", "")),
         "external_port": as_int(fields.get("NewExternalPort", "")),
-        "protocol": fields.get("NewProtocol", "").upper(),
+        "protocol": protocol if protocol in ("TCP", "UDP") else device_text(protocol, 8),
         "internal_port": as_int(fields.get("NewInternalPort", "")),
-        "internal_client": fields.get("NewInternalClient", ""),
+        "internal_client": as_ipv4(fields.get("NewInternalClient", "")),
         "enabled": fields.get("NewEnabled", "1") not in ("0", "false", ""),
-        "description": fields.get("NewPortMappingDescription", "")[:120],
+        "description": device_text(fields.get("NewPortMappingDescription", ""), 120),
         "lease_duration": as_int(fields.get("NewLeaseDuration", "")),
     }
 
@@ -289,7 +449,7 @@ def enumerate_mappings(control_url: str, service_type: str, *, timeout: float = 
     Stops early at ``deadline`` (monotonic seconds) or after two consecutive slow answers, because
     a sluggish gateway would otherwise cost up to 100 x timeout on the scheduler thread.
     """
-    if not _is_private_url(control_url):
+    if not _is_private_url(control_url) or not _SERVICE_TYPE_OK.fullmatch(service_type or ""):
         return []
     mappings: list[dict[str, Any]] = []
     slow = 0
@@ -302,7 +462,7 @@ def enumerate_mappings(control_url: str, service_type: str, *, timeout: float = 
                    "SOAPAction": f'"{service_type}#GetGenericPortMappingEntry"'}
         t0 = time.monotonic()
         try:
-            status, resp = _http(control_url, timeout=timeout, data=body, headers=headers)
+            status, resp = _http(control_url, timeout=timeout, data=body, headers=headers, deadline=deadline)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             logger.debug("port mapping query %d failed: %s", index, exc)
             break
@@ -347,6 +507,17 @@ def _upnp_findings(igds: list[dict[str, str]], mappings: list[dict[str, Any]]) -
     return drafts
 
 
+def _igd_in_scope(igd: dict[str, str], network: ipaddress.IPv4Network) -> bool:
+    """The IGD must be the LAN host that answered SSDP, inside the configured scan boundary."""
+    host = igd.get("from") or ""
+    if not _is_lan_address(host) or _url_host(igd.get("location") or "") != host:
+        return False
+    try:
+        return ipaddress.ip_address(host) in network
+    except ValueError:
+        return False
+
+
 def run(cfg: "Config", conn: "sqlite3.Connection", *, quick: bool = False,
         progress: Callable[[str], None] | None = None) -> ScanResult:
     """Public IP + InternetDB + UPnP mappings; stores ``exposure.public_ip`` / ``exposure.last_json``."""
@@ -379,12 +550,18 @@ def run(cfg: "Config", conn: "sqlite3.Connection", *, quick: bool = False,
             findings.extend(_wan_findings(ip, idb))
 
         say("searching for a UPnP gateway")
-        igds = discover_igd(iface, seconds=3.0)
+        network = discovery.resolve_network(cfg)
+        igds = [igd for igd in discover_igd(iface, seconds=3.0) if _igd_in_scope(igd, network)][:MAX_IGDS]
         summary["igd_found"] = len(igds)
         summary["igds"] = igds
         mappings: list[dict[str, Any]] = []
         for igd in igds:
-            for svc in igd_services(igd["location"]):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                summary["partial"] = True
+                break
+            # Wall-clock bound on the description fetch too: the budget must hold before the SOAP walk.
+            for svc in igd_services(igd["location"], timeout=min(5.0, left)):
                 if time.monotonic() >= deadline:
                     summary["partial"] = True
                     break

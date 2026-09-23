@@ -45,7 +45,7 @@ CONFIDENCES: tuple[str, ...] = ("exact", "probable", "ambiguous", "unknown")
 # A decoded barcode is attacker-controlled text of unknown length. Anything longer than this,
 # or carrying control characters, is not a code we are willing to store.
 MAX_CODE_LEN = 512
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # "Currently online" for ranking (B6 rule 1) means the online flag *and* a recent sighting;
 # a device that dropped off an hour ago should not outrank the one in your hand.
@@ -500,6 +500,10 @@ def tags_for_device(conn: sqlite3.Connection, device_id: int) -> list[dict]:
     return api.rows(conn, "SELECT * FROM lens_tags WHERE device_id=? ORDER BY id", (int(device_id),))
 
 
+class TagExists(ValueError):
+    """``learn_tag(..., overwrite=False)`` found the code already bound (or ignored)."""
+
+
 def learn_tag(
     conn: sqlite3.Connection,
     code: str,
@@ -508,13 +512,27 @@ def learn_tag(
     kind: str = "learned",
     label: str | None = None,
     created_by: str = "lens",
+    overwrite: bool = True,
 ) -> int:
     """Bind ``code`` to ``device_id`` and return the tag's row id.
 
     ``device_id=None`` with ``kind='ignored'`` records "this code is not a device", so the phone
     stops asking about the barcode on the back of the sofa. Re-learning an existing code moves it
     rather than creating a duplicate; a sticker keeps its ``sticker`` kind so reprints stay valid.
+
+    ``overwrite=False`` is the read-only phone's mode (B8 lets it teach Lens a *new* code; B10
+    forbids it changing anything that exists): it only ever inserts, and raises
+    :class:`TagExists` when the code is already stored, whatever its kind. The check and the
+    insert share one unit of work, so a concurrent learn cannot slip between them.
     """
+    if not overwrite:
+        dbmod = _core_db()
+        scope = dbmod.transaction(conn) if dbmod is not None and hasattr(dbmod, "transaction") else _nullcontext()
+        with scope:
+            normalised = normalise_code(code)
+            if normalised is not None and tag_for_code(conn, normalised) is not None:
+                raise TagExists("that code is already known")
+            return learn_tag(conn, code, device_id, kind=kind, label=label, created_by=created_by)
     normalised = normalise_code(code)
     if normalised is None:
         raise ValueError("invalid code")
@@ -563,6 +581,31 @@ def forget_tag(conn: sqlite3.Connection, code: str) -> bool:
         return False
     api.write(conn, "DELETE FROM lens_tags WHERE code=?", (normalised,))
     return True
+
+
+def existing_sticker_codes(conn: sqlite3.Connection, device_ids: list[int]) -> dict[int, str]:
+    """device id -> sticker payload for devices that already have one. Never mints."""
+    ensure_tables(conn)
+    wanted: list[int] = []
+    for raw in device_ids or []:
+        try:
+            device_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if device_id not in wanted:
+            wanted.append(device_id)
+    if not wanted:
+        return {}
+    placeholders = ",".join("?" for _ in wanted)
+    out: dict[int, str] = {}
+    for r in api.rows(
+        conn,
+        f"SELECT device_id, code FROM lens_tags WHERE code LIKE ? AND device_id IN ({placeholders}) ORDER BY id",
+        [STICKER_PREFIX + "%"] + wanted,
+    ):
+        if r.get("device_id") is not None:
+            out[int(r["device_id"])] = str(r["code"])  # same row mint_sticker_codes reuses
+    return out
 
 
 def mint_sticker_codes(conn: sqlite3.Connection, device_ids: list[int]) -> dict[int, str]:
@@ -1785,6 +1828,7 @@ __all__ = [
     "headline",
     "identify",
     "learn_tag",
+    "TagExists",
     "lens_device",
     "mint_pairing_code",
     "mint_sticker_codes",

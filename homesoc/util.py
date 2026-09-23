@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -334,6 +335,43 @@ def _gateway_macos() -> str | None:
     return None
 
 
+# ------------------------------------------------------------------ device text
+
+# C0/C1 controls (CR, LF, ESC, NEL, CSI...), DEL, Unicode line/paragraph separators and the bidi
+# override/isolate/mark characters. Same class as findings.catalog.one_line.
+_DEVICE_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
+
+
+def device_text(value: Any, limit: int = 256) -> str:
+    """A string a LAN device chose (hostname, banner, UPnP field, certificate name), made safe to
+    store: one printable line, runs of control/bidi characters collapsed to a single space,
+    trimmed and capped at ``limit``. Applied where such text enters the inventory, so every
+    consumer (dashboard, notifications, CLI, logs, reports) sees the same harmless string."""
+    if value is None:
+        return ""
+    flat = _DEVICE_UNSAFE.sub(" ", str(value))
+    return flat.strip()[:limit].strip()
+
+
+# ----------------------------------------------------------------------- terminal
+
+# C0 controls except TAB and LF, DEL, and the C1 range (U+009B is a one-byte CSI on some
+# terminals). ESC, BEL and CR are what let a string rewrite the screen, retitle the window,
+# plant an OSC 8 link or an OSC 52 clipboard write.
+_TERMINAL_UNSAFE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    r"""``text`` with every terminal control character shown as a visible ``\xNN`` escape.
+
+    Banners, mDNS/SSDP names and UPnP fields are chosen by devices on the LAN, and they reach
+    findings titles, hostnames and log lines. Anything written to a console goes through this,
+    so a hostile device can never drive the user's terminal. Line breaks and tabs survive.
+    """
+    value = str(text).replace("\r\n", "\n")
+    return _TERMINAL_UNSAFE.sub(lambda m: f"\\x{ord(m.group()):02x}", value)
+
+
 # -------------------------------------------------------------------------- files
 
 
@@ -376,5 +414,6 @@ __all__ = [
     "default_interface_ip",
     "default_cidr",
     "default_gateway",
+    "terminal_safe",
     "atomic_write_text",
 ]

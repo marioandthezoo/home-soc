@@ -29,7 +29,7 @@ Nothing in a playbook is done for you. Home SOC observes and explains; you decid
 - [Autostart and persistence](#autostart-and-persistence) — `WIN-PER-001`, `WIN-PER-002`, `WIN-PER-003`
 - [Downloaded files](#downloaded-files) — `AV-FILE-001`, `AV-FILE-002`
 - [Linux and macOS hosts](#linux-and-macos-hosts) — `POSIX-ENC-001`, `POSIX-FW-001`, `POSIX-NET-001`, `POSIX-SSH-001`, `POSIX-UPD-001`
-- [Devices on your network](#devices-on-your-network) — `NET-DEV-001`, `NET-DEV-002`, `NET-DEV-003`
+- [Devices on your network](#devices-on-your-network) — `NET-DEV-001`, `NET-DEV-002`, `NET-DEV-003`, `NET-DEV-004`
 - [Services exposed by devices on the LAN](#services-exposed-by-devices-on-the-lan) — `NET-SVC-001`, `NET-SVC-002`, `NET-SVC-003`, `NET-SVC-004`, `NET-SVC-005`, `NET-SVC-006`, `NET-SVC-007`, `NET-SVC-008`, `NET-SVC-009`, `NET-SVC-010`, `NET-SVC-011`, `NET-SVC-012`
 - [Known vulnerabilities (CVE / KEV / EPSS)](#known-vulnerabilities-cve--kev--epss) — `NET-VUL-001`, `NET-VUL-002`, `NET-VUL-003`, `NET-VUL-004`
 - [Internet-facing exposure](#internet-facing-exposure) — `NET-RTR-002`, `NET-WAN-001`, `NET-WAN-002`, `NET-WAN-003`
@@ -293,6 +293,7 @@ Home SOC's catalog contains **92 findings**. Titles containing `{something}` are
 | [`NET-DEV-001`](#net-dev-001) | medium \* | New device on the network: {ip} ({vendor}) | Devices on your network | `findings/engine.py`, `scanners/discovery.py` | `?`, `discovery` |
 | [`NET-DEV-002`](#net-dev-002) | info | Device with unknown vendor or randomized MAC: {ip} | Devices on your network | `scanners/discovery.py` | `discovery` |
 | [`NET-DEV-003`](#net-dev-003) | info | Trusted device '{name}' has been offline for {days} days | Devices on your network | `cli.py`, `scanners/discovery.py` | `any run`, `discovery` |
+| [`NET-DEV-004`](#net-dev-004) | high | {count} new devices appeared in one network scan | Devices on your network | `scanners/discovery.py` | `discovery` |
 | [`NET-SVC-001`](#net-svc-001) | critical | Telnet open on {ip}:{port} | Services exposed by devices on the LAN | `scanners/services.py` | `services` |
 | [`NET-SVC-002`](#net-svc-002) | high | FTP open on {ip}:{port} | Services exposed by devices on the LAN | `scanners/services.py` | `services` |
 | [`NET-SVC-007`](#net-svc-007) | high | Database port open on {ip}:{port} ({product}) | Services exposed by devices on the LAN | `scanners/services.py` | `services` |
@@ -1452,6 +1453,21 @@ Emitted by `cli.py` (Home SOC self-checks), `scanners/discovery.py` (device disc
 
 1. Open the Devices page and check whether you still own the device.
 2. If it is gone (sold, replaced), untick 'Trusted' or delete it from the inventory.
+
+### NET-DEV-004
+
+**{count} new devices appeared in one network scan**
+Severity `high` · category `devices` · raised once per affected subject
+
+Emitted by `scanners/discovery.py` (device discovery).
+
+**Why it matters.** A home network gains a device now and then, not dozens at once. A burst like this usually means one device is answering for many addresses with made-up hardware (MAC) addresses, which is how a compromised gadget floods or spoofs the network. After the first scan, Home SOC adds at most 32 new devices per scan and 256 per day, and holds the rest back so the inventory stays usable.
+
+**How to fix it**
+
+1. Open the Devices page, sort by 'first seen' and look at the newest entries: many unknown devices with random-looking MAC addresses on one IP range point at a single misbehaving device.
+2. Unplug or power off recently added gadgets one at a time (cameras, plugs, TV boxes) and run a discovery scan after each; when the burst stops you have found the culprit.
+3. Keep that device off the network, or move it to the router's guest/IoT network, and update or factory-reset it before reconnecting.
 
 ---
 

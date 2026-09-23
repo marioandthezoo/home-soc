@@ -48,10 +48,27 @@
       Each code is an opaque random token — it carries no MAC address, IP, hostname or device name, so a
       photograph of a sticker tells a visitor nothing about the network. Reprinting is safe: the same device keeps
       the same code, and stickers already stuck to things keep working.
+      The caption is only ever the nickname you chose, or the kind of device (&ldquo;camera&rdquo;) when it has none
+      &mdash; never its hostname, IP address or MAC address.
     </p>
+    {% set unnamed = labels | rejectattr('device.nickname') | list | length %}
+    {% if show_names and unnamed %}
+    <p class="muted small">{{ unnamed }} device{{ '' if unnamed == 1 else 's' }} on this sheet {{ 'has' if unnamed == 1 else 'have' }} no nickname,
+      so {{ 'its' if unnamed == 1 else 'their' }} sticker shows the device kind instead. Give them a nickname on the Devices page first if you want a name printed.</p>
+    {% endif %}
+    {% if labels and minting and missing %}
+    <form method="post" action="/lens/stickers" class="sticker-mint">
+      <input type="hidden" name="size" value="{{ size }}">
+      <input type="hidden" name="which" value="{{ which }}">
+      <input type="hidden" name="names" value="{{ '1' if show_names else '0' }}">
+      <p class="muted small">{{ missing }} device{{ '' if missing == 1 else 's' }} on this sheet {{ 'has' if missing == 1 else 'have' }} no code yet.
+        Codes are only created when you ask, so the sheet below shows an empty box for {{ 'it' if missing == 1 else 'them' }}.</p>
+      <button class="btn btn-primary" type="submit">Create codes and show the sheet</button>
+    </form>
+    {% endif %}
     {% if not labels %}
     <p class="warn-strip">Nothing to print. {% if which == 'untagged' %}Every device already has a code the camera can read — switch to <b>All devices</b> to reprint.{% else %}No devices have been discovered yet.{% endif %}</p>
-    {% elif not minting %}
+    {% elif not minting and missing %}
     <p class="warn-strip">The Lens identification package is not installed in this build, so no codes could be minted.
       The layout below is a preview with empty labels.</p>
     {% endif %}
@@ -65,7 +82,10 @@
     <div class="label">
       <div class="label-qr">{% if item.qr %}{{ item.qr }}{% else %}<span class="label-missing">no code</span>{% endif %}</div>
       <div class="label-text">
-        {% if show_names %}<b class="label-name">{{ item.device.display_name }}</b>{% endif %}
+        {#- SPEC_LENS: a photograph of a sticker reveals nothing about the network. The caption is
+            the owner-chosen nickname only; ``display_name`` is not used here because it falls back
+            to hostname, IP and MAC. Without a nickname, the generic device kind is printed. -#}
+        {% if show_names %}{% if item.device.nickname %}<b class="label-name">{{ item.device.nickname }}</b>{% elif item.device.kind and item.device.kind != 'unknown' %}<b class="label-name label-kind">{{ item.device.kind }}</b>{% endif %}{% endif %}
         <span class="label-mark">Home SOC Lens</span>
       </div>
     </div>

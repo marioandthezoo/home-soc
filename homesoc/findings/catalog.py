@@ -9,6 +9,7 @@ alternative where one exists, because that is the environment it was built again
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from string import Formatter
 from typing import Any
@@ -21,6 +22,13 @@ SEVERITIES: tuple[str, ...] = ("critical", "high", "medium", "low", "info")
 # list of skipped check IDs. Rendering them with str() leaks Python syntax into titles the user
 # reads ("skipped: ['WIN-SYS-002']"), so containers get flattened before interpolation.
 MAX_LISTED_VALUES = 6
+# Evidence strings are often written by a LAN device (hostnames, mDNS/SSDP names, banners, the
+# description a device gives its UPnP port mapping) and titles travel verbatim into ntfy/Discord/
+# webhook alerts and the CLI. A newline in a device-chosen string would let it forge an extra
+# "[CRITICAL] ..." line inside Home SOC's own alert, and bidi overrides can reverse what the user
+# reads, so every string interpolated into a title is flattened to one line and length-capped.
+MAX_EVIDENCE_CHARS = 300
+_UNSAFE_TEXT = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
 # When a list holds dicts (matcher's [{"cve", "epss"}], services' [{"port", "banner"}]) the title
 # wants one readable field per entry; these are tried in order.
 _PREFERRED_FIELDS: tuple[str, ...] = (
@@ -59,11 +67,22 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 _PLACEHOLDER_DEFAULTS: dict[str, str] = {"hours": "48+"}
 
 
+def one_line(text: Any, limit: int | None = None) -> str:
+    """``text`` as a single printable line: control, line-separator and bidi characters become spaces."""
+    flat = _UNSAFE_TEXT.sub(" ", str(text))
+    if limit is not None and len(flat) > limit:
+        flat = flat[: limit - 1] + "…"
+    return flat
+
+
 def _display(value: Any) -> Any:
     """Flatten an evidence value into something readable inside a sentence.
 
-    Scalars other than bool pass through unchanged so ``json_evidence`` keeps its raw types.
+    Scalars other than bool and str pass through unchanged so ``json_evidence`` keeps its raw types;
+    strings are made single-line (see ``one_line``) because they are frequently device-controlled.
     """
+    if isinstance(value, str):
+        return one_line(value, MAX_EVIDENCE_CHARS)
     if isinstance(value, bool):
         return "yes" if value else "no"
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -77,8 +96,8 @@ def _display(value: Any) -> Any:
         for field_name in _PREFERRED_FIELDS:
             candidate = value.get(field_name)
             if candidate not in (None, ""):
-                return str(candidate)
-        return ", ".join(f"{k}={v}" for k, v in list(value.items())[:4])
+                return one_line(candidate, MAX_EVIDENCE_CHARS)
+        return one_line(", ".join(f"{k}={v}" for k, v in list(value.items())[:4]), MAX_EVIDENCE_CHARS)
     return value
 
 
@@ -844,6 +863,23 @@ _SPECS: list[FindingSpec] = [
         ],
         [], "devices", True,
     ),
+    _spec(
+        "NET-DEV-004", "high", "{count} new devices appeared in one network scan",
+        "A home network gains a device now and then, not dozens at once. A burst like this usually means one "
+        "device is answering for many addresses with made-up hardware (MAC) addresses, which is how a "
+        "compromised gadget floods or spoofs the network. Home SOC added {added} of them and held the other "
+        "{skipped} back so the inventory stays usable.",
+        [
+            "Open the Devices page, sort by 'first seen' and look at the newest entries: many unknown devices "
+            "with random-looking MAC addresses on one IP range point at a single misbehaving device.",
+            "Examples of the addresses involved: {sample}.",
+            "Unplug or power off recently added gadgets one at a time (cameras, plugs, TV boxes) and run a "
+            "discovery scan after each; when the burst stops you have found the culprit.",
+            "Keep that device off the network, or move it to the router's guest/IoT network, and update or "
+            "factory-reset it before reconnecting.",
+        ],
+        [_NSA_HOME], "devices", True,
+    ),
     # ------------------------------------------------------------------ Services on LAN devices
     _spec(
         "NET-SVC-001", "critical", "Telnet open on {ip}:{port}",
@@ -1426,15 +1462,17 @@ def render(draft: Any) -> tuple[str, str]:
     """Return (title, detail) for a FindingDraft-like object using the catalog templates."""
     spec = get(getattr(draft, "finding_id", ""))
     subject = str(getattr(draft, "subject", "") or "")
-    values = SafeDict(_subject_fields(subject))
+    values = SafeDict(_clean_evidence(_subject_fields(subject)))
     values.update(_clean_evidence(getattr(draft, "evidence", None)))
     if spec is None:
         # SPEC-GAP: unknown IDs are tolerated (logged) so a typo in a scanner does not drop the finding.
         logger.warning("finding id %s is not in the catalog", getattr(draft, "finding_id", "?"))
-        title = f"{getattr(draft, 'finding_id', 'UNKNOWN')} on {subject}"
+        title = one_line(f"{getattr(draft, 'finding_id', 'UNKNOWN')} on {subject}")
         detail = getattr(draft, "detail", None) or json_evidence(values)
         return title, detail
-    title = _fmt(spec.title, values)
+    # The title is always one line whatever the template or evidence holds: notifications and the
+    # CLI print one finding per line.
+    title = one_line(_fmt(spec.title, values))
     detail = getattr(draft, "detail", None) or _fmt(spec.rationale, values)
     return title, detail
 
@@ -1444,7 +1482,7 @@ def render_remediation(finding_id: str, evidence: dict[str, Any] | None, subject
     spec = get(finding_id)
     if spec is None:
         return []
-    values = SafeDict(_subject_fields(subject))
+    values = SafeDict(_clean_evidence(_subject_fields(subject)))
     values.update(_clean_evidence(evidence))
     return [_fmt(step, values) for step in spec.remediation]
 

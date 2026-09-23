@@ -255,7 +255,7 @@ The short version:
 2. In `config.toml`: `[web] host = "0.0.0.0"`, `port = 8443`, keep the token; `[lens] enabled = true`. Restart.
 3. `python -m homesoc lens cert --regenerate`, then run with TLS: `python -m homesoc run --tls`.
 4. Elevated PowerShell, once: `powershell -ExecutionPolicy Bypass -File scripts\enable-lens.ps1 -Port 8443`.
-5. Open `/lens/pair` on the computer and scan the QR with the phone.
+5. Open `/lens/pair` on the computer, press **Show a pairing code**, and scan the QR with the phone.
 
 Three honest limits before you spend an evening on it. **Chrome on Android is the target** — scanning needs the
 `BarcodeDetector` API, so other browsers (including everything on iOS) fall back to the device picker rather than the

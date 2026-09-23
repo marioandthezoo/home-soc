@@ -1,6 +1,13 @@
 {% extends "base.html" %}
+{% macro origin(it) -%}
+{% if it.source == 'override' %} <span class="badge badge-ok" title="Saved on this page; it wins over config.toml">override</span>{% endif %}
+{%- endmacro %}
+{% macro override_note(it) -%}
+{% if it.shadows_config %}<p class="muted small setting-shadow">config.toml has a different value for this, but the value saved on this page wins.</p>{% endif %}
+{% if it.clearable %}<button class="btn btn-sm" type="button" data-action="settings-clear" data-key="{{ it.key }}">Use config.toml value</button>{% endif %}
+{%- endmacro %}
 {% block content %}
-<p class="muted small">Values saved here are stored as overrides in the database and win over <span class="mono">config.toml</span>. Most take effect after restarting Home SOC. Secrets are never echoed back; leave a secret blank to keep it.</p>
+<p class="muted small">Values saved here are stored as overrides in the database and win over <span class="mono">config.toml</span>. Most take effect after restarting Home SOC. Secrets are never echoed back; leave a secret blank to keep it. To go back to what <span class="mono">config.toml</span> says (for example after rotating a leaked token or webhook there), press <b>Use config.toml value</b> next to that setting and restart.</p>
 <form id="settings-form">
   {% for section, items in sections.items() %}
   <section class="card">
@@ -9,13 +16,13 @@
       {% for it in items %}
       {% set fid = 'set-' ~ it.key|replace('.', '-') %}
       {% if it.type == 'bool' %}
-      <div class="field field-row"><input type="checkbox" id="{{ fid }}" name="{{ it.key }}" data-type="bool"{% if it.value %} checked{% endif %}><label for="{{ fid }}">{{ it.key }}{% if it.source == 'override' %} <span class="badge badge-ok">override</span>{% endif %}</label></div>
+      <div class="field field-row"><input type="checkbox" id="{{ fid }}" name="{{ it.key }}" data-type="bool"{% if it.value %} checked{% endif %}><label for="{{ fid }}">{{ it.key }}{{ origin(it) }}</label>{{ override_note(it) }}</div>
       {% elif it.type == 'secret' %}
-      <div class="field"><label for="{{ fid }}">{{ it.key }}{% if it.set %} <span class="badge badge-ok">set</span>{% endif %}</label><input type="password" id="{{ fid }}" name="{{ it.key }}" data-type="secret" autocomplete="off" placeholder="{{ '(unchanged)' if it.set else '(empty)' }}"></div>
+      <div class="field"><label for="{{ fid }}">{{ it.key }}{% if it.set %} <span class="badge badge-ok">set</span>{% endif %}{{ origin(it) }}</label><input type="password" id="{{ fid }}" name="{{ it.key }}" data-type="secret" autocomplete="off" placeholder="{{ '(unchanged)' if it.set else '(empty)' }}">{{ override_note(it) }}</div>
       {% elif it.type in ('int', 'float') %}
-      <div class="field"><label for="{{ fid }}">{{ it.key }}{% if it.source == 'override' %} <span class="badge badge-ok">override</span>{% endif %}</label><input type="number" id="{{ fid }}" name="{{ it.key }}" data-type="{{ it.type }}" value="{{ it.value }}"{% if it.type == 'float' %} step="any"{% endif %}></div>
+      <div class="field"><label for="{{ fid }}">{{ it.key }}{{ origin(it) }}</label><input type="number" id="{{ fid }}" name="{{ it.key }}" data-type="{{ it.type }}" value="{{ it.value }}"{% if it.type == 'float' %} step="any"{% endif %}>{{ override_note(it) }}</div>
       {% else %}
-      <div class="field"><label for="{{ fid }}">{{ it.key }}{% if it.source == 'override' %} <span class="badge badge-ok">override</span>{% endif %}</label><input type="text" id="{{ fid }}" name="{{ it.key }}" data-type="{{ it.type }}" value="{{ it.value }}"{% if it.type == 'list' %} placeholder="comma-separated"{% endif %}></div>
+      <div class="field"><label for="{{ fid }}">{{ it.key }}{{ origin(it) }}</label><input type="text" id="{{ fid }}" name="{{ it.key }}" data-type="{{ it.type }}" value="{{ it.value }}"{% if it.type == 'list' %} placeholder="comma-separated"{% endif %}>{{ override_note(it) }}</div>
       {% endif %}
       {% endfor %}
     </div>

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from homesoc import db
 from homesoc.models import Device, FindingDraft, ScanResult, Service
 from homesoc.scanners import IS_WINDOWS, cfg_get, discovery, nmap_xml, run_command, services
-from homesoc.util import utcnow_iso
+from homesoc.util import device_text, utcnow_iso
 
 if TYPE_CHECKING:
     import sqlite3
@@ -77,6 +77,16 @@ BANNER_PORTS = frozenset({21, 22, 25, 80, 110, 143, 3306, 6379})
 TLS_PORTS = frozenset({443, 8443})
 _BANNER_BYTES = 256
 _BANNER_TIMEOUT = 1.0
+# device.hostname is LAN-supplied (mDNS): only strict hostname syntax may reach the Host header / SNI,
+# anything else (CRLF, spaces, escapes) would let a device inject headers or a second request.
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9_-]{1,63}(?:\.[A-Za-z0-9_-]{1,63})*\.?")
+
+
+def _safe_hostname(name: str | None) -> str | None:
+    """``name`` when it is a plain DNS hostname of legal length, else None."""
+    if name and len(name) <= 253 and _HOSTNAME_RE.fullmatch(name):
+        return name
+    return None
 NMAP_TIMEOUT_GRACE = 30.0
 
 _SSH_RE = re.compile(r"SSH-[\d.]+-([A-Za-z][\w.-]*?)[_ ]v?(\d[\w.]*)\s*(.*)")
@@ -196,14 +206,26 @@ def _cert_subject(der: bytes) -> dict[str, str]:
                 raw = der[v0:v1]
                 value = raw.decode("utf-16-be", "replace") if vtag == 0x1E else raw.decode("utf-8", "replace")
                 if oid in oids:
-                    out[oids[oid]] = value
+                    out[oids[oid]] = device_text(value, 128)
         return out
     except (IndexError, ValueError):
         return {}
 
 
 def parse_banner(port: int, banner: str) -> dict[str, Any]:
-    """Turn a raw banner into name/product/version/extrainfo; unknown text lands in extrainfo."""
+    """Turn a raw banner into name/product/version/extrainfo; unknown text lands in extrainfo.
+
+    The banner is written by the device, so every field that comes out of it is reduced to one
+    printable line (no CR/LF, escape sequences or bidi overrides) before it is stored.
+    """
+    info = _parse_banner_raw(port, banner)
+    for key, limit in (("product", 80), ("version", 64), ("extrainfo", 120)):
+        if info.get(key) is not None:
+            info[key] = device_text(info[key], limit) or None
+    return info
+
+
+def _parse_banner_raw(port: int, banner: str) -> dict[str, Any]:
     info: dict[str, Any] = {"name": PORT_NAMES.get(port), "product": None, "version": None, "extrainfo": None}
     text = banner.strip()
     if not text:
@@ -238,7 +260,7 @@ def parse_banner(port: int, banner: str) -> dict[str, Any]:
 def _mysql_greeting(data: bytes) -> dict[str, Any]:
     info: dict[str, Any] = {"name": "mysql", "product": "MySQL", "version": None, "extrainfo": None}
     if len(data) > 5 and data[4] == 10:
-        ver = data[5:].split(b"\x00", 1)[0].decode("ascii", "replace")
+        ver = device_text(data[5:].split(b"\x00", 1)[0].decode("ascii", "replace"), 64)
         info["version"] = ver
         if "mariadb" in ver.lower():
             info["product"] = "MariaDB"
@@ -251,6 +273,7 @@ def grab_banner(ip: str, port: int, *, sni: str | None = None, timeout: float = 
     """Read up to 256 bytes from a handful of well-known ports; TLS ports report the cert subject."""
     info: dict[str, Any] = {"name": PORT_NAMES.get(port), "product": None, "version": None,
                             "extrainfo": None, "tunnel": None}
+    sni = _safe_hostname(sni)
     try:
         with socket.create_connection((ip, port), timeout=timeout) as sock:
             sock.settimeout(timeout)

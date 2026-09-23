@@ -18,7 +18,7 @@
     <h1>◉ Home SOC</h1>
     <p>This dashboard is protected by the token from <span class="mono">config.toml</span> (<span class="mono">[web] token</span>).</p>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
-    <form method="get" action="/login">
+    <form method="post" action="/login">
       <div class="field"><label for="token">token</label><input type="password" id="token" name="token" autocomplete="current-password" autofocus required></div>
       <button class="btn btn-primary" type="submit">Sign in</button>
     </form>

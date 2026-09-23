@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 #: a log line. Nicknames are owner-supplied and reach a terminal table and a JSON payload; HTML
 #: escaping belongs to the web layer (double-escaping here would corrupt what it renders), but
 #: a CR/LF in a nickname could forge a row in the CLI's output, so those go.
-_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 MAX_LABEL = 48
 
 #: How many cloud endpoints one device may contribute to the map. The map has to stay readable

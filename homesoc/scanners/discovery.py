@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from homesoc import db
 from homesoc.models import FindingDraft, ScanResult
 from homesoc.scanners import IS_LINUX, IS_MAC, IS_WINDOWS, cfg_get, powershell, run_command
-from homesoc.util import utcnow_iso
+from homesoc.util import device_text, iso_ago, utcnow_iso
 
 if TYPE_CHECKING:
     import sqlite3
@@ -60,6 +60,12 @@ SWEEP_MAX_SECONDS = 60.0          # hard cap on the TCP sweep (SPEC: never longe
 SWEEP_MAX_HOSTS = 1024            # SPEC-GAP: spec is silent on huge CIDRs; cap to /22-sized sweeps
 HOSTNAME_TIMEOUT = 1.0
 OFFLINE_TRUSTED_DAYS = 30
+# MAC churn: a LAN device that answers ARP for unused addresses with a fresh random MAC every
+# sweep would otherwise add ~250 devices (and 500 open findings) per sweep, forever. After the
+# first (baseline) discovery, at most this many new devices are added per sweep and per day;
+# anything past that is reported once as NET-DEV-004 instead of becoming inventory rows.
+MAX_NEW_DEVICES_PER_SWEEP = 32
+MAX_NEW_DEVICES_PER_DAY = 256
 STALE_IP_KEY_PREFIX = "ip:"
 
 _MAC_HEX_RE = re.compile(r"[^0-9a-f]")
@@ -418,6 +424,9 @@ def sweep(
 
 # --------------------------------------------------------------------------- names
 
+_NAME_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
 def resolve_hostnames(ips: Iterable[str], timeout: float = HOSTNAME_TIMEOUT) -> dict[str, str]:
     """Reverse-DNS each IP in parallel, waiting ~1 s total; slow answers are simply dropped."""
     ips = list(dict.fromkeys(ips))
@@ -433,7 +442,10 @@ def resolve_hostnames(ips: Iterable[str], timeout: float = HOSTNAME_TIMEOUT) -> 
                 name = fut.result()[0]
             except (OSError, socket.herror, socket.gaierror):
                 continue
-            if name and not name.replace(".", "").isdigit():
+            # A PTR answer can echo a device-chosen DHCP name: drop control characters (CRLF
+            # injection into banner requests, forged log lines) and absurd lengths outright.
+            if (name and not name.replace(".", "").isdigit() and len(name) <= 254
+                    and not _NAME_CONTROL_CHARS.search(name)):
                 out[futures[fut]] = name.rstrip(".")
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -559,6 +571,42 @@ def _is_first_run(conn: "sqlite3.Connection") -> bool:
     return row is None or int(row["n"]) == 0
 
 
+def _limit_new_devices(conn: "sqlite3.Connection", seen: list["_Seen"], baseline: bool) -> tuple[list["_Seen"], dict | None]:
+    """Keep every known device, and new ones only up to the per-sweep and per-day caps.
+
+    The first discovery is a baseline and is never capped: everything on the network is new then.
+    Returns the hosts to upsert and, when some were held back, the NET-DEV-004 evidence.
+    """
+    if baseline:
+        return seen, None
+    macs = [s.mac for s in seen if not s.is_self]
+    known: set[str] = set()
+    for start in range(0, len(macs), 500):
+        chunk = macs[start:start + 500]
+        marks = ",".join("?" for _ in chunk)
+        known.update(str(r["mac"]) for r in db.query(conn, f"SELECT mac FROM devices WHERE mac IN ({marks})", chunk))
+    new = [s for s in seen if not s.is_self and s.mac not in known]
+    # The baseline sweep's devices all share one first_seen (the oldest one); they are what the
+    # owner already had, so they do not use up today's allowance.
+    row = db.one(conn, "SELECT COUNT(*) AS n FROM devices WHERE first_seen >= ? "
+                       "AND first_seen > (SELECT MIN(first_seen) FROM devices)", (iso_ago(hours=24),))
+    today = int(row["n"]) if row is not None else 0
+    allowance = max(0, min(MAX_NEW_DEVICES_PER_SWEEP, MAX_NEW_DEVICES_PER_DAY - today))
+    if len(new) <= allowance:
+        return seen, None
+    held = {s.mac for s in new[allowance:]}
+    logger.warning("discovery: %d new MAC addresses in one sweep; adding %d, holding back %d (MAC churn?)",
+                   len(new), allowance, len(held))
+    evidence = {
+        "count": len(new),
+        "added": allowance,
+        "skipped": len(held),
+        "added_last_24h": today,
+        "sample": [f"{s.ip} {s.mac}" for s in new[allowance:allowance + 5]],
+    }
+    return [s for s in seen if s.mac not in held], evidence
+
+
 BASELINE_DETAIL = (
     "First inventory: this is the first time Home SOC has looked at your network, so everything it found is "
     "recorded as the starting point rather than reported as an intrusion. Skim the Devices page, name the ones "
@@ -637,7 +685,9 @@ def run(cfg: "Config", conn: "sqlite3.Connection", *, quick: bool = False,
                 method = "tcp"
             info = mdns.get(ip) or {}
             mdns_names = [n for n in info.get("names", []) if n]
-            hostname = names.get(ip) or (mdns_names[0] if mdns_names else None)
+            # Reverse DNS and mDNS names are both chosen by the device: one printable line, at
+            # most a DNS name's length, before it becomes devices.hostname.
+            hostname = device_text(names.get(ip) or (mdns_names[0] if mdns_names else ""), 253) or None
             if is_self and not hostname:
                 hostname = socket.gethostname()
             vendor = _lookup_vendor(mac) if not mac.startswith(STALE_IP_KEY_PREFIX) else None
@@ -652,6 +702,10 @@ def run(cfg: "Config", conn: "sqlite3.Connection", *, quick: bool = False,
                               mdns=info or None, is_self=is_self))
 
         say(f"updating inventory ({len(seen)} hosts)")
+        seen, churn = _limit_new_devices(conn, seen, baseline)
+        if churn is not None:
+            summary["new_devices_skipped"] = churn["skipped"]
+            findings.append(FindingDraft(finding_id="NET-DEV-004", subject=f"network:{network}", evidence=churn))
         for s in seen:
             device_id, is_new, _trusted = _upsert_device(conn, s, now)
             if is_new:

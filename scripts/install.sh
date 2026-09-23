@@ -20,7 +20,9 @@ fi
 # shellcheck disable=SC1091
 . .venv/bin/activate
 echo "[Home SOC] installing dependencies ..."
-python -m pip install -r requirements.txt -q --disable-pip-version-check
+# requirements.txt is the hash-locked lock file (every transitive package, pip included):
+# --require-hashes makes pip refuse anything unpinned, unlisted or whose bytes differ from it.
+python -m pip install --require-hashes -r requirements.txt -q --disable-pip-version-check
 echo "[Home SOC] initialising ..."
 python -m homesoc init "$@"
 chmod +x run.sh 2>/dev/null || true

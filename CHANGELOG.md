@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+A full security audit (2026-09-22) against the threat model in SECURITY.md. Every confirmed issue is fixed
+and its proof of concept re-run against the fixed code. Highlights:
+
+- **DNS resolver**: one LAN device or one slow domain can no longer take DNS down for the house. No shared
+  global rate limit (per-source only; over-limit UDP gets a TC=1 reply that moves the client to TCP), the
+  circuit breaker only opens when the resolver's own canary query fails, failing names and zones are held
+  locally, TCP connections are capped (64 total, 8 per source) with whole-message deadlines, and the query
+  log has per-client budgets and a 2-million-row cap.
+- **Dashboard sign-in**: the cookie is now a random, server-revocable 7-day session, never the token itself.
+  Wrong tokens are rate-limited and logged; the login form posts. Cross-site requests are refused (fetch
+  metadata) even without a token, and no GET changes state: pairing codes and sticker codes are created
+  only by their own buttons.
+- **Lens**: a read-only phone can no longer rebind or erase printed stickers; the HTTPS listener handshakes
+  per connection with timeouts (one idle socket used to freeze it); the phone keeps only a trimmed, 24-hour
+  offline card and wipes it on revocation; sticker captions never print a hostname, IP or MAC; the TLS key
+  gets an owner-only ACL on Windows.
+- **LAN-controlled text**: hostnames, banners, certificate names and UPnP fields are cleaned on the way in,
+  and escaped again for the Markdown report, Discord, RSS, toasts, the terminal and the log.
+- **Scanners**: the UPnP walk only talks to the device that answered, inside your LAN, never loopback;
+  every fetch has a wall-clock deadline; mDNS/SSDP results are capped; a burst of new MAC addresses is
+  capped and reported as `NET-DEV-004`; a scheduler watchdog reports jobs that overrun.
+- **Feeds and APIs**: gzip only where published, inflation capped at the download cap, whole-document
+  feeds have absolute ceilings; redirects are checked hop by hop (https, public addresses only); NVD,
+  VirusTotal and URLhaus never follow redirects (API keys stay put) and read bounded bodies; `dns.lists`
+  only accepts feed names.
+- **Local files**: on Linux/macOS the data folder is 0700 and the database/logs 0600; on Windows a data
+  folder outside your profile gets an owner-only ACL.
+- **Settings**: overrides saved on the Settings page can be cleared ("Use config.toml value", or
+  `python -m homesoc config unset <key>`); clearing or changing `web.token` signs every browser out.
+- **Supply chain**: `requirements.txt` is a hash-locked lock of the whole dependency tree, installed with
+  `--require-hashes`; pytest (>= 9.0.3) is dev-only.
+
 ### Added
 
 **Lens — point your phone at a device.** A phone-sized web app Home SOC serves itself at `/lens`. Point the camera at

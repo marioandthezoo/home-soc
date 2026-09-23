@@ -128,6 +128,96 @@
 
   function token() { return load(TOKEN_KEY) || ''; }
 
+  /* ----------------------------------------------------------- the offline card at rest
+
+     B8 wants the last card back when Home SOC is unreachable, and the only place a phone can
+     keep it is localStorage — on the phone's disk, readable by whoever holds the phone. The
+     service worker already refuses to cache an authenticated response for exactly that reason,
+     so what is kept here is held to the same standard:
+
+     - a trimmed snapshot, not the payload: the name the owner sees, the flags, the headline, the
+       severity counts and the open ports. No MAC, no vendor, no CVE list, no DNS history, no
+       dependency map, no timeline;
+     - it expires: a snapshot older than CARD_TTL_MS is deleted on read, not shown;
+     - it belongs to a pairing: no token, no card. Revocation (the 401 path) and a phone that was
+       never paired both wipe it, so a revoked phone in airplane mode shows the pairing notice,
+       not the last device it looked at.
+
+     A card written by an older lens.js (the full payload, no version) fails the version check
+     and is deleted the first time it is read. */
+  var CARD_VERSION = 2;
+  var CARD_TTL_MS = 24 * 60 * 60 * 1000;
+  var CARD_MAX_SERVICES = 40;
+
+  function cardSnapshot(payload, now) {
+    if (!payload || !payload.device) { return null; }
+    var d = payload.device;
+    var posture = payload.posture || {};
+    var counts = posture.severity_counts || {};
+    var keptCounts = {};
+    SEVERITIES.forEach(function (sev) { if (Number(counts[sev])) { keptCounts[sev] = Number(counts[sev]); } });
+    var services = (payload.services || []).filter(function (s) {
+      return s && (!s.state || String(s.state) === 'open');
+    }).slice(0, CARD_MAX_SERVICES).map(function (s) {
+      return {
+        port: Number(s.port) || 0,
+        proto: s.proto ? String(s.proto) : 'tcp',
+        label: s.label ? String(s.label) : (s.name ? String(s.name) : ''),
+        gloss: s.gloss ? String(s.gloss) : '',
+        risk: s.risk ? String(s.risk) : ''
+      };
+    });
+    return {
+      v: CARD_VERSION,
+      saved_at: Number(now) || 0,
+      device: {
+        id: d.id,
+        /* The one name the card was headed with, in place of the identifiers behind it. */
+        name: String(d.nickname || d.hostname || d.ip || d.mac || 'Unknown device'),
+        kind: d.kind ? String(d.kind) : '',
+        online: Boolean(d.online),
+        trusted: Boolean(d.trusted),
+        last_seen: d.last_seen || ''
+      },
+      posture: {
+        headline: posture.headline ? String(posture.headline) : '',
+        severity_counts: keptCounts,
+        score_contribution: Number(posture.score_contribution) || 0
+      },
+      services: services
+    };
+  }
+
+  function saveCard(payload, now) {
+    if (!token()) { store(CARD_KEY, null); return; }
+    var snap = cardSnapshot(payload, now);
+    store(CARD_KEY, snap ? JSON.stringify(snap) : null);
+  }
+
+  function readCachedCard(now) {
+    var raw = load(CARD_KEY);
+    if (!raw) { return null; }
+    if (!token()) { store(CARD_KEY, null); return null; }
+    var parsed = null;
+    try { parsed = JSON.parse(raw); } catch (e) { parsed = null; }
+    var saved = parsed ? Number(parsed.saved_at) : 0;
+    var age = Number(now) - saved;
+    /* A clock set backwards more than a minute is treated as expired rather than as "fresh
+       forever". */
+    if (!parsed || parsed.v !== CARD_VERSION || !parsed.device || !saved || !(age >= -60000 && age <= CARD_TTL_MS)) {
+      store(CARD_KEY, null);
+      return null;
+    }
+    return parsed;
+  }
+
+  /* Everything this phone kept because it was paired goes when the pairing does. */
+  function forgetPairing() {
+    store(TOKEN_KEY, null);
+    store(CARD_KEY, null);
+    store(IGNORE_KEY, null);
+  }
+
   function request(path, options) {
     options = options || {};
     var headers = { 'Accept': 'application/json', 'X-Requested-With': 'fetch' };
@@ -493,7 +583,7 @@
 
     function onError(err, where) {
       if (err && err.status === 401) {
-        store(TOKEN_KEY, null);
+        forgetPairing();
         state('not paired', 'bad');
         showNotice(
           'This phone is no longer paired',
@@ -545,14 +635,8 @@
       resumeScanning();
     }
 
-    function cachedCard() {
-      try {
-        var raw = load(CARD_KEY);
-        if (!raw) { return null; }
-        var parsed = JSON.parse(raw);
-        return parsed && parsed.device ? parsed : null;
-      } catch (e) { return null; }
-    }
+    /* Trimmed, time-limited and tied to the pairing: see readCachedCard. */
+    function cachedCard() { return readCachedCard(Date.now()); }
 
     /* Is Home SOC actually reachable from here? ``navigator.onLine`` cannot answer that — it is
        true whenever the phone has *a* network, so a phone sitting on the home Wi-Fi with Home
@@ -597,6 +681,9 @@
        already reading. */
     function goOffline() {
       reachable = false;
+      /* An unpaired or revoked phone keeps its pairing notice: dropping off the network is no
+         reason to show it a device card. */
+      if (!token()) { state('not paired', 'bad'); return; }
       if (!card.hidden || !picker.hidden || !unknown.hidden) { state('offline', 'bad'); return; }
       var cached = cachedCard();
       if (cached) { staleDeviceId = cached.device.id; renderCard(cached, { stale: true }); return; }
@@ -621,7 +708,7 @@
       opts = opts || {};
       if (!payload || !payload.device) { return; }
       /* A fresh card is proof the server answered, so it also clears the offline state. */
-      if (!opts.stale) { store(CARD_KEY, JSON.stringify(payload)); staleDeviceId = null; reachable = true; }
+      if (!opts.stale) { saveCard(payload, Date.now()); staleDeviceId = null; reachable = true; }
       stopScanning();
       hideNotice();
       clear(cardBody);
@@ -629,7 +716,7 @@
       var d = payload.device || {};
       var posture = payload.posture || {};
       var counts = posture.severity_counts || {};
-      var name = d.nickname || d.hostname || d.ip || d.mac || 'Unknown device';
+      var name = d.nickname || d.hostname || d.ip || d.mac || d.name || 'Unknown device';
 
       if (opts.stale) {
         cardBody.appendChild(el('p', {
@@ -661,6 +748,24 @@
       /* headline + severity strip */
       if (posture.headline) { cardBody.appendChild(el('p', { className: 'headline', text: String(posture.headline) })); }
       cardBody.appendChild(severityStrip(counts, posture));
+
+      /* The cached card is a trimmed snapshot (readCachedCard): it has no findings, CVEs, DNS or
+         dependency detail to show, and rendering those sections empty would claim "nothing open"
+         about a device Lens simply did not keep the answer for. Say so instead. */
+      if (opts.stale) {
+        cardBody.appendChild(exposedSection(payload.services || []));
+        cardBody.appendChild(el('p', {
+          className: 'sec-empty',
+          text: 'Problems, vulnerabilities, DNS and history are shown only while Home SOC is reachable.'
+        }));
+        cardBody.appendChild(footer(payload, d, true));
+        BODY.classList.add('card-open');
+        show(card, true);
+        cardBody.scrollTop = 0;
+        card.focus();
+        state('offline · cached', 'bad');
+        return;
+      }
 
       /* SPEC C7 calls this the single best use of the dependency map: point the phone at a box
          and learn what the house loses without it. The server has always computed it — and Lens
@@ -1031,7 +1136,7 @@
       return sec;
     }
 
-    function footer(payload, device) {
+    function footer(payload, device, stale) {
       var actions = payload.actions || {};
       var foot = el('div', { className: 'card-foot' });
       var scanAgain = el('button', { className: 'btn btn-primary', text: 'Scan again', attrs: { type: 'button' } });
@@ -1054,7 +1159,7 @@
       }
       if (actions.can_rescan) { action('Rescan now', 'rescan'); }
       if (actions.can_set_trusted) { action(device.trusted ? 'Mark untrusted' : 'Mark trusted', 'set_trusted', { payload: { trusted: !device.trusted } }); }
-      if (!actions.can_rescan && !actions.can_acknowledge && !actions.can_set_trusted) {
+      if (!stale && !actions.can_rescan && !actions.can_acknowledge && !actions.can_set_trusted) {
         foot.appendChild(el('p', { className: 'foot-note', text: 'This phone is paired read-only. Turn on [lens] allow_actions to rescan or acknowledge from here.' }));
       }
       return foot;
@@ -1279,6 +1384,8 @@
 
     /* Boot. No token means this phone has never been paired: say so instead of 401-ing later. */
     if (!token()) {
+      /* Nothing a previous pairing left behind outlives it. */
+      forgetPairing();
       state('not paired', 'bad');
       showNotice(
         'This phone is not paired yet',
@@ -1328,6 +1435,8 @@
     request('/api/lens/claim', { body: { code: code } }).then(function (data) {
       var tok = data && (data.token || data.lens_token);
       if (!tok) { throw new Error('the server did not return a token'); }
+      /* A new pairing starts clean: the last card belonged to whichever token was here before. */
+      forgetPairing();
       store(TOKEN_KEY, tok);
       show(spinner, false);
       text(title, 'This phone is paired');

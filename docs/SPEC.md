@@ -564,7 +564,9 @@ colors critical #e5484d, high #f76b15, medium #ffb224, low #46a758, info #3e63dd
 - `scripts/install.ps1`: same as run.bat steps without run; creates a Startup-folder shortcut to run.bat (no admin);
   prints next steps. `scripts/make-autostart.ps1`: `-Mode startup|task` (task requires admin, uses schtasks at logon, highest).
 - `scripts/enable-lan-dns.ps1` (requires admin): `New-NetFirewallRule -DisplayName "Home SOC DNS" -Direction Inbound -Protocol UDP -LocalPort 53 -Action Allow -Profile Private` (+TCP), prints router instructions.
-- `requirements.txt`: `flask==3.1.3`, `requests==2.34.2`, `dnslib==0.9.26`, `pytest==8.*` (dev).
+- `requirements.txt`: a hash-locked runtime lock generated with pip-compile (`flask==3.1.3`, `requests==2.34.2`,
+  `dnslib==0.9.26`, their whole transitive closure and pip), installed with `--require-hashes`. `pytest>=9.0.3`
+  is only in the pyproject `[dev]` extra, never in a production venv.
 - `pyproject.toml`: name `homesoc`, version 0.1.0, `[project.scripts] homesoc = "homesoc.cli:main"`.
 
 ## 17. Tests (owner: each package owns its test file; fixtures created by the owner)

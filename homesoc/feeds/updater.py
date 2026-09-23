@@ -1,28 +1,37 @@
 """Feed downloader: conditional GET, size-capped streaming, atomic file replace.
 
 Every feed is untrusted input. Downloads are capped at `feeds.max_download_mb`
-(both on the wire and after gzip inflation), written to `<name>.tmp` and only
-then moved into place with os.replace so a crash mid-download can never leave
-a truncated list that the DNS filter would happily load.
+(or the feed's own tighter cap, see FeedSpec.max_bytes) both on the wire and
+after gzip inflation, written to `<name>.tmp` and only then moved into place
+with os.replace so a crash mid-download can never leave a truncated list that
+the DNS filter would happily load.
+
+Redirects are followed by hand, not by requests: every hop must be https and
+must not point at a loopback, private, link-local, CGNAT or multicast address,
+so a compromised feed origin cannot bounce Home SOC into the LAN (blind GET
+SSRF against a router's CGI) or downgrade the download to plain http.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
+import ipaddress
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
-from homesoc.feeds import registry
+from homesoc.feeds import parsers, registry
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +51,12 @@ ERROR_SINCE_KEY = "feeds.error_since."
 FAILURES_KEY = "feeds.failures."
 CHUNK_BYTES = 64 * 1024
 GZIP_MAGIC = b"\x1f\x8b"
-# Inflated size may legitimately exceed the wire size several times over (EPSS
-# csv.gz is ~2.6 MB for ~13 MB of text); 8x still stops decompression bombs.
-INFLATE_FACTOR = 8
+# The inflated file is held to the same cap as the download (never a multiple of it): the
+# parsers and registry loaders hold the whole document in memory, and JSON costs ~25x its size
+# there, so "8x the wire cap" meant a 0.5 MB body could cost ~13 GB of RAM.
+MAX_REDIRECTS = 5
+_REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
+PARSE_DEADLINE_EVERY_LINES = 20000
 
 _LOCK = threading.Lock()
 
@@ -424,14 +436,90 @@ def _mark_error(conn: sqlite3.Connection, name: str, error: str) -> None:
     _set_setting(conn, FAILURES_KEY + name, str(consecutive_failures(conn, name) + 1))
 
 
+def _is_public_ip(value: str) -> bool:
+    """True only for globally routable unicast addresses (no loopback/RFC 1918/link-local/CGNAT/multicast)."""
+    try:
+        ip = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def _check_hop(url: str) -> str:
+    """Validate one request target (the feed URL or a redirect Location); return its hostname.
+
+    Runs without DNS so it also guards the scripted responses tests use. Name resolution is
+    checked separately in _http_get, right before the real connection.
+    """
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as exc:
+        raise FeedError(f"refusing malformed URL {url[:200]!r}") from exc
+    if parts.scheme.lower() != "https":
+        raise FeedError(f"refusing non-https URL {url[:200]!r}")
+    if not host:
+        raise FeedError(f"refusing URL without a host {url[:200]!r}")
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return host  # a name; resolved and checked in _http_get
+    if not _is_public_ip(host):
+        raise FeedError(f"refusing URL pointing at non-public address {host}")
+    return host
+
+
+def _check_resolves_public(host: str) -> None:
+    """Refuse a host name that resolves to any non-public address.
+
+    This runs before the connection and requests resolves again, so a rebinding name could
+    still switch addresses in between. That leaves no usable SSRF: every hop is https with
+    certificate verification, so the request line (path, query) is only ever sent after the
+    peer has proven it holds a publicly trusted certificate for that name.
+    """
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError) as exc:
+        raise FeedError(f"cannot resolve {host}: {exc}") from exc
+    for info in infos:
+        addr = str(info[4][0])
+        if not _is_public_ip(addr):
+            raise FeedError(f"refusing {host}: resolves to non-public address {addr}")
+
+
 def _http_get(url: str, headers: dict[str, str], timeout: tuple[int, int]) -> requests.Response:
-    """Thin wrapper so tests can substitute a fake response without a network."""
-    return requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
+    """One request, redirects not followed (tests substitute a fake response without a network)."""
+    _check_resolves_public(_check_hop(url))
+    return requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=False)
+
+
+def _open(url: str, headers: dict[str, str], deadline: _Deadline) -> requests.Response:
+    """GET `url`, following at most MAX_REDIRECTS redirects, each hop re-validated by _check_hop."""
+    for _hop in range(MAX_REDIRECTS + 1):
+        _check_hop(url)
+        try:
+            resp = _http_get(url, headers, (CONNECT_TIMEOUT_SEC, READ_TIMEOUT_SEC))
+        except requests.RequestException as exc:
+            raise FeedError(f"request failed: {exc}") from exc
+        if resp.status_code not in _REDIRECT_CODES:
+            return resp
+        with resp:  # release the connection; a redirect body is never read
+            location = resp.headers.get("Location")
+        if not location:
+            raise FeedError(f"HTTP {resp.status_code} without a Location header")
+        url = urljoin(url, location.strip())
+        deadline.check("redirects")
+    raise FeedError(f"more than {MAX_REDIRECTS} redirects")
 
 
 def _fetch_one(conn: sqlite3.Connection, spec: registry.FeedSpec, row: Any, max_bytes: int,
                deadline: _Deadline | None = None) -> str:
     deadline = deadline or _Deadline(FEED_MAX_SECONDS)
+    # The feed's own ceiling applies on top of the configured one, on the wire and after gunzip.
+    max_bytes = registry.size_cap(spec, max_bytes) or max_bytes
     headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     etag = _row_get(row, "etag")
     last_modified = _row_get(row, "last_modified")
@@ -441,10 +529,7 @@ def _fetch_one(conn: sqlite3.Connection, spec: registry.FeedSpec, row: Any, max_
     if have_file and last_modified:
         headers["If-Modified-Since"] = str(last_modified)
 
-    try:
-        resp = _http_get(spec.url, headers, (CONNECT_TIMEOUT_SEC, READ_TIMEOUT_SEC))
-    except requests.RequestException as exc:
-        raise FeedError(f"request failed: {exc}") from exc
+    resp = _open(spec.url, headers, deadline)
 
     with resp:
         now = _utcnow_iso()
@@ -473,8 +558,10 @@ def _fetch_one(conn: sqlite3.Connection, spec: registry.FeedSpec, row: Any, max_
         try:
             size, digest = _stream_to_tmp(resp, tmp, max_bytes, deadline)
             if _looks_gzip(tmp):
-                size, digest = _inflate_tmp(tmp, max_bytes * INFLATE_FACTOR, deadline)
-            entries = _count_entries(spec, tmp)
+                if not spec.gzip:
+                    raise FeedError("unexpected gzip body for a feed that is not published gzip'd")
+                size, digest = _inflate_tmp(tmp, max_bytes, deadline)
+            entries = _count_entries(spec, tmp, max_bytes, deadline)
             os.replace(tmp, final)
         finally:
             tmp.unlink(missing_ok=True)
@@ -529,7 +616,10 @@ def _stream_to_tmp(resp: requests.Response, tmp: Path, max_bytes: int, deadline:
 
 
 def _looks_gzip(tmp: Path) -> bool:
-    """Decide by magic bytes, not URL: a mirror may serve the .gz URL pre-inflated (or vice versa)."""
+    """Decide by magic bytes, not URL: a mirror may serve the .gz URL pre-inflated.
+
+    Only feeds declared gzip (FeedSpec.gzip) are then inflated; any other gzip body is refused.
+    """
     with tmp.open("rb") as fh:
         return fh.read(2) == GZIP_MAGIC
 
@@ -563,31 +653,54 @@ def _inflate_tmp(tmp: Path, max_bytes: int, deadline: _Deadline | None = None) -
     return total, sha.hexdigest()
 
 
-def _count_entries(spec: registry.FeedSpec, path: Path) -> int | None:
+def _count_entries(spec: registry.FeedSpec, path: Path, max_bytes: int | None = None,
+                   deadline: _Deadline | None = None) -> int | None:
     """Parse the freshly downloaded file once so the dashboard can show an entry count.
 
     A parse that yields zero entries for a list-type feed is treated as a
     failed download: mirrors sometimes serve an HTML error page with HTTP 200.
+    The file's size is checked against the feed's cap before anything is read,
+    and the feed's wall clock keeps running through the parse.
     """
     if spec.parser is None:
         return None
+    cap = registry.size_cap(spec, max_bytes)
+    size = path.stat().st_size
+    if cap is not None and size > cap:
+        raise FeedError(f"file of {size} bytes exceeds cap of {cap} bytes")
     try:
-        # Line feeds are counted line by line (no read_text + splitlines copy); JSON/CSV feeds
-        # need the whole document but are small.
+        # Line feeds are counted line by line (no read_text + splitlines copy); EPSS is parsed
+        # row by row from the file; JSON feeds need the whole document but are capped small.
         if spec.kind in ("hosts", "domains", "adblock", "ip", "oui"):
-            count = _count_lines_parsed(spec, path)
+            count = _count_lines_parsed(spec, path, deadline=deadline)
+        elif spec.kind == "epss":
+            with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+                count = len(parsers.parse_epss_lines(_deadline_lines(fh, deadline)))
         else:
             text = path.read_text(encoding="utf-8", errors="replace")
             parsed = spec.parser(text)
             count = len(parsed) if hasattr(parsed, "__len__") else sum(1 for _ in parsed)
+    except FeedError:
+        raise
     except Exception as exc:  # noqa: BLE001 - parser errors mean bad content
         raise FeedError(f"parse failed: {type(exc).__name__}: {exc}") from exc
+    if deadline is not None:
+        deadline.check("parse")
     if count == 0:
         raise FeedError("downloaded file contains no entries")
     return count
 
 
-def _count_lines_parsed(spec: registry.FeedSpec, path: Path, batch_lines: int = 20000) -> int:
+def _deadline_lines(lines: Iterable[str], deadline: _Deadline | None) -> Iterator[str]:
+    """Pass lines through, checking the feed's wall clock every PARSE_DEADLINE_EVERY_LINES."""
+    for n, line in enumerate(lines, 1):
+        if deadline is not None and n % PARSE_DEADLINE_EVERY_LINES == 0:
+            deadline.check("parse")
+        yield line
+
+
+def _count_lines_parsed(spec: registry.FeedSpec, path: Path, batch_lines: int = PARSE_DEADLINE_EVERY_LINES,
+                        deadline: _Deadline | None = None) -> int:
     """Feed the line-oriented parsers in batches so a 64 MB list never lives in memory twice."""
     count = 0
     batch: list[str] = []
@@ -597,6 +710,8 @@ def _count_lines_parsed(spec: registry.FeedSpec, path: Path, batch_lines: int = 
             if len(batch) >= batch_lines:
                 count += sum(1 for _ in spec.parser("".join(batch)))  # type: ignore[misc]
                 batch = []
+                if deadline is not None:
+                    deadline.check("parse")
     if batch:
         count += sum(1 for _ in spec.parser("".join(batch)))  # type: ignore[misc]
     return count

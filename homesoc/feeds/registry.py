@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
+from typing import IO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,19 +36,34 @@ class FeedSpec:
     hours: int
     license_note: str = ""
     enabled_default: bool = True
+    # Absolute ceiling for this feed's file (on the wire *and* after gunzip), applied on top of
+    # `feeds.max_download_mb`. Whole-document formats (JSON) cost ~25x their size in RAM when
+    # parsed, so they get a cap sized to the real feed plus headroom rather than the generic one.
+    # 0 = only the configured download cap applies.
+    max_bytes: int = 0
+    # Only a feed published as .gz is inflated. Everything else that starts with the gzip magic
+    # is refused: a 0.5 MB body must never become a 512 MB file the parsers then hold in memory.
+    gzip: bool = False
 
 
-def _spec(name: str, url: str, kind: str, parser: Parser | None, hours: int, note: str, enabled: bool = True) -> FeedSpec:
-    return FeedSpec(name=name, url=url, kind=kind, parser=parser, hours=hours, license_note=note, enabled_default=enabled)
+_MB = 1024 * 1024
+
+
+def _spec(name: str, url: str, kind: str, parser: Parser | None, hours: int, note: str, enabled: bool = True,
+          max_bytes: int = 0, gzip: bool = False) -> FeedSpec:
+    return FeedSpec(name=name, url=url, kind=kind, parser=parser, hours=hours, license_note=note, enabled_default=enabled,
+                    max_bytes=max_bytes, gzip=gzip)
 
 
 FEEDS: dict[str, FeedSpec] = {
     s.name: s
     for s in (
         _spec("kev", "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-              "kev", parsers.parse_kev, 6, "CISA KEV, public domain (US Government work)"),
+              "kev", parsers.parse_kev, 6, "CISA KEV, public domain (US Government work)",
+              max_bytes=16 * _MB),  # ~1.5 MB today
         _spec("epss", "https://epss.empiricalsecurity.com/epss_scores-current.csv.gz",
-              "epss", parsers.parse_epss, 24, "FIRST EPSS, free for non-commercial use with attribution"),
+              "epss", parsers.parse_epss, 24, "FIRST EPSS, free for non-commercial use with attribution",
+              max_bytes=32 * _MB, gzip=True),  # ~13 MB of csv inside ~2.6 MB of gzip today
         _spec("oui", "https://www.wireshark.org/download/automated/data/manuf",
               "oui", parsers.parse_oui, 168, "Wireshark manuf (IEEE OUI data), GPLv2 data file"),
         _spec("oisd_small", "https://small.oisd.nl", "domains", parsers.parse_adblock, 12,
@@ -71,7 +87,8 @@ FEEDS: dict[str, FeedSpec] = {
         _spec("openphish", "https://openphish.com/feed.txt",
               "domains", parsers.parse_urls, 6, "OpenPhish community feed, non-commercial use"),
         _spec("feodo_ips", "https://feodotracker.abuse.ch/downloads/ipblocklist.json",
-              "ip", parsers.parse_feodo, 6, "abuse.ch Feodo Tracker, CC0"),
+              "ip", parsers.parse_feodo, 6, "abuse.ch Feodo Tracker, CC0",
+              max_bytes=8 * _MB),  # JSON, well under 1 MB today
         _spec("spamhaus_drop", "https://www.spamhaus.org/drop/drop.txt",
               "ip", parsers.parse_ips, 24, "Spamhaus DROP, free for non-commercial use"),
     )
@@ -102,23 +119,41 @@ def _signature(path: Path) -> tuple[int, int] | None:
     return (st.st_mtime_ns, st.st_size)
 
 
-def _cached(name: str, path: Path, loader: Callable[[str], Any], empty: Callable[[], Any]) -> Any:
+def size_cap(spec: FeedSpec | None, configured: int | None = None) -> int | None:
+    """The byte ceiling for a feed's file: the tighter of its own cap and the configured download cap."""
+    caps = [c for c in ((spec.max_bytes if spec else 0), configured or 0) if c and c > 0]
+    return min(caps) if caps else None
+
+
+def _cached(name: str, path: Path, loader: Callable[[str], Any], empty: Callable[[], Any],
+            file_loader: Callable[[IO[str]], Any] | None = None) -> Any:
     """Return loader(text) for `path`, reusing the previous result while the file is unchanged.
 
     A missing file yields `empty()` (also cached under a sentinel signature)
     so callers get a consistent type before the first feed update completes.
+    A file larger than the feed's cap is refused *before* it is read (it can only be there if
+    something other than the capped updater put it there), and `file_loader`, when given,
+    parses from the open file line by line instead of from one big string.
     """
     sig = _signature(path) or (-1, -1)
     with _cache_lock:
         entry = _cache.get(name)
         if entry is not None and entry.signature == sig:
             return entry.value
+    cap = size_cap(FEEDS.get(name))
     if sig == (-1, -1):
+        value = empty()
+    elif cap is not None and sig[1] > cap:
+        logger.warning("feed file %s is %d bytes, over the %d byte cap for %s; ignoring it", path, sig[1], cap, name)
         value = empty()
     else:
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-            value = loader(text)
+            if file_loader is not None:
+                with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+                    value = file_loader(fh)
+            else:
+                text = path.read_text(encoding="utf-8", errors="replace")
+                value = loader(text)
         except OSError as exc:
             logger.warning("cannot read feed file %s: %s", path, exc)
             value = empty()
@@ -285,7 +320,7 @@ def load_kev() -> KevCatalog:
 
 
 def load_epss() -> dict[str, float]:
-    return _cached("epss", _path("epss"), parsers.parse_epss, dict)
+    return _cached("epss", _path("epss"), parsers.parse_epss, dict, file_loader=parsers.parse_epss_lines)
 
 
 # -------------------------------------------------------------------- OUI ---

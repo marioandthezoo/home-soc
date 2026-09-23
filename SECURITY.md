@@ -116,11 +116,22 @@ dashboard is exposed and `web.token` is empty.
 set, `homesoc/web/app.py` requires it on **every** route except `/login` and `/static/` — pages get a
 login form with HTTP 401, API routes get `{"ok": false, "error": "unauthorized"}` with 401.
 
-- Accepted as the `homesoc_token` cookie, an `X-Token` header, or `?token=` on a GET.
-- A `?token=` on a GET is immediately turned into a cookie and **redirected to the same URL without
-  it**, so the secret does not linger in the address bar, browser history or `Referer`.
-- The cookie is `HttpOnly`, `SameSite=Strict`, `Secure` when the request arrived over HTTPS, and
-  expires after 30 days.
+- The token itself is accepted only on sign-in (the login form posts it in the body; `?token=` on a
+  GET still works for the links the CLI prints) and as an `X-Token` header for scripts.
+- Signing in creates a **session**: the cookie holds a random session id, never the token. Only a
+  hash of the id is stored. Sessions last 7 days and slide while used; signing out ends the session
+  on the server, and changing `web.token` (in `config.toml` or on the Settings page) signs every
+  browser out. Under `--tls` the cookie is `__Host-homesoc_token` (Secure, host-only).
+- A `?token=` on a GET is immediately turned into a session and **redirected to the same URL without
+  it**, so the secret does not linger in the address bar, browser history or `Referer`. A `?token=`
+  on a navigation that another website started is ignored (neither accepted nor counted), so a
+  web page cannot use wrong tokens to lock you out.
+- The cookie is `HttpOnly` and `SameSite=Strict`.
+- Wrong tokens are **rate-limited**: 10 per source address and 100 in total per 10 minutes, then a
+  15-minute lockout, and a warning in the activity feed. The all-addresses lockout does not apply
+  to this PC's own loopback address (which keeps its per-address limit), so a LAN host cannot lock
+  you out at the desk. A token shorter than 16 characters logs a
+  warning at startup.
 - Comparison uses `hmac.compare_digest`, not `==`.
 
 ### Host-header validation (anti DNS-rebinding)
@@ -157,8 +168,15 @@ whose hostname is `<img src=x onerror=alert(1)>` renders as text (there is a tes
 
 Every `POST`, `PUT`, `PATCH` and `DELETE` must carry the header `X-Requested-With: fetch`, or it is
 rejected with HTTP 403. A browser cannot add a custom header to a cross-origin form submission or a
-simple request without a successful CORS preflight, which the dashboard never grants. All mutating
-endpoints take JSON.
+simple request without a successful CORS preflight, which the dashboard never grants. The only
+plain HTML forms are sign-in and the two Lens "create" buttons (a pairing code, sticker codes);
+those are accepted only when the browser itself says they are same-origin (`Sec-Fetch-Site`, or an
+exact `Origin`). **No GET changes anything**: loading `/lens/pair` or `/lens/stickers` shows the
+page, and minting happens only on its own button.
+
+On top of that, requests that the browser marks as coming from another site (`Sec-Fetch-Site`, or a
+foreign `Origin`) are refused for every `/api/` route and every non-navigation load, even on an
+install without a token, where cookies protect nothing. A plain link to an ordinary page still works.
 
 ### No shell, ever
 
@@ -183,8 +201,14 @@ T0–T3 — a value from config cannot turn into a different flag.
   nothing.
 - **Size cap** from `feeds.max_download_mb` (64 MB default), checked against `Content-Length` before
   the first byte and again on **every 64 KB chunk** — a lying `Content-Length` does not help.
-- **Decompression-bomb cap**: gzip is detected by magic bytes, not by the URL, and inflation is
-  capped at 8× the wire limit.
+- **Decompression-bomb cap**: gzip is accepted only from feeds published gzipped (EPSS), and the
+  inflated file is held to the same cap as the download. Whole-document feeds (KEV, EPSS, Feodo)
+  also have their own absolute ceilings well below the configurable cap, checked before a file is
+  read, and EPSS is parsed row by row.
+- **Redirects are checked hop by hop**: at most 5, every hop must be `https`, and a hop to a
+  loopback, private, link-local, CGNAT or multicast address (or a name resolving to one) is refused.
+  NVD, VirusTotal and URLhaus calls do not follow redirects at all, so an API key header can never
+  be forwarded to another host, and their answers are read with a size cap.
 - **Timeouts everywhere**: 10 s connect, 60 s read, a 180 s wall clock per feed, a 600 s wall clock
   for the whole batch, plus a throughput floor (1 KB/s after a 30 s grace) so a server that trickles
   one byte at a time cannot hold the scheduler thread hostage.
@@ -218,8 +242,21 @@ T0–T3 — a value from config cannot turn into a different flag.
 - **Not an open resolver.** Queries from any address that is not private, loopback or link-local are
   dropped without an answer. A port-forward to 53 or a spoofed victim address gets nothing back, so
   the host cannot be used as a DNS reflector.
-- **Rate limits** as a second amplification guard: 300 queries/second per client and 3000/second
-  globally; over the limit, the packet is dropped rather than answered.
+- **Rate limits per source**, never shared: 300 queries/second per client, with separate UDP and TCP
+  budgets. Over the limit a UDP query gets a bare TC=1 reply no larger than the query, so a victim
+  whose address is being forged falls back to TCP (which cannot be forged) instead of losing DNS.
+  The global ceiling (3000/second) applies only to UDP answers larger than 512 bytes, which are
+  truncated rather than dropped. One device can no longer use up a bucket everyone shares.
+- **One bad name cannot take DNS down for the house.** A query that fails upstream no longer opens
+  the circuit breaker; the breaker opens only if the resolver's own canary query (`. NS`) fails too.
+  A failing name is answered SERVFAIL locally for 5 s, a zone that keeps failing is held for 30 s,
+  and upstream work in flight is capped per client (32), per zone (32) and in total (1024).
+- **TCP connections are bounded**: 64 in total and 8 per source, a 10 s wait for the first byte,
+  5 s for a whole message, 120 s and 100 queries per connection. Non-local sources are refused
+  before a thread is started.
+- **The query log has budgets**: 600 rows per client and 30,000 in total per minute (queries over
+  budget are still answered, just not written), names are truncated, and the table is capped at
+  2 million rows, oldest first.
 - **Response size is clamped to 1232 bytes** regardless of what the client's EDNS advertises. Larger
   answers set TC=1, forcing the client to retry over TCP — which a spoofed source cannot complete.
 - **`ANY` queries and non-IN classes are refused** outright.
@@ -228,6 +265,21 @@ T0–T3 — a value from config cannot turn into a different flag.
   against it.
 - The UDP socket sets `SIO_UDP_CONNRESET` on Windows so a single ICMP port-unreachable cannot kill
   the listener.
+
+### Text from the network is made harmless on the way in
+
+Hostnames (reverse DNS and mDNS), service banners, certificate names and UPnP port-mapping fields
+are chosen by the devices that send them. Where they enter the inventory they are reduced to one
+printable line (control characters, line breaks, terminal escapes and bidi overrides removed) and
+capped in length; a UPnP "internal client" must be an IPv4 address. On the way out they are escaped
+again for each format: HTML, the Markdown report, Discord Markdown, RSS/toast XML, the terminal (CLI
+output shows control characters as `\xNN`) and the log (a message is always one line). The
+Windows toast never splices alert text into PowerShell source: the toast XML is passed as base64,
+because PowerShell also treats typographic quotes (U+2018-U+201B) as string delimiters. A discovery
+sweep adds at most 32 new devices (256 a day) after the first one, and reports a burst as
+`NET-DEV-004`, so a device inventing MAC addresses cannot flood the inventory. The UPnP/IGD walk
+only talks to the device that answered, inside your LAN range, never to loopback or link-local
+addresses, and every fetch has a wall-clock deadline.
 
 ### Least privilege, and exactly what needs admin
 
@@ -302,10 +354,12 @@ dashboard from your phone on the same Wi-Fi:
 2. **Bind to one interface, not all of them.** If you know this machine's LAN address, put that in
    `web.host` instead of `0.0.0.0`. It will not then be reachable over a VPN interface or a second
    NIC you forgot about.
-3. **Do not port-forward it, and do not expose it to the internet.** There is no HTTPS, no rate
-   limiting on login, no account lockout, and it is a Flask development server. It is not built to
-   survive the open internet, and it holds a map of your house. If you need remote access, use a VPN
-   (WireGuard, Tailscale) or an SSH tunnel and leave the dashboard on loopback.
+3. **Do not port-forward it, and do not expose it to the internet.** Wrong tokens are rate-limited
+   and `--tls` serves HTTPS with a self-signed certificate, but it is still a small built-in server
+   (TLS handshakes run per connection with a 10 s timeout, and idle connections close after 120 s).
+   It is not built to survive the open internet, and it holds a map of your house. If you need
+   remote access, use a VPN (WireGuard, Tailscale) or an SSH tunnel and leave the dashboard on
+   loopback.
 4. **If you must terminate TLS, put a reverse proxy in front.** Keep Home SOC on `127.0.0.1` and let
    the proxy listen on the LAN. Note that the Host-header allowlist is built from this machine's own
    names and addresses — a proxy presenting a different `Host` will be refused with HTTP 400, so
@@ -318,8 +372,16 @@ dashboard from your phone on the same Wi-Fi:
    everyday account is an Administrator. That is good advice generally, and it also limits what an
    attacker who reaches the dashboard could do next.
 7. **Back up `data/` the way you back up documents, and encrypt the backup.** It is your network
-   inventory and DNS history.
-8. **Firewall the resolver deliberately.** `scripts/enable-lan-dns.ps1` creates the inbound rule for
+   inventory and DNS history. Home SOC keeps it private to you on the machine itself: on Linux and
+   macOS the data folder is `0700` and the database, its WAL and the logs are `0600` (existing
+   installs are tightened on the next start); on Windows, a data folder outside your user profile
+   gets an owner + SYSTEM + Administrators ACL, and the Lens TLS key and certificate always get an
+   explicit owner + SYSTEM ACL.
+8. **Rotating a secret that was typed into the Settings page.** Values saved there win over
+   `config.toml`. Press **Use config.toml value** next to the setting (or run
+   `python -m homesoc config unset <key>`) and restart; clearing `web.token` also signs every
+   browser out.
+9. **Firewall the resolver deliberately.** `scripts/enable-lan-dns.ps1` creates the inbound rule for
    the Private profile only. If you never intend other devices to use the resolver, do not create the
    rule at all, or set `dns.listen = "127.0.0.1"`.
 
@@ -327,7 +389,7 @@ dashboard from your phone on the same Wi-Fi:
 
 ## 6. Dependencies and supply chain
 
-Home SOC runs on **three pinned third-party packages**, and nothing else:
+Home SOC runs on **three direct third-party packages** (plus `cryptography`, only if you use Lens):
 
 ```
 flask==3.1.3
@@ -335,22 +397,23 @@ requests==2.34.2
 dnslib==0.9.26
 ```
 
-`pytest>=8,<9` is a development-only extra. Everything else is the Python standard library. There is
-no JavaScript build, no `node_modules`, no bundler, no minifier, no CDN — `homesoc/web/static/`
-contains three hand-written files that ship as source.
+`pytest>=9.0.3,<10` is a development-only extra and is never installed into a production venv.
+Everything else is the Python standard library. There is no JavaScript build, no `node_modules`, no
+bundler, no minifier, no CDN — `homesoc/web/static/` contains hand-written files that ship as source.
 
-- **Exact pins, not ranges.** `requirements.txt` and `pyproject.toml` agree. An upgrade is a commit
-  you can review, not something that happens on a Tuesday because a mirror changed.
-- **No install-time scripts.** The build backend is plain `setuptools>=69` with a declarative
-  `pyproject.toml`. There is no `setup.py`, no `build` hook, no post-install step, no compilation
-  step. `pip install` runs no project code.
-- **Pure Python, no native extensions.** Nothing needs a compiler; there is no wheel with a shared
-  library in it.
+- **A hash-locked lock file.** `requirements.txt` pins the whole transitive closure (and pip itself)
+  to exact versions with the SHA-256 of every published file, generated with pip-compile. Every
+  launcher installs it with `pip install --require-hashes`, so pip refuses anything unpinned or any
+  file whose bytes differ from the lock.
+- **No install-time scripts.** The build backend is plain `setuptools>=77` with a declarative
+  `pyproject.toml`. There is no `setup.py`, no `build` hook, no post-install step. `pip install`
+  runs no project code.
 - **Small transitive surface.** Flask brings Werkzeug, Jinja2, MarkupSafe, click, itsdangerous and
   blinker; requests brings urllib3, certifi, idna and charset-normalizer; dnslib brings nothing.
-- **The launchers only install what is pinned.** `run.bat` / `run.sh` create `.venv`, then run
-  `pip install -r requirements.txt` only when the hash of `requirements.txt` changed. They do not
-  fetch anything else and never install into the system Python.
+  MarkupSafe and charset-normalizer install compiled wheels, and those are hash-pinned too.
+- **Updates reach existing installs.** `run.bat` / `run.sh` reinstall whenever the hash of
+  `requirements.txt` changes, and a lock bump changes it. They do not fetch anything else and never
+  install into the system Python.
 - **Feeds are data, not code.** The definitions Home SOC downloads are blocklists, CSVs and JSON.
   Nothing downloaded at runtime is ever executed, imported, or used to construct a path or a command
   line. See §3 for how those downloads are bounded.

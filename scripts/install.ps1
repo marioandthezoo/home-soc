@@ -93,7 +93,9 @@ if (-not (Test-Path $venvPython)) {
 if (-not (Test-Path $venvPython)) { throw "virtual environment is missing $venvPython" }
 
 Write-Host "[Home SOC] installing dependencies ..."
-& $venvPython -m pip install -r (Join-Path $root "requirements.txt") -q --disable-pip-version-check
+# requirements.txt is the hash-locked lock file (every transitive package, pip included):
+# --require-hashes makes pip refuse anything unpinned, unlisted or whose bytes differ from it.
+& $venvPython -m pip install --require-hashes -r (Join-Path $root "requirements.txt") -q --disable-pip-version-check
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
 Write-Host "[Home SOC] initialising data directory, config and database ..."

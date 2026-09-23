@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 import sqlite3
 from typing import Any
 
@@ -273,13 +274,9 @@ def _coverage(conn: sqlite3.Connection) -> dict:
         for f in feeds
         if not f.get("last_updated") or (f.get("age_hours") is not None and f["age_hours"] > FEED_STALE_HOURS)
     ]
-    since = api.cutoff_iso(24)
-    dns_agg = api.one(
-        conn,
-        "SELECT count(*) AS total, sum(action='block') AS blocked, count(DISTINCT client) AS clients "
-        "FROM dns_queries WHERE ts>=?",
-        (since,),
-    ) or {}
+    # Mostly from the hourly rollup, like the dashboard's own DNS cards: a day of raw query rows
+    # can run to millions when one device floods the resolver, all read under the shared lock.
+    dns_agg = api.dns_window_counts(conn, 24)
     total = int(dns_agg.get("total") or 0)
     blocked = int(dns_agg.get("blocked") or 0)
     return {
@@ -384,10 +381,38 @@ def remediation_report_json(conn: sqlite3.Connection, *, days: int = 30) -> dict
 # --------------------------------------------------------------------------- markdown
 
 
+#: C0/C1 controls (newlines included) and the bidi overrides that can reorder what a reader sees.
+_MD_CONTROL = re.compile("[\\x00-\\x1f\\x7f-\\x9f\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]+")
+#: What means something inline in CommonMark/GFM: emphasis, code spans, links and images (an
+#: escaped ``[`` cannot open one), raw HTML and autolinks, table cells, strikethrough.
+_MD_META = re.compile(r"([\\`*_\[\]<>|~])")
+#: What would start a heading, list, quote or rule at the beginning of a line.
+_MD_LINE_START = re.compile(r"^(\s*)(\d+)([.)])|^(\s*)([-+=>#])")
+
+
+def _md_text(value: Any, *, line_start: bool = False) -> str:
+    """Any text that is not a constant of this module, made inert for a Markdown renderer.
+
+    Finding titles, details, device names and the remediation steps (catalog templates with
+    evidence filled in) all carry strings a LAN device chose: its mDNS name, a UPnP mapping
+    description, a Server banner. The catalog itself is plain text (``admin page > Firmware``,
+    ``<this-pc>``), not Markdown, so escaping all of it is also what renders it as written.
+    Control characters and line breaks collapse to one space, so a value can never start a
+    line of its own — no forged heading, list or "How to fix it" section — and every Markdown
+    and HTML metacharacter is backslash-escaped, so no link, image, code span or tag survives.
+    ``line_start`` also neutralises what only matters at the beginning of a line.
+    """
+    text = _MD_CONTROL.sub(" ", str(value if value is not None else "")).strip()
+    text = _MD_META.sub(r"\\\1", text)
+    if line_start:
+        text = _MD_LINE_START.sub(lambda m: f"{m.group(1)}{m.group(2)}\\{m.group(3)}" if m.group(2)
+                                  else f"{m.group(4)}\\{m.group(5)}", text, count=1)
+    return text
+
+
 def _md_escape(value: Any) -> str:
-    """Keep table pipes and line breaks from breaking the document; the report is plain text,
-    so nothing else needs escaping."""
-    return str(value if value is not None else "").replace("|", "\\|").replace("\n", " ").strip()
+    """A table cell: :func:`_md_text` already escapes the ``|`` that would end the cell."""
+    return _md_text(value)
 
 
 def _md_table(headers: list[str], rows_: list[list[Any]]) -> list[str]:
@@ -475,25 +500,30 @@ def remediation_report_markdown(conn: sqlite3.Connection, *, days: int = 30) -> 
         lines.append("_Nothing is open. Everything Home SOC found has been fixed, acknowledged or suppressed._")
         lines.append("")
     for i, item in enumerate(s["open_worklist"], start=1):
-        where = item.get("device_name") or item["subject"]
-        lines.append(f"### {i}. [{item['severity'].upper()}] {item['title']}")
+        # Every value below can carry text a LAN device chose (see _md_text); only the structure
+        # around it — headings, list markers, "How to fix it" — is this module's own.
+        where = _md_text(item.get("device_name") or item["subject"])
+        severity = _md_text(str(item["severity"]).upper())
+        finding_id = re.sub(r"[^A-Za-z0-9._-]", "", str(item["finding_id"]))
+        lines.append(f"### {i}. [{severity}] {_md_text(item['title'])}")
         lines.append("")
         lines.append(
-            f"- Affects: {where}  \n- Finding ID: `{item['finding_id']}`  \n"
-            f"- Open for {item['age_days']} days · seen {item['occurrences']}×"
+            f"- Affects: {where}  \n- Finding ID: `{finding_id}`  \n"
+            f"- Open for {_md_text(item['age_days'])} days · seen {_md_text(item['occurrences'])}×"
         )
         if item["detail"]:
             lines.append("")
-            lines.append(str(item["detail"]))
+            lines.append(_md_text(item["detail"], line_start=True))
         if item["remediation"]:
             lines.append("")
             lines.append("**How to fix it**")
             lines.append("")
             for n, step in enumerate(item["remediation"], start=1):
-                lines.append(f"{n}. {step}")
-        if item["refs"]:
+                lines.append(f"{n}. {_md_text(step)}")
+        refs = [str(r) for r in item["refs"] if re.fullmatch(r"https?://[^\s<>]+", str(r))]
+        if refs:
             lines.append("")
-            lines.append("References: " + ", ".join(f"<{r}>" for r in item["refs"]))
+            lines.append("References: " + ", ".join(f"<{r}>" for r in refs))
         lines.append("")
 
     lines.append("## Coverage — what was actually checked")
@@ -534,7 +564,7 @@ def remediation_report_markdown(conn: sqlite3.Connection, *, days: int = 30) -> 
         lines.append("## Not checked")
         lines.append("")
         for note in s["notes"]:
-            lines.append(f"- {note}")
+            lines.append(f"- {_md_text(note)}")
         lines.append("")
 
     lines.append("---")

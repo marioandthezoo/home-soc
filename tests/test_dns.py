@@ -143,7 +143,7 @@ class FakeSession:
     def _mount(self, prefix, adapter):
         self.mounts.append(prefix)
 
-    def get(self, url, headers=None, timeout=None):
+    def get(self, url, headers=None, timeout=None, **kwargs):  # stream/allow_redirects since the redirect fix
         self.headers_seen.append(dict(headers or {}))
         self.calls.append(("GET", url))
         if self.fail:
@@ -153,7 +153,7 @@ class FakeSession:
             return FakeResponse(200, {"data": {"attributes": {"last_analysis_stats": self.vt[domain]}}})
         return FakeResponse(404, {})
 
-    def post(self, url, data=None, headers=None, timeout=None):
+    def post(self, url, data=None, headers=None, timeout=None, **kwargs):
         self.headers_seen.append(dict(headers or {}))
         self.calls.append(("POST", url))
         if self.fail:
@@ -499,7 +499,13 @@ def test_server_malformed_and_rate_limit(server):
     q = DNSRecord.question("ads.example.com").pack()
     server.ratelimit = _RateLimiter(max_qps=5)
     results = [server.handle_query(q, "10.9.9.9") for _ in range(10)]
-    assert sum(1 for r in results if r is None) >= 5
+    # Over the per-client limit a UDP query no longer vanishes: it gets a bare TC=1 "slip"
+    # reply (no answers, never larger than the query), so a victim whose address is being
+    # forged falls back to TCP instead of losing DNS.
+    parsed = [DNSRecord.parse(r) for r in results if r is not None]
+    slipped = [p for p in parsed if p.header.tc]
+    assert len(slipped) >= 5 and all(not p.rr for p in slipped)
+    assert all(len(r) <= len(q) for r in results if r is not None and DNSRecord.parse(r).header.tc)
 
 
 def test_server_nxdomain_mode_and_servfail(conn, lists_dir):

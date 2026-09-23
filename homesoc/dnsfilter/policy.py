@@ -170,20 +170,57 @@ def _feeds_dir() -> Path:
         return here.parents[2] / "data" / "feeds"
 
 
+# A list name becomes part of a file path, so it is held to the feed registry's naming: lowercase
+# letters, digits, '_' and '-'. No dot, separator, drive letter or UNC prefix can reach the filesystem
+# (``../../x``, ``C:\x`` and ``//host/share/x`` all used to be joined onto the feeds folder, turning
+# any readable file into a blocklist and making Windows authenticate to the named SMB server).
+_LIST_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def valid_list_name(name: str, list_dir: Path | None = None) -> bool:
+    """True when ``name`` may be used as a ``dns.lists`` entry.
+
+    With the real feeds folder (``list_dir`` None) the name must also be a feed in
+    ``homesoc.feeds.registry``; an explicit ``list_dir`` (tests, tools) only needs the grammar.
+    """
+    if not isinstance(name, str) or not _LIST_NAME_RE.match(name):
+        return False
+    if list_dir is not None:
+        return True
+    try:
+        from homesoc.feeds import registry  # type: ignore
+    except Exception:  # registry unavailable: the grammar alone already keeps the path in the folder
+        return True
+    return name in registry.FEEDS
+
+
+def _is_within(path: Path, base: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(base.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def find_list_file(name: str, list_dir: Path | None = None) -> Path | None:
-    """Locate a feed's on-disk file: the feeds package's ``feed_path`` first, then common names."""
+    """Locate a feed's on-disk file: the feeds package's ``feed_path`` first, then common names.
+
+    Only valid list names are looked up (see ``valid_list_name``), and a candidate must resolve to a
+    file inside the feeds folder, so a symlink planted there cannot point the policy elsewhere.
+    """
+    if not valid_list_name(name, list_dir):
+        return None
     if list_dir is None:
         try:
             from homesoc.feeds import updater  # type: ignore
 
             p = Path(updater.feed_path(name))
-            if p.exists():
+            if p.is_file() and _is_within(p, p.parent):
                 return p
         except Exception:
             pass
     base = list_dir if list_dir is not None else _feeds_dir()
     for candidate in (base / name, base / f"{name}.txt", base / f"{name}.list", base / f"{name}.hosts"):
-        if candidate.is_file():
+        if candidate.is_file() and _is_within(candidate, base):
             return candidate
     return None
 
@@ -231,6 +268,9 @@ class Policy:
         conn: sqlite3.Connection | None = None,
     ) -> None:
         self.list_names = [n for n in list_names if n]
+        for n in self.list_names:
+            if not valid_list_name(n, list_dir):
+                logger.warning("ignoring DNS list name %r: not a feed from the registry", str(n)[:80])
         self.never_block: frozenset[str] = frozenset(NEVER_BLOCK_SUFFIXES | {normalize_name(n) for n in never_block if n})
         self.min_malicious_votes = max(1, int(min_malicious_votes))
         self.reputation_ttl_hours = float(reputation_ttl_hours)
@@ -363,6 +403,9 @@ class Policy:
             path, mtime = located[name]
             st.path, st.mtime = path, mtime
             if path is None:
+                if not valid_list_name(name, self.list_dir):
+                    st.loaded, st.entries, st.error = False, 0, "invalid list name (must be a feed from the registry)"
+                    continue
                 st.loaded, st.entries, st.error = False, 0, "file not found"
                 logger.warning("DNS blocklist %r has no downloaded file yet", name)
                 continue

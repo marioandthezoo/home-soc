@@ -291,8 +291,11 @@ class FakeSession:
         self.responses = list(responses)
         self.calls = []
 
-    def get(self, url, params=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+    def get(self, url, params=None, headers=None, timeout=None, **kwargs):
+        # enrich._fetch now streams (stream=True) and refuses redirects (allow_redirects=False);
+        # record them so a test can see the call shape, but keep the old keys unchanged.
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout,
+                           **kwargs})
         if not self.responses:
             raise AssertionError("unexpected extra NVD request")
         item = self.responses.pop(0)

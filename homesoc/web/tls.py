@@ -149,7 +149,21 @@ def ensure_cert(hosts: list[str], *, days: int = DEFAULT_DAYS, force: bool = Fal
     cert_path, key_path = cert_paths()
     reason = _regeneration_reason(cert_path, key_path, hosts, force=force)
     if reason is None:
-        logger.debug("reusing existing certificate %s", cert_path)
+        exposed = _key_exposure(key_path)
+        if exposed is None:
+            logger.debug("reusing existing certificate %s", cert_path)
+            return cert_path, key_path
+        # The key sat in a folder whose ACL other local accounts inherit (a copy under C:\ gives
+        # BUILTIN\Users read and Authenticated Users modify). Anyone who read it can impersonate
+        # this server to a paired phone with the very fingerprint the owner verified, and anyone
+        # who replaced it chose that fingerprint. Neither is fixed by tightening the ACL now.
+        try:
+            logger.warning("replacing the Lens certificate: %s", exposed)
+            _generate(cert_path, key_path, hosts, days=days)
+        except TlsUnavailable:
+            logger.warning("cannot regenerate without 'cryptography'; restricting the existing key to this account")
+            _protect_windows_file(key_path)
+            _protect_windows_file(cert_path)
         return cert_path, key_path
     logger.info("generating Lens certificate (%s)", reason)
     _generate(cert_path, key_path, hosts, days=days)
@@ -224,7 +238,10 @@ def _generate(cert_path: Path, key_path: Path, hosts: Iterable[str], *, days: in
         encryption_algorithm=serialization.NoEncryption(),
     )
     _write_private(key_path, key_bytes)
-    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    # The certificate is public, but it must not be replaceable: the fingerprint the owner checks
+    # on the phone is whatever this file says, so another account swapping in its own pair (the
+    # key file is re-created above, the certificate would not be) would pass that check.
+    _write_private(cert_path, certificate.public_bytes(serialization.Encoding.PEM))
     logger.info(
         "wrote %s (%d name(s), %d address(es), valid %d days, SHA-256 %s)",
         cert_path, len(names), len(addresses), days, cert_fingerprint_sha256(cert_path),
@@ -232,10 +249,13 @@ def _generate(cert_path: Path, key_path: Path, hosts: Iterable[str], *, days: in
 
 
 def _write_private(path: Path, data: bytes) -> None:
-    """Write the key so only this account can read it, where the OS can express that.
+    """Write the file so only this account can read or change it.
 
-    On Windows the file inherits the data directory's ACL; ``docs/LENS_SETUP.md`` says so
-    rather than pretending ``chmod`` did something.
+    POSIX: mode 0600. Windows: ``os.open``'s mode and ``chmod`` only toggle the read-only
+    attribute, so the file would otherwise keep whatever ACL the folder hands down — private
+    under the user profile, but readable by every local account in a copy under ``C:\\``. The
+    empty file gets an explicit, non-inherited ACL (this account and SYSTEM) *before* the key
+    bytes go into it, so there is no moment at which another account could read them.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -243,13 +263,99 @@ def _write_private(path: Path, data: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
     handle = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
     try:
+        if os.name == "nt" and not _protect_windows_file(path):
+            raise OSError(f"could not restrict {path} to this account; refusing to write a private key into it")
         os.write(handle, data)
-    finally:
+    except BaseException:
         os.close(handle)
+        handle = -1
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        if handle != -1:
+            os.close(handle)
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError as exc:  # pragma: no cover - platform dependent
         logger.debug("could not restrict permissions on %s: %s", path, exc)
+
+
+# ------------------------------------------------------------------ Windows ACLs
+
+
+def _system32(tool: str) -> str:
+    """Absolute path of a System32 tool, so a planted ``icacls.exe`` in the CWD or PATH never runs."""
+    return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / tool)
+
+
+def _current_user_sid() -> str | None:
+    from homesoc import util
+
+    rc, out, _err = util.run_cmd([_system32("whoami.exe"), "/user", "/fo", "csv", "/nh"], timeout=15)
+    if rc != 0:
+        return None
+    sids = re.findall(r"S-1-[0-9-]+", out)
+    return sids[-1] if sids else None
+
+
+def _protect_windows_file(path: Path) -> bool:
+    """Replace ``path``'s inherited ACL with full control for this account and SYSTEM only.
+
+    True on success, and always True off Windows (the POSIX mode already did the job). SIDs,
+    not account names, so it works on every Windows display language.
+    """
+    if os.name != "nt":
+        return True
+    sid = _current_user_sid()
+    if not sid:
+        logger.warning("cannot determine the current account's SID; %s keeps its inherited permissions", path)
+        return False
+    from homesoc import util
+
+    rc, _out, err = util.run_cmd(
+        [_system32("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F", "/grant:r", "*S-1-5-18:F"],
+        timeout=30,
+    )
+    if rc != 0:
+        logger.warning("could not restrict %s to this account (icacls rc=%d): %s", path, rc, err.strip())
+        return False
+    return True
+
+
+def _inside_user_profile(path: Path) -> bool:
+    profile = os.environ.get("USERPROFILE", "").strip()
+    if not profile:
+        return False
+    try:
+        path.resolve().relative_to(Path(profile).resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _key_exposure(key_path: Path) -> str | None:
+    """Why an existing key can no longer be trusted, or ``None`` when it can.
+
+    A key this module wrote carries an explicit ACL (no ``(I)`` entries in ``icacls``). One that
+    still inherits its permissions came from an older release or from someone else; outside the
+    user profile the folder it inherited from was readable by every local account, so the key
+    must be treated as disclosed. Language-independent: ``(I)`` is not translated.
+    """
+    if os.name != "nt" or not key_path.is_file():
+        return None
+    from homesoc import util
+
+    rc, out, _err = util.run_cmd([_system32("icacls.exe"), str(key_path)], timeout=30)
+    if rc != 0 or "(I)" not in out:
+        return None
+    if _inside_user_profile(key_path):
+        _protect_windows_file(key_path)  # private already; make it explicit so it stays that way
+        return None
+    return (f"{key_path} inherited its permissions from a folder outside your user profile, so other "
+            "accounts on this PC could read or replace it; phones must accept the new certificate once")
 
 
 # ------------------------------------------------------------------ inspection

@@ -163,8 +163,12 @@ Some hardening you get without configuring anything: upstream sockets are `conne
 kernel drops replies from anyone else; outgoing question names are 0x20 case-randomised so an
 off-path spoofer must guess the case pattern as well as the 16-bit ID; queries from public IP
 addresses are dropped outright so the resolver cannot be abused as a DDoS reflector; per-client
-queries are capped at 300/second and the whole server at 3,000/second; and UDP answers are clamped
-to 1232 bytes with anything larger pushed to TCP.
+queries are capped at 300/second (a client over the limit gets a truncated reply that sends it to
+TCP, which a forged address cannot use); the whole-server ceiling of 3,000/second applies only to
+large UDP answers, which are truncated rather than dropped; and UDP answers are clamped to 1232
+bytes with anything larger pushed to TCP. One device cannot use up a limit everyone shares, and one
+slow or failing domain cannot trip the circuit breaker for the whole house: the breaker opens only
+when the resolver's own canary query fails as well.
 
 When *every* path has failed for 60 seconds you get a **NET-DNS-005** finding, and a circuit breaker
 lets only one probe query through every 5 seconds so the LAN fails fast instead of waiting out

@@ -31,6 +31,9 @@ PHONE_PAGES = ["/lens", "/lens/claim"]
 DESK_PAGES = ["/lens/pair", "/lens/stickers"]
 LENS_PAGES = PHONE_PAGES + DESK_PAGES
 XSS_NICKNAME = '<img src=x onerror=alert(1)>'
+#: What a browser sends with the pairing/sticker pages' own "create" form. Minting only happens
+#: on that same-origin POST; a GET of either page never changes anything.
+FORM = {"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}
 
 
 def _now(minutes_ago: float = 0) -> str:
@@ -331,7 +334,7 @@ def test_pair_page_renders_the_qr_and_the_fingerprint(conn, monkeypatch):
     qr_stub(monkeypatch, calls)
     tls_stub(monkeypatch)
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: {"code": "K7QF2M9X", "expires_at": "2026-09-13T10:05:00+00:00"})
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "<svg" in body
     assert calls and calls[0] == "https://192.168.10.5:8443/lens/claim#c=K7QF2M9X"
     assert "/lens/claim#c=K7QF2M9X" in body
@@ -354,7 +357,7 @@ def test_a_wildcard_bind_never_reaches_the_qr_code(conn, monkeypatch):
     monkeypatch.setattr(appmod, "_lan_host", lambda *a, **k: "192.168.10.5")
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: {"code": "K7QF2M9X"})
     # Reached over loopback, so the Host header cannot stand in for the LAN address either.
-    body = client_for(conn).get("/lens/pair", base_url="https://127.0.0.1:8443").data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url="https://127.0.0.1:8443").data.decode()
     assert calls, "a code should still be minted: 0.0.0.0 is a healthy, reachable binding"
     for url in calls:
         assert "0.0.0.0" not in url, url
@@ -366,7 +369,7 @@ def test_pair_page_explains_a_loopback_binding_instead_of_minting(conn, monkeypa
     tls_stub(monkeypatch)
     minted: list = []
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: minted.append(1) or {"code": "NOPE"})
-    body = client_for(conn, host="127.0.0.1").get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn, host="127.0.0.1").post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "check-pill-fail" in body
     assert "0.0.0.0" in body and "enable-lens.ps1" in body
     assert not minted, "a pairing code must not be minted while the preflight is failing"
@@ -386,8 +389,8 @@ def test_pair_page_refuses_to_mint_a_code_over_plain_http(conn, monkeypatch):
                 mint_pairing_code=lambda _conn: minted.append(1) or {"code": "K7QF2M9X"})
     core_db.set_setting(conn, appmod.BIND_SETTING, "0.0.0.0:8787")
     for require_https in (True, False):
-        body = client_for(conn, host="0.0.0.0", require_https=require_https).get(
-            "/lens/pair", base_url="http://192.168.10.5:8787").data.decode()
+        body = client_for(conn, host="0.0.0.0", require_https=require_https).post(
+            "/lens/pair", headers=FORM, base_url="http://192.168.10.5:8787").data.decode()
         assert not minted, f"a code was minted over plain HTTP with require_https={require_https}"
         assert "#c=" not in body
         assert "check-pill-fail" in body
@@ -395,8 +398,8 @@ def test_pair_page_refuses_to_mint_a_code_over_plain_http(conn, monkeypatch):
     # ...and over TLS it mints as usual, with require_https either way.
     for require_https in (True, False):
         minted.clear()
-        body = client_for(conn, host="0.0.0.0", require_https=require_https).get(
-            "/lens/pair", base_url=HTTPS).data.decode()
+        body = client_for(conn, host="0.0.0.0", require_https=require_https).post(
+            "/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
         assert minted and "#c=K7QF2M9X" in body
 
 
@@ -432,7 +435,7 @@ def test_disabling_lens_kills_outstanding_pairing_codes_at_startup(conn):
 
 def test_pair_page_explains_a_missing_certificate(conn, monkeypatch):
     tls_stub(monkeypatch, missing=True)
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "lens cert --regenerate" in body
     assert "check-pill-fail" in body
 
@@ -449,7 +452,7 @@ def test_pair_page_explains_a_missing_cryptography_package(conn, monkeypatch):
             return "/tmp/cert.pem"
 
     stub_module(monkeypatch, "homesoc.web.tls", cert_paths=lambda: (_Path(), _Path()), cert_info=cert_info)
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "install cryptography" in body
     assert "Tailscale" in body
 
@@ -458,14 +461,14 @@ def test_pair_page_warns_when_the_certificate_does_not_cover_the_lan_address(con
     qr_stub(monkeypatch, [])
     tls_stub(monkeypatch, sans=("192.168.99.9",))
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: "ABCD1234")
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "check-pill-warn" in body
     assert "--hosts 192.168.10.5" in body
 
 
 def test_pair_page_survives_a_build_with_no_lens_packages(conn):
     """Half-installed is a real state: the page must explain it, not traceback."""
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "<svg" not in body
     assert "pairing service is not installed" in body or "check-pill-fail" in body
 
@@ -475,7 +478,7 @@ def test_pair_page_counts_paired_phones_when_the_table_exists(conn, monkeypatch)
     conn.execute("CREATE TABLE IF NOT EXISTS lens_tokens(id INTEGER PRIMARY KEY, token_hash TEXT, label TEXT, scopes TEXT, created_at TEXT, revoked_at TEXT)")
     conn.execute("INSERT INTO lens_tokens(token_hash, label, scopes, created_at) VALUES('h','Pixel','read',?)", (_now(),))
     conn.commit()
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "1 of 10 slots" in body
 
 
@@ -491,7 +494,7 @@ def test_qr_markup_that_is_not_svg_is_dropped(conn, monkeypatch):
     stub_module(monkeypatch, "homesoc.web.qr", to_svg=lambda payload, **kw: "<script>alert(1)</script>")
     tls_stub(monkeypatch)
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: "ABCD1234")
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "<script>alert(1)</script>" not in body
 
 
@@ -508,7 +511,7 @@ def test_qr_is_rendered_from_a_matrix_encoder_too(conn, monkeypatch):
     stub_module(monkeypatch, "homesoc.web.qr", to_svg=to_svg, encode=lambda payload: [[1, 0], [0, 1]])
     tls_stub(monkeypatch)
     stub_module(monkeypatch, "homesoc.web.lens_auth", mint_pairing_code=lambda _conn: "ABCD1234")
-    body = client_for(conn).get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn).post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert seen and "<svg" in body
 
 
@@ -527,8 +530,8 @@ def test_sticker_minting_is_passed_through_and_is_stable_across_reprints(conn, m
     stub_module(monkeypatch, "homesoc.web.lens", mint_sticker_codes=mint)
     qr_stub(monkeypatch, [])
     c = client_for(conn)
-    first = c.get("/lens/stickers?which=all").data.decode()
-    second = c.get("/lens/stickers?which=all").data.decode()
+    first = c.post("/lens/stickers?which=all", headers=FORM).data.decode()
+    second = c.post("/lens/stickers?which=all", headers=FORM).data.decode()
     assert asked == [[1, 2], [1, 2]]
     assert first.count("<svg") == 2 and second.count("<svg") == 2
     assert first == second, "reprinting the same sheet must produce the same labels"
@@ -542,9 +545,9 @@ def test_untagged_is_the_default_selection(conn, monkeypatch):
     asked: list = []
     stub_module(monkeypatch, "homesoc.web.lens", mint_sticker_codes=lambda _c, ids: asked.append(sorted(ids)) or {i: f"hs1:{i}" for i in ids})
     c = client_for(conn)
-    c.get("/lens/stickers")
+    c.post("/lens/stickers", headers=FORM)
     assert asked[-1] == [1], "the device that already has a tag must not be reprinted by default"
-    c.get("/lens/stickers?which=all")
+    c.post("/lens/stickers", data={"which": "all"}, headers=FORM)
     assert asked[-1] == [1, 2]
 
 
@@ -552,6 +555,49 @@ def test_sticker_codes_never_carry_network_identifiers(seeded_client, monkeypatc
     body = seeded_client.get("/lens/stickers?which=all").data.decode()
     assert "00:11:22:00:00:01" not in body
     assert "192.168.10.1" not in body
+
+
+def test_loading_the_pages_mints_nothing(conn, monkeypatch):
+    """A GET of /lens/pair or /lens/stickers must not change state: minting a pairing code
+    voids the previous one, and any web page can make the owner's browser GET a URL."""
+    seed(conn)
+    tls_stub(monkeypatch)
+    minted: list = []
+    stub_module(monkeypatch, "homesoc.web.lens_auth",
+                mint_pairing_code=lambda _conn: minted.append("pair") or {"code": "K7QF2M9X"})
+    stub_module(monkeypatch, "homesoc.web.lens",
+                mint_sticker_codes=lambda _c, ids: minted.append("stickers") or {i: f"hs1:{i}" for i in ids})
+    c = client_for(conn)
+    pair = c.get("/lens/pair", base_url=HTTPS).data.decode()
+    sheet = c.get("/lens/stickers?which=all").data.decode()
+    assert minted == []
+    assert "#c=" not in pair and "Show a pairing code" in pair and 'method="post"' in pair
+    assert "Create codes" in sheet and 'method="post"' in sheet
+    # The page's own form does mint.
+    assert "#c=K7QF2M9X" in c.post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
+    assert minted == ["pair"]
+
+
+def test_create_forms_need_a_same_origin_browser(conn, monkeypatch):
+    """The minting POST carries no X-Requested-With (it is a plain form), so it is accepted only
+    when the browser vouches that it is same-origin. Anything else gets the usual 403."""
+    seed(conn)
+    tls_stub(monkeypatch)
+    minted: list = []
+    stub_module(monkeypatch, "homesoc.web.lens_auth",
+                mint_pairing_code=lambda _conn: minted.append(1) or {"code": "K7QF2M9X"})
+    stub_module(monkeypatch, "homesoc.web.lens",
+                mint_sticker_codes=lambda _c, ids: minted.append(2) or {i: f"hs1:{i}" for i in ids})
+    c = client_for(conn)
+    for path in ("/lens/pair", "/lens/stickers"):
+        assert c.post(path, base_url=HTTPS).status_code == 403, path                 # no metadata at all
+        assert c.post(path, base_url=HTTPS, headers={"Origin": "https://evil.example"}).status_code == 403, path
+        assert c.post(path, base_url=HTTPS, headers={"Sec-Fetch-Site": "cross-site"}).status_code == 403, path
+        assert c.post(path, base_url=HTTPS, headers={"Sec-Fetch-Site": "same-site"}).status_code == 403, path
+    assert minted == []
+    assert c.post("/lens/pair", base_url=HTTPS, headers={"Origin": HTTPS}).status_code == 200  # old browser, same origin
+    assert c.post("/lens/stickers", base_url=HTTPS, headers={"X-Requested-With": "fetch"}).status_code == 200
+    assert minted == [1, 2]
 
 
 def test_print_css_sizes_both_label_formats_in_millimetres():
@@ -827,7 +873,7 @@ def test_preflight_believes_the_recorded_bind_over_config(conn, monkeypatch):
     from homesoc import cli
 
     cli.record_bind_state(conn, "0.0.0.0", 8443)
-    body = client_for(conn, host="127.0.0.1").get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn, host="127.0.0.1").post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "check-pill-fail" not in body, "the server is reachable; the preflight must not block"
     assert "#c=K7QF2M9X" in body
 
@@ -841,7 +887,7 @@ def test_preflight_believes_the_recorded_bind_when_it_is_loopback(conn, monkeypa
     from homesoc import cli
 
     cli.record_bind_state(conn, "127.0.0.1", 8443)
-    body = client_for(conn, host="0.0.0.0").get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn, host="0.0.0.0").post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "check-pill-fail" in body
     assert not minted, "no code for an address nothing is listening on"
 
@@ -854,7 +900,7 @@ def test_a_spoofed_host_header_cannot_claim_the_server_is_reachable(conn, monkey
 
     cfg = make_cfg(host="127.0.0.1")
     assert appmod.effective_bind(cfg, conn) == ("127.0.0.1", cfg.web.port)
-    body = client_for(conn, host="127.0.0.1").get("/lens/pair", base_url=HTTPS).data.decode()
+    body = client_for(conn, host="127.0.0.1").post("/lens/pair", headers=FORM, base_url=HTTPS).data.decode()
     assert "check-pill-fail" in body
 
 

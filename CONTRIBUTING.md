@@ -23,12 +23,14 @@ python -m venv .venv
 python3 -m venv .venv
 . .venv/bin/activate
 
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.txt
 python -m pip install -e ".[dev]"
 ```
 
-`requirements.txt` already includes `pytest`. The editable install is optional; it gives you the
-`homesoc` console script, but `python -m homesoc ...` works either way.
+`requirements.txt` is a hash-locked lock of the runtime dependencies (the whole transitive closure
+plus pip), generated with pip-compile; the command to regenerate it is in its header. It does not
+contain `pytest`: the `[dev]` extra installs it (`pytest>=9.0.3`). The editable install also gives
+you the `homesoc` console script, but `python -m homesoc ...` works either way.
 
 Then create a data directory and a config:
 

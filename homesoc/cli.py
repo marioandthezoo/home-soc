@@ -125,6 +125,26 @@ class _StderrHandler(logging.StreamHandler):
         pass
 
 
+class _TerminalSafeFormatter(logging.Formatter):
+    r"""Log lines quote hostnames, banners and UPnP fields that LAN devices choose; show their
+    control characters as ``\xNN`` so a device cannot drive the console (or whoever tails the log)."""
+
+    #: Line breaks inside the *message* itself: a device-supplied value containing one would
+    #: otherwise start what looks like a fresh, genuine log line.
+    _MESSAGE_BREAKS = {"\n": "\\n", "\u2028": "\\u2028", "\u2029": "\\u2029", "\x85": "\\x85"}
+
+    def formatMessage(self, record: logging.LogRecord) -> str:  # noqa: N802 - logging API name
+        text = util.terminal_safe(super().formatMessage(record))
+        for raw, shown in self._MESSAGE_BREAKS.items():
+            text = text.replace(raw, shown)
+        return text
+
+    def format(self, record: logging.LogRecord) -> str:
+        # formatMessage (above) has made the message one line; tracebacks appended after it keep
+        # their line breaks, with any other control characters still made visible.
+        return util.terminal_safe(super().format(record))
+
+
 def setup_logging(level: str = "INFO", *, log_file: Path | None = None) -> None:
     """stderr + rotating file (5 x 2 MB). Re-entrant so tests and `main()` can call it repeatedly."""
     root = logging.getLogger()
@@ -132,7 +152,7 @@ def setup_logging(level: str = "INFO", *, log_file: Path | None = None) -> None:
         if getattr(handler, "_homesoc", False):
             root.removeHandler(handler)
             handler.close()
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
+    fmt = _TerminalSafeFormatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     stream = _StderrHandler()
     stream.setFormatter(fmt)
     stream._homesoc = True  # type: ignore[attr-defined]
@@ -143,6 +163,9 @@ def setup_logging(level: str = "INFO", *, log_file: Path | None = None) -> None:
         rotating.setFormatter(fmt)
         rotating._homesoc = True  # type: ignore[attr-defined]
         root.addHandler(rotating)
+        # Existing installs wrote these 0644; the log names devices, addresses and DNS activity.
+        for log in Path(target).parent.glob(Path(target).name + "*"):
+            paths.restrict_path(log, paths.PRIVATE_FILE_MODE)
     except OSError as exc:
         logger.warning("cannot open log file %s: %s", target, exc)
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -156,8 +179,11 @@ def emit(text: str = "") -> None:
     A stock Windows console is code page 437/850, so an em dash in a report or a feed title
     would otherwise end the command in a UnicodeEncodeError traceback. Text that the console
     cannot represent is degraded, never fatal — ``report --out`` still writes real UTF-8.
+
+    Findings titles and hostnames carry banners and mDNS names that LAN devices choose, so
+    terminal control characters are shown as visible escapes rather than written raw.
     """
-    line = text + "\n"
+    line = util.terminal_safe(text) + "\n"
     stream = sys.stdout
     try:
         stream.write(line)
@@ -562,7 +588,7 @@ def build_jobs(cfg: Config, conn: sqlite3.Connection,
             description="Dependency map, outage history and blast radius"),
         Job("host", hours(cfg.schedule.host_hours), job_host, description="Host posture, Defender, updates, persistence, Wi-Fi"),
         Job("exposure", hours(cfg.schedule.exposure_hours), lambda: scan_exposure(cfg, conn),
-            description="WAN exposure: public IP, InternetDB, UPnP"),
+            description="WAN exposure: public IP, InternetDB, UPnP", budget_sec=10 * 60),
         Job("files", hours(24), lambda: scan_files(cfg, conn), description="Hash and look up new downloads"),
         Job("dns_rollup", hours(1), job_dns_rollup, description="DNS query log rollup and retention"),
         Job("score", hours(1), job_score, description="Record security score and SOC health"),
@@ -571,14 +597,15 @@ def build_jobs(cfg: Config, conn: sqlite3.Connection,
         Job("dns_retry", 5 * 60, job_dns_retry, run_at_start=False, description="Re-bind the DNS resolver after a port conflict"),
         # Manual-only entries so the dashboard's buttons map onto scheduler.run_now().
         Job("quick", 0, lambda: run_scan(cfg, conn, QUICK_STEPS, quick=True), description="Quick scan"),
-        Job("full", 0, lambda: run_scan(cfg, conn, SCAN_STEPS), description="Full scan"),
+        Job("full", 0, lambda: run_scan(cfg, conn, SCAN_STEPS), description="Full scan", budget_sec=3 * 3600),
         Job("device_scan", 0, lambda: run_device_scan(cfg, conn), description="Service scan of one device (dashboard)"),
     ]
     if 0 <= cfg.notify.digest_hour <= 23:
         jobs.append(Job("digest", hours(24), job_digest, run_at_start=False, at_hour=cfg.notify.digest_hour,
                         description="Daily digest notification"))
     if manual_only:
-        jobs = [Job(j.name, 0, j.func, run_at_start=False, at_hour=None, description=j.description) for j in jobs]
+        jobs = [Job(j.name, 0, j.func, run_at_start=False, at_hour=None, description=j.description,
+                    budget_sec=j.budget_sec) for j in jobs]
     return jobs
 
 
@@ -898,19 +925,82 @@ class Runtime:
         db.record_event(self.conn, "info", "cli", "Home SOC stopped")
 
 
+#: Seconds a new HTTPS connection gets to finish its TLS handshake. It runs in the connection's
+#: own thread, so a peer that connects and says nothing only ever ties up itself.
+TLS_HANDSHAKE_TIMEOUT = 10.0
+#: Seconds a connection may sit silent (between keep-alive requests, or mid-request) before it
+#: is closed, so stalled clients cannot hold threads forever. Handler run time does not count.
+CONNECTION_IDLE_TIMEOUT = 120.0
+
+
+def build_tls_context(cert: Path | str, key: Path | str) -> Any:
+    """Server-side TLS context: TLS 1.2 or newer, with the Lens certificate."""
+    import ssl
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(str(cert), str(key))
+    return context
+
+
+def make_dashboard_server(app: Any, host: str, port: int, *, ssl_context: Any = None) -> Any:
+    """The threaded Werkzeug server the dashboard and Lens run on, made safe to face the LAN.
+
+    Werkzeug's own ``ssl_context`` support wraps the *listening* socket, so the TLS handshake of
+    every new connection runs inside ``accept()`` on the single serving thread, with no timeout:
+    one device that opens a TCP connection and never sends a ClientHello froze the dashboard and
+    every paired phone for as long as it liked. Here the listener stays a plain socket, each
+    accepted connection is wrapped with ``do_handshake_on_connect=False``, and the handshake runs
+    in that connection's worker thread under TLS_HANDSHAKE_TIMEOUT. Every connection, plain or
+    TLS, then gets CONNECTION_IDLE_TIMEOUT.
+    """
+    import ssl
+
+    from werkzeug.serving import ThreadedWSGIServer, WSGIRequestHandler
+
+    class _RequestHandler(WSGIRequestHandler):
+        def log_error(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+            if format.startswith("Request timed out"):  # an idle keep-alive closed: routine
+                logger.debug("closed idle connection from %s", self.client_address[0])
+                return
+            super().log_error(format, *args)
+
+    class _DashboardServer(ThreadedWSGIServer):
+        def get_request(self) -> tuple[Any, Any]:
+            sock, address = self.socket.accept()
+            if self.ssl_context is not None:
+                sock = self.ssl_context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+            return sock, address
+
+        def finish_request(self, request: Any, client_address: Any) -> None:
+            if isinstance(request, ssl.SSLSocket):
+                request.settimeout(TLS_HANDSHAKE_TIMEOUT)
+                try:
+                    request.do_handshake()
+                except (OSError, ValueError) as exc:  # timeout, reset, not TLS, bad version
+                    logger.debug("TLS handshake with %s failed: %s", client_address[0], exc)
+                    return
+            request.settimeout(CONNECTION_IDLE_TIMEOUT)
+            super().finish_request(request, client_address)
+
+    server = _DashboardServer(host, port, app, _RequestHandler)
+    server.ssl_context = ssl_context  # read by the request handler for the URL scheme
+    return server
+
+
 def _serve_forever(rt: Runtime, host: str, port: int, *, tls: bool = False) -> int:
     create_app = _lazy("create_app")
     if create_app is None:
         emit("The web package is not available; cannot start the dashboard.")
         return EXIT_ERROR
-    ssl_context: tuple[str, str] | None = None
+    ssl_context: Any = None
     if tls:
         try:
             cert, key = ensure_lens_cert(rt.cfg, host=host)
-        except Exception as exc:  # TlsUnavailable, OSError, or a missing web package
+            ssl_context = build_tls_context(cert, key)
+        except Exception as exc:  # TlsUnavailable, OSError/SSLError, or a missing web package
             emit(str(exc))
             return EXIT_ERROR
-        ssl_context = (str(cert), str(key))
         fingerprint = lens_cert_fingerprint(cert)
         logger.info("HTTPS enabled with %s (SHA-256 %s)", cert, fingerprint or "unknown")
         emit(f"Certificate: {cert}")
@@ -923,11 +1013,11 @@ def _serve_forever(rt: Runtime, host: str, port: int, *, tls: bool = False) -> i
         logger.warning("dashboard bound to %s without web.token - anyone on the LAN can use it", host)
     emit(f"Dashboard: {dashboard_url(rt.cfg, host, port, tls=tls)}  (Ctrl-C to stop)")
     try:
-        app.run(host=host, port=port, threaded=True, use_reloader=False, debug=False,
-                ssl_context=ssl_context)
-    except OSError as exc:
+        server = make_dashboard_server(app, host, port, ssl_context=ssl_context)
+    except (OSError, SystemExit) as exc:  # Werkzeug reports a failed bind as SystemExit(1)
         logger.error("cannot bind dashboard on %s:%d: %s", host, port, exc)
         return EXIT_ERROR
+    server.serve_forever()  # returns on Ctrl-C / SIGTERM and closes the socket itself
     return EXIT_OK
 
 
@@ -1786,6 +1876,51 @@ def cmd_dns_test(ctx: Context) -> int:
     return EXIT_OK
 
 
+def cmd_config(ctx: Context) -> int:
+    """``config overrides`` lists the Settings-page overrides; ``config unset KEY`` removes one so
+    config.toml (or the default) applies again. Needed to rotate a leaked secret that was once
+    entered on the Settings page: while the override exists, editing config.toml changes nothing."""
+    action = str(getattr(ctx.args, "config_command", "") or "")
+    stored = config.overrides(ctx.conn)
+    if action == "overrides":
+        if not stored:
+            emit("no Settings-page overrides: config.toml (and the defaults) apply as written")
+            return EXIT_OK
+        for key in sorted(stored):
+            shown = "***" if key in config.SECRET_KEYS else stored[key]
+            emit(f"{key:34} {shown}")
+        emit("")
+        emit("Remove one with: python -m homesoc config unset <key>")
+        return EXIT_OK
+    if action == "unset":
+        keys = list(getattr(ctx.args, "keys", None) or [])
+        if getattr(ctx.args, "all", False):
+            keys = sorted(stored)
+        if not keys:
+            emit("usage: python -m homesoc config unset <key> [<key> ...] | --all")
+            return EXIT_USAGE
+        status = EXIT_OK
+        for key in keys:
+            if key not in stored:
+                emit(f"{key}: no override stored (nothing to do)")
+                continue
+            config.clear_override(ctx.conn, key)
+            emit(f"{key}: override removed; config.toml applies after a restart")
+            if key == "web.token":
+                try:
+                    from homesoc.web import api as webapi
+
+                    count = webapi.sessions_revoke_all(ctx.conn)
+                    emit(f"  signed out {count} browser session(s) opened with the old token")
+                except Exception as exc:  # the override is gone either way
+                    emit(f"  could not revoke browser sessions: {exc}")
+                    status = EXIT_ERROR
+        db.record_event(ctx.conn, "info", "cli", "config overrides cleared", {"keys": keys})
+        return status
+    emit("usage: python -m homesoc config {overrides|unset}")
+    return EXIT_USAGE
+
+
 COMMANDS: dict[str, Callable[[Context], int]] = {
     "init": cmd_init,
     "update": cmd_update,
@@ -1802,6 +1937,7 @@ COMMANDS: dict[str, Callable[[Context], int]] = {
     "defender": cmd_defender,
     "dns-test": cmd_dns_test,
     "lens": cmd_lens,
+    "config": cmd_config,
     "blast": cmd_blast,
 }
 
@@ -1904,10 +2040,30 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("id", nargs="?", type=int, help="token id from 'lens tokens'")
     q.add_argument("--all", action="store_true", help="revoke every paired phone")
 
+    p = sub.add_parser("config", help="list or remove Settings-page overrides of config.toml")
+    config_sub = p.add_subparsers(dest="config_command", metavar="action")
+    config_sub.required = True
+    config_sub.add_parser("overrides", help="list the values saved on the Settings page (secrets masked)")
+    q = config_sub.add_parser("unset", help="remove Settings-page overrides so config.toml applies again")
+    q.add_argument("keys", nargs="*", metavar="KEY", help="dotted key, e.g. web.token or notify.discord_webhook")
+    q.add_argument("--all", action="store_true", help="remove every override")
+
     q = lens_sub.add_parser("cert", help="show or regenerate the HTTPS certificate")
     q.add_argument("--regenerate", action="store_true", help="replace the certificate even if it is still valid")
     q.add_argument("--hosts", metavar="a,b", help="names/addresses to cover (default: this machine's)")
     return parser
+
+
+def _private_umask() -> None:
+    """POSIX: every file Home SOC creates (database, WAL, logs, feeds, backups) is owner-only.
+
+    Only ever adds bits to the mask, so a stricter umask the owner already chose is kept."""
+    import os
+
+    if os.name == "nt":
+        return
+    previous = os.umask(0o077)
+    os.umask(previous | 0o077)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1924,6 +2080,7 @@ def main(argv: list[str] | None = None) -> int:
         import os
 
         os.environ[paths.ENV_CONFIG] = args.config
+    _private_umask()
     setup_logging(args.log_level or "INFO")
     try:
         conn = db.connect()

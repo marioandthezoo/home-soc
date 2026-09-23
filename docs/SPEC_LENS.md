@@ -100,13 +100,18 @@ acknowledge a finding, set trusted) — `act` is only granted when `lens.allow_a
 
 **Pairing flow.** The desktop dashboard gains `/lens/pair` (requires the normal dashboard auth). It:
 1. checks `web.host` is not loopback-only and that a certificate exists, explaining exactly what to fix if not;
-2. mints a single-use **pairing code** (short, 8 characters, valid 5 minutes, stored in `settings`);
+2. mints a single-use **pairing code** (short, 8 characters, valid 5 minutes, stored in `settings`) when the owner
+   presses the page's "Show a pairing code" button (a same-origin form POST). A GET never mints, because minting
+   voids the previous code and any web page can make the browser issue a GET;
 3. renders a QR containing `https://<lan-host>:<port>/lens/claim#c=<pairing-code>` plus the certificate fingerprint
    in human-readable form beneath it.
 
 The phone scans it with any camera app, opens the link, is warned once about the self-signed certificate, and lands on
 `/lens/claim`, which POSTs the pairing code to `/api/lens/claim` and receives a long-lived token. The token is stored
 in `localStorage` and sent as `X-Lens-Token` on every subsequent request. The pairing code is consumed on first use.
+For offline use the phone keeps only a trimmed snapshot of the last card (name, kind, headline, severity counts,
+open ports; no MAC, IP, CVEs, DNS or dependencies). It expires after 24 hours, is only shown while a token is
+present, and is wiped with the token when the server answers 401 (which also sends `Clear-Site-Data: "storage"`).
 
 QR generation is **hand-rolled** in `homesoc/web/qr.py` — a small, dependency-free QR encoder (byte mode, error
 correction level M, versions 1–10 are ample for these URLs) returning a matrix, with `to_svg()` and `to_ascii()`

@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import csv
 import ipaddress
-import io
 import json
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -366,10 +365,24 @@ def parse_epss(csv_text: str) -> dict[str, float]:
 
     Percentile is discarded: the matcher only thresholds on the probability.
     """
+    return parse_epss_lines(csv_text.splitlines())
+
+
+def parse_epss_lines(lines: Iterable[str]) -> dict[str, float]:
+    """parse_epss over any iterable of lines (an open file included), one row at a time.
+
+    The EPSS file is ~13 MB; reading it as one string, splitting it and re-joining it held
+    three copies in memory. Iterating keeps only the result dict.
+    """
     scores: dict[str, float] = {}
-    body = "\n".join(line for line in csv_text.splitlines() if not line.startswith("#"))
-    reader = csv.reader(io.StringIO(body))
-    for row in reader:
+    reader = csv.reader(line for line in lines if not line.startswith("#"))
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            break
+        except csv.Error:  # an oversized or malformed row is dropped, not fatal to the list
+            continue
         if len(row) < 2:
             continue
         cve = row[0].strip().upper()

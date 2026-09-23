@@ -9,6 +9,7 @@ DNS does not know.  Two multicast packets, no follow-up probes, no findings.
 from __future__ import annotations
 
 import logging
+import re
 import select
 import socket
 import struct
@@ -38,6 +39,15 @@ QU_IN = 0x8001
 EXTRA_TYPES = ("_http._tcp.local", "_ipp._tcp.local", "_airplay._tcp.local", "_googlecast._tcp.local",
                "_hap._tcp.local", "_smb._tcp.local", "_workstation._tcp.local", "_device-info._tcp.local")
 MAX_PACKET = 9000
+# Everything below is LAN-supplied and ends up in devices.mdns_services / devices.hostname, so one
+# chatty (or hostile) responder must not be able to push megabytes per discovery cycle.
+MAX_FIELD = 256
+MAX_SSDP_PER_HOST = 32
+MAX_NAMES_PER_HOST = 64
+MAX_RESPONDERS = 1024
+# C0/C1 controls, DEL and Unicode line separators never belong in a name or header: they are CRLF
+# injection (the port-80 banner request, logs) or terminal escapes.
+_CONTROL_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 # --------------------------------------------------------------------------- mDNS
@@ -52,15 +62,25 @@ def build_mdns_query() -> bytes:
     return q.pack()
 
 
+def _clean(value: str) -> str:
+    """``value`` if it is plain printable text of sane length, else "" (the caller skips empties)."""
+    if not value or len(value) > MAX_FIELD or _CONTROL_CHARS.search(value):
+        return ""
+    return value
+
+
 def _label(name: Any) -> str:
-    """Plain text of a dnslib label; ``str()`` would escape spaces as ``\\032``."""
+    """Plain text of a dnslib label; ``str()`` would escape spaces as ``\\032``.
+
+    A name carrying control characters (a CRLF-laden "hostname", say) comes back as "".
+    """
     raw = getattr(name, "label", None)
     if raw is not None:
         try:
-            return b".".join(raw).decode("utf-8", "replace").rstrip(".")
+            return _clean(b".".join(raw).decode("utf-8", "replace").rstrip("."))
         except (TypeError, AttributeError):
             pass
-    return str(name).rstrip(".")
+    return _clean(str(name).rstrip("."))
 
 
 def parse_mdns_response(data: bytes) -> dict[str, list[str]]:
@@ -131,7 +151,9 @@ def parse_ssdp_response(text: str) -> dict[str, str] | None:
         if ":" not in line:
             continue
         k, v = line.split(":", 1)
-        headers[k.strip().lower()] = v.strip()
+        v = v.strip()
+        # Control characters are dropped, not stored; over-long values are cut to MAX_FIELD.
+        headers[k.strip().lower()] = "" if _CONTROL_CHARS.search(v) else v[:MAX_FIELD]
     return {
         "st": headers.get("st", ""),
         "server": headers.get("server", ""),
@@ -215,16 +237,18 @@ def probe(interface_ip: str, seconds: float = 3.0) -> dict[str, dict[str, Any]]:
                 except OSError:
                     continue
                 ip = addr[0]
+                if ip not in results and len(results) >= MAX_RESPONDERS:
+                    continue  # spoofed-source flood: a /24 home has far fewer real responders
                 entry = results.setdefault(ip, {"mdns": [], "ssdp": [], "names": []})
                 if kind == "mdns":
                     parsed = parse_mdns_response(data)
                     for t in parsed["services"]:
-                        if t not in entry["mdns"]:
+                        if t not in entry["mdns"] and len(entry["mdns"]) < MAX_NAMES_PER_HOST:
                             entry["mdns"].append(t)
                     for n in parsed["names"]:
-                        if n not in entry["names"]:
+                        if n not in entry["names"] and len(entry["names"]) < MAX_NAMES_PER_HOST:
                             entry["names"].append(n)
-                else:
+                elif len(entry["ssdp"]) < MAX_SSDP_PER_HOST:
                     parsed_ssdp = parse_ssdp_response(data.decode("utf-8", errors="replace"))
                     if parsed_ssdp and parsed_ssdp not in entry["ssdp"]:
                         entry["ssdp"].append(parsed_ssdp)

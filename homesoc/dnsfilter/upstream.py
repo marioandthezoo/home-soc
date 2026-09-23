@@ -14,6 +14,9 @@ Two defensive details that are easy to get wrong in a forwarder:
 * Once every path has failed, a circuit breaker lets one probe through every few seconds and fails
   the rest instantly; without it every LAN query would cost 9 s of timeouts on its own thread, and a
   host that uses Home SOC as its own resolver would recurse into itself while bootstrapping DoH.
+  The breaker only opens on evidence about the *upstreams*: a client's name failing proves nothing
+  (its authoritative servers may be slow on purpose), so the verdict comes from a canary query the
+  resolver chooses itself (see ``note_query_failure``).
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
-from dnslib import CLASS, QTYPE, DNSError, DNSLabel, DNSRecord
+from dnslib import CLASS, QTYPE, RCODE, DNSError, DNSLabel, DNSRecord
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,14 @@ DOH_TIMEOUT = 5.0
 MAX_MESSAGE = 65535
 DOH_CONTENT_TYPE = "application/dns-message"
 # While all upstreams are down, one query per this interval is allowed to probe; the rest fail fast.
+# The same interval rate-limits the canary check below.
 BREAKER_PROBE_SECONDS = 5.0
+# The health canary: the root NS set is in every recursive resolver's cache and no client (and no
+# attacker-controlled zone) influences how fast it is answered.
+CANARY_QNAME = "."
+CANARY_QTYPE = "NS"
+# A whole-query failure within this long of another query's success says nothing about the upstreams.
+RECENT_SUCCESS_SECONDS = 2.0
 # How long a DoH address learned through the UDP upstreams stays valid.
 DOH_BOOTSTRAP_TTL = 24 * 3600.0
 # After a reply that matches the question but not the 0x20 case pattern, wait this long for a
@@ -61,6 +71,10 @@ DOH_BOOTSTRAP_IPS: dict[str, tuple[str, ...]] = {
 
 class UpstreamError(Exception):
     """All upstreams (UDP, TCP fallback and DoH) failed for one query."""
+
+
+class CircuitOpenError(UpstreamError):
+    """The breaker is open: the query was failed fast without contacting any upstream."""
 
 
 @dataclass(frozen=True)
@@ -180,6 +194,10 @@ class Upstream:
         self._lock = threading.Lock()
         self._next_probe_at = 0.0
         self.breaker_rejections = 0
+        self._canary_lock = threading.Lock()
+        self._canary_at: float | None = None
+        self._canary_ok = True
+        self.canary_runs = 0
         self._doh_ip: str | None = None
         self._doh_ip_at = 0.0
         self._doh_mounted: set[str] = set()
@@ -203,7 +221,11 @@ class Upstream:
     def resolve(self, request: DNSRecord, *, tcp_only: bool = False) -> DNSRecord:
         """Return the upstream's reply for ``request`` (id preserved). Raises ``UpstreamError``."""
         if not self._breaker_allows():
-            raise UpstreamError("all upstreams are down (circuit open); retry shortly")
+            raise CircuitOpenError("all upstreams are down (circuit open); retry shortly")
+        return self._resolve_paths(request, tcp_only=tcp_only)
+
+    def _resolve_paths(self, request: DNSRecord, *, tcp_only: bool = False, track: bool = True) -> DNSRecord:
+        """Every configured path in order; ``track=False`` (the canary) leaves health bookkeeping alone."""
         plain_wire = request.pack()
         errors: list[str] = []
         for addr in self.addresses:
@@ -213,13 +235,16 @@ class Upstream:
             except (OSError, ValueError, DNSError, UpstreamError) as exc:
                 msg = f"{addr.label}: {type(exc).__name__}: {exc}"
                 errors.append(msg)
-                self._note_failure(addr.label, msg)
+                if track:
+                    self._note_failure(addr.label, msg)
                 continue
             if reply.header.id != request.header.id or not same_question(request, reply):
                 errors.append(f"{addr.label}: reply does not match the question")
-                self._note_failure(addr.label, "reply mismatch")
+                if track:
+                    self._note_failure(addr.label, "reply mismatch")
                 continue
-            self._note_success(addr.label)
+            if track:
+                self._note_success(addr.label)
             restore_case(reply, request)
             return reply
         if self.doh_upstream:
@@ -231,11 +256,67 @@ class Upstream:
             except Exception as exc:  # requests raises many types; DoH is best-effort
                 msg = f"doh {self.doh_upstream}: {type(exc).__name__}: {exc}"
                 errors.append(msg)
-                self._note_failure("doh", msg)
+                if track:
+                    self._note_failure("doh", msg)
             else:
-                self._note_success("doh")
+                if track:
+                    self._note_success("doh")
                 return reply
         raise UpstreamError("; ".join(errors) or "no upstreams configured")
+
+    def note_query_failure(self, *, now: float | None = None) -> bool:
+        """A client's query failed on every path: open the breaker only if the upstreams are down.
+
+        One name can fail because *its* authoritative servers are slow or broken, and any website or
+        LAN device can arrange that for names it controls. Treating it as "every upstream is down"
+        let one slow zone SERVFAIL every uncached lookup in the house, and an attacker who kept
+        winning the probe slot kept it that way. So the verdict comes from a canary the resolver
+        picks itself (``CANARY_QNAME``/``CANARY_QTYPE``), rate-limited to one per
+        ``BREAKER_PROBE_SECONDS``; a healthy canary also closes a breaker a failed probe left open.
+
+        Returns True when the breaker is open after the check.
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            h = self.health
+            if h.ok and h.last_ok_at is not None and now - h.last_ok_at < RECENT_SUCCESS_SECONDS:
+                return False  # another query was just answered: the upstreams are fine, this name is not
+            fresh = self._canary_at is not None and now - self._canary_at < BREAKER_PROBE_SECONDS
+            verdict = self._canary_ok
+        if not fresh:
+            if not self._canary_lock.acquire(blocking=False):
+                return not self.health.ok  # another thread is asking the canary right now
+            try:
+                verdict = self._run_canary()
+                with self._lock:
+                    self._canary_at, self._canary_ok = time.monotonic(), verdict
+                    self.canary_runs += 1
+            finally:
+                self._canary_lock.release()
+        if verdict:
+            self._close_breaker()
+            return False
+        self.mark_all_failed()
+        return True
+
+    def _run_canary(self) -> bool:
+        """True when some path answers the canary with NOERROR/NXDOMAIN (i.e. it can resolve at all)."""
+        try:
+            reply = self._resolve_paths(DNSRecord.question(CANARY_QNAME, CANARY_QTYPE), track=False)
+        except UpstreamError as exc:
+            logger.info("upstream canary failed: %s", exc)
+            return False
+        return reply.header.rcode in (RCODE.NOERROR, RCODE.NXDOMAIN)
+
+    def _close_breaker(self) -> None:
+        with self._lock:
+            self.health.last_ok_at = time.monotonic()
+            if self.health.ok:
+                return
+            self.health.ok = True
+            self.health.failing_since = None
+            self.health.consecutive_failures = 0
+            self._next_probe_at = 0.0
 
     # ---- circuit breaker ------------------------------------------------------------------
     def _breaker_allows(self, now: float | None = None) -> bool:
@@ -441,7 +522,8 @@ class Upstream:
             self.health.last_error = msg
 
     def mark_all_failed(self) -> None:
-        """Called by ``resolve`` callers after an ``UpstreamError`` so health reflects whole-query failures."""
+        """Open the breaker unconditionally. Resolver code calls ``note_query_failure`` instead, which
+        only gets here once the canary confirms that the upstreams themselves are unreachable."""
         with self._lock:
             self.health.consecutive_failures += 1
             if self.health.ok:
@@ -459,6 +541,7 @@ class Upstream:
                 "upstreams": [a.label for a in self.addresses],
                 "doh": self.doh_upstream,
                 "breaker_rejections": self.breaker_rejections,
+                "canary_runs": self.canary_runs,
                 "case_randomized": self.randomize_query_case,
                 "case_normalizing": sorted(self._case_normalizing),
             }

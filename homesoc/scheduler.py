@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 # is not specified; three in a row separates a flaky network from a broken job.
 FAILING_REPEATEDLY = 3
 
+# Watchdog. Jobs run one after another on one thread, so a job that hangs (a LAN device dripping
+# a UPnP answer one byte at a time was the real case) silently stops every other job. Network
+# code now carries its own wall-clock limits; the watchdog is the backstop that makes an overrun
+# visible in the activity feed and the jobs table instead of leaving the monitor quietly blind.
+JOB_OVERRUN_SEC = 30 * 60
+WATCHDOG_INTERVAL_SEC = 30.0
+
 
 @dataclass
 class Job:
@@ -45,6 +52,11 @@ class Job:
     run_at_start: bool = True
     at_hour: int | None = None
     description: str = ""
+    budget_sec: int | None = None  # longest a run may take before the watchdog reports it
+
+    @property
+    def overrun_after(self) -> int:
+        return JOB_OVERRUN_SEC if self.budget_sec is None else max(0, int(self.budget_sec))
 
     @property
     def manual_only(self) -> bool:
@@ -64,6 +76,8 @@ class _State:
     last_status: str | None = None
     last_duration_sec: float | None = None
     last_error: str | None = None
+    started_mono: float | None = None   # monotonic start of the current run
+    overrun_reported: bool = False
 
 
 class Scheduler:
@@ -81,6 +95,7 @@ class Scheduler:
         self._cond = threading.Condition()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._watchdog: threading.Thread | None = None
         self._done_events: dict[str, threading.Event] = {}
         self._load_history()
 
@@ -97,6 +112,8 @@ class Scheduler:
             self._persist(name)
         self._thread = threading.Thread(target=self._loop, name="homesoc-scheduler", daemon=True)
         self._thread.start()
+        self._watchdog = threading.Thread(target=self._watch, name="homesoc-scheduler-watchdog", daemon=True)
+        self._watchdog.start()
         logger.info("scheduler started with %d jobs", len(self.jobs))
 
     def stop(self, timeout: float = 30.0) -> None:
@@ -105,7 +122,10 @@ class Scheduler:
             self._cond.notify_all()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout)
+        if self._watchdog and self._watchdog.is_alive():
+            self._watchdog.join(min(timeout, WATCHDOG_INTERVAL_SEC + 1))
         self._thread = None
+        self._watchdog = None
         logger.info("scheduler stopped")
 
     @property
@@ -169,6 +189,8 @@ class Scheduler:
                     "failures": s.failures,
                     "consecutive_failures": s.consecutive_failures,
                     "failing_repeatedly": s.consecutive_failures >= FAILING_REPEATEDLY,
+                    "running_for_sec": self._running_for(s),
+                    "overrunning": self._is_overrunning(job, s),
                 }
             )
         return out
@@ -176,6 +198,46 @@ class Scheduler:
     def failing_jobs(self) -> list[dict[str, Any]]:
         """Jobs whose last FAILING_REPEATEDLY runs all failed — input for SOC-SYS-004."""
         return [j for j in self.status() if j["failing_repeatedly"]]
+
+    # ------------------------------------------------------------ watchdog
+
+    @staticmethod
+    def _running_for(state: _State) -> float | None:
+        if not state.running or state.started_mono is None:
+            return None
+        return round(time.monotonic() - state.started_mono, 1)
+
+    def _is_overrunning(self, job: Job, state: _State) -> bool:
+        elapsed = self._running_for(state)
+        return elapsed is not None and elapsed > job.overrun_after
+
+    def check_overruns(self) -> list[str]:
+        """Report (once per run) every job past its budget; returns the names reported now."""
+        reported: list[str] = []
+        for name, job in self.jobs.items():
+            state = self._state[name]
+            if state.overrun_reported or not self._is_overrunning(job, state):
+                continue
+            state.overrun_reported = True
+            minutes = int((self._running_for(state) or 0) // 60)
+            waiting = [n for n, s in self._state.items() if n != name and s.next_run is not None and s.next_run <= time.time()]
+            message = (f"job {name} has been running for {minutes} min, past its {job.overrun_after // 60} min budget; "
+                       f"{len(waiting)} other scheduled job(s) are waiting behind it")
+            logger.warning(message)
+            try:
+                db.record_event(self.conn, "warning", "scheduler", message,
+                                {"job": name, "running_min": minutes, "waiting": waiting[:20]})
+            except sqlite3.Error:
+                logger.exception("cannot record the overrun of job %s", name)
+            reported.append(name)
+        return reported
+
+    def _watch(self) -> None:
+        while not self._stop.wait(WATCHDOG_INTERVAL_SEC):
+            try:
+                self.check_overruns()
+            except Exception:  # the watchdog must never die quietly either
+                logger.exception("scheduler watchdog check failed")
 
     # ------------------------------------------------------------ internals
 
@@ -217,6 +279,8 @@ class Scheduler:
             logger.info("job %s already running; skipped", job.name)
             return False
         state.running = True
+        state.started_mono = time.monotonic()
+        state.overrun_reported = False
         started = time.time()
         state.last_run = utcnow_iso()
         status, error = "ok", None
@@ -229,6 +293,7 @@ class Scheduler:
         finally:
             duration = time.time() - started
             state.running = False
+            state.started_mono = None
             state.runs += 1
             state.last_status = status
             state.last_duration_sec = round(duration, 3)
