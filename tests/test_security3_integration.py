@@ -154,9 +154,10 @@ def test_a_query_log_flood_raises_net_dns_007_and_it_clears_after_a_day(conn, tm
     assert flood.evidence["sample_sources"] == ["10.9.8.7", "172.16.4.4"]
     title = catalog.render_plain_title("NET-DNS-007", flood.evidence, "dns")
     assert "faking addresses" in title
-    # Still open within the day, gone once a quiet day has passed.
+    # Still open within the day, gone once a quiet day has passed. Check a second past the day, not on
+    # it: (t + 86400) - t is not exactly 86400 for every float t, so the boundary itself is a coin toss.
     assert "NET-DNS-007" in [d.finding_id for d in srv.health_findings(now=now + 3600)]
-    assert "NET-DNS-007" not in [d.finding_id for d in srv.health_findings(now=now + 1 + 86400)]
+    assert "NET-DNS-007" not in [d.finding_id for d in srv.health_findings(now=now + 2 + 86400)]
 
 
 def test_the_query_log_keeps_the_overflow_sample_for_the_finding(conn):

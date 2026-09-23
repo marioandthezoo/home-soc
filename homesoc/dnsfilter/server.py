@@ -723,11 +723,13 @@ class DnsServer:
             self.ensure_components()
             addr = (self.listen, self.configured_port)
             try:
-                self._udp = _UdpServer(addr, _UdpHandler)
-                self._udp.dns = self
-                bound = (self.listen, int(self._udp.server_address[1]))
-                self._tcp = _TcpServer(bound, _TcpHandler)
+                # TCP first: on Windows, Hyper-V reserves blocks of TCP ports that UDP may still use, so
+                # with port 0 a UDP-chosen port can be one TCP is refused. The reverse is not true.
+                self._tcp = _TcpServer(addr, _TcpHandler)
                 self._tcp.dns = self
+                bound = (self.listen, int(self._tcp.server_address[1]))
+                self._udp = _UdpServer(bound, _UdpHandler)
+                self._udp.dns = self
             except OSError as exc:
                 self._close_sockets()
                 self.last_error = f"cannot bind {addr[0]}:{addr[1]}: {exc}"

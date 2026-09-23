@@ -70,14 +70,16 @@ class FakeUpstream:
                 out = fake.answer(data, tcp=True)
                 self_inner.wfile.write(struct.pack("!H", len(out)) + out)
 
-        for _ in range(20):
-            self.udp = socketserver.ThreadingUDPServer(("127.0.0.1", 0), UdpHandler)
-            port = self.udp.server_address[1]
+        # TCP picks the port: Windows hands out UDP ports sequentially, and a run of them can sit inside
+        # a TCP range Hyper-V reserves, so UDP-first could fail every attempt on a CI runner.
+        for _ in range(50):
+            self.tcp = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TcpHandler)
+            port = self.tcp.server_address[1]
             try:
-                self.tcp = socketserver.ThreadingTCPServer(("127.0.0.1", port), TcpHandler)
+                self.udp = socketserver.ThreadingUDPServer(("127.0.0.1", port), UdpHandler)
                 break
             except OSError:
-                self.udp.server_close()
+                self.tcp.server_close()
         else:  # pragma: no cover
             raise RuntimeError("could not find a free port pair")
         self.udp.daemon_threads = self.tcp.daemon_threads = True

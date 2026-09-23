@@ -19,7 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   services rather than trusting them, and the test now says so. Two query-log budget tests pin their clock,
   so filling a per-minute budget can no longer straddle a minute boundary under load. The scheduler
   watchdog test polls until the overrun is reported instead of sleeping a fixed 50 ms, which Python 3.12's
-  coarse Windows clock could read as zero.
+  coarse Windows clock could read as zero. The query-log flood test checked the one-day expiry exactly on
+  the boundary, where float rounding decides the answer for about 7% of clock readings; it now checks a
+  second past it.
+- **Binding the resolver on an automatic port.** The resolver bound UDP first and then asked for TCP on
+  the same port. Windows hands out UDP ports in sequence, and Hyper-V reserves blocks of TCP ports, so an
+  automatic (port 0) bind could land on a port TCP is refused. It now binds TCP first. Only tests use
+  port 0; the real listener on 53 or 5353 was never affected. The test fake upstream does the same.
 
 ## [0.2.0] — 2026-09-23
 
