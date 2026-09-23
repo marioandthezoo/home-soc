@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Feed deadline on Linux and macOS.** When a feed server drips its headers, the wall clock cuts the
+  socket; on Windows that surfaces as an error, but on POSIX it reads as a clean end of file, and Python's
+  HTTP client took that as the end of the headers. The request step could then return an apparently
+  complete response after the deadline. The body read still caught the expired clock, so a dripping mirror
+  already failed fast and kept the old list, but the request step now checks the clock itself as well.
+- **Tests that depended on the machine.** The live autostart-probe test no longer fails on machines that
+  cannot verify Authenticode signatures (GitHub's Windows runners); the product lists and baselines such
+  services rather than trusting them, and the test now says so. Two query-log budget tests pin their clock,
+  so filling a per-minute budget can no longer straddle a minute boundary under load.
+
 ## [0.2.0] — 2026-09-23
 
 ### Walkthrough video

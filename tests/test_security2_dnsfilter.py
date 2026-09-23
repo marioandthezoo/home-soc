@@ -352,7 +352,25 @@ def test_tcp_idle_timeout_shrinks_when_the_table_is_busy(monkeypatch):
 
 
 # ---- 4. query log: forged sources cannot blind it to inventory devices ---------------------------
-def test_forged_sources_cannot_stop_inventory_devices_being_logged(conn, lists_dir):
+@pytest.fixture
+def frozen_minute(monkeypatch):
+    """Pin the query log's clock mid-minute. Its budgets reset when int(monotonic() // 60) changes,
+    so a test that fills a budget with thousands of queries and then checks one more is refused
+    could straddle a minute boundary under load, see the budget legitimately reset, and fail."""
+    import time as real_time
+
+    class _Clock:
+        def __getattr__(self, name):
+            return getattr(real_time, name)
+
+        @staticmethod
+        def monotonic():
+            return 60 * 100_000 + 30.0
+
+    monkeypatch.setattr(querylog, "time", _Clock())
+
+
+def test_forged_sources_cannot_stop_inventory_devices_being_logged(conn, lists_dir, frozen_minute):
     """The PoC: 4096 forged sources at the start of a minute and no later client (a C2 lookup, the
     victim) was logged for the rest of the minute, without even an 'over budget' event."""
     add_device(conn, "192.168.1.50", "aa:bb:cc:00:00:50")
@@ -374,7 +392,7 @@ def test_forged_sources_cannot_stop_inventory_devices_being_logged(conn, lists_d
     assert len(ev) == 1                                                     # the overflow leaves a trace now
 
 
-def test_total_budget_exhaustion_does_not_reach_known_devices(conn):
+def test_total_budget_exhaustion_does_not_reach_known_devices(conn, frozen_minute):
     known = KnownClients(addresses=["192.168.1.50"])
     ql = querylog.QueryLog(conn, client_budget=10, total_budget=25, known=known)
     for i in range(100):

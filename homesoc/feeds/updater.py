@@ -564,6 +564,16 @@ def _open(url: str, headers: dict[str, str], deadline: _Deadline) -> requests.Re
                 deadline.check("request")
                 raise FeedError(f"request failed: {exc}") from exc
             if resp.status_code not in _REDIRECT_CODES:
+                # The watch cuts a stalled read by shutting the socket down. Windows reports that
+                # cut as an error, but on POSIX it reads as a clean end of file, and http.client
+                # takes an end of file inside the headers as the end of the headers: a server that
+                # drips its headers until the deadline comes back looking like a complete response.
+                # So the clock is checked here too, whatever the library made of the cut.
+                try:
+                    deadline.check("request")
+                except FeedError:
+                    resp.close()
+                    raise
                 return resp
             with resp:  # release the connection; a redirect body is never read
                 location = resp.headers.get("Location")
