@@ -143,41 +143,63 @@ under `[web] token`; set it to `""` if you want no login at all on a single-user
 
 ## A tour of the dashboard
 
+The pages speak plainly first and keep the technical detail one click away. Each page's old,
+technical name is shown in brackets below (and beside every page heading), so if you knew the
+dashboard before, "Things to fix" is the page that used to be called Findings. The addresses
+did not change, so bookmarks still work.
+
+Everyday pages:
+
 | Page | What you see |
 |---|---|
-| **Overview** (`/`) | The security score and its grade, a **Fix these first** card showing which finding types are costing the most points and how far the score would rise if you cleared each one, open findings broken down by severity, device counts, 24-hour DNS numbers, scheduler job health, when each scan last ran, feed freshness and the latest events. The one page to check daily. |
-| **Activity feed** (`/feed`) | One reverse-chronological stream of everything that happened: new and resolved findings, devices joining or going offline, scans finishing, feeds updating, blocked DNS requests, Defender detections, notifications sent. Filter by kind, severity, time window or free text; there is also an RSS version at `/feed.rss`. |
-| **Summary** (`/summary`) | The "what was found and what got fixed" report: score trend, found-vs-remediated bars per severity, the remediated table with how long each issue stayed open, and the still-open worklist as expandable cards with numbered remediation steps. Export it as Markdown or JSON, or print it. |
-| **Findings** (`/findings`) | Every issue Home SOC has ever raised, filterable by status, severity, category and text. Each row opens into the plain-English explanation, the evidence behind it, the fix steps and reference links; you can acknowledge, resolve or suppress from here. |
-| **Devices** (`/devices`) | The inventory: name, IP, MAC, vendor, guessed device kind, online state, when it was first and last seen, how many open ports and findings it has, and whether you have marked it trusted. Click any device for its services, sightings, vulnerabilities and findings, and to rescan just that one. |
-| **Map** (`/map`) | What each device depends on, what depends on it, and what stops working when it fails. Click a node for its blast radius: what goes down, what merely loses internet, and what carries on. Every edge is labelled with how it was established — watched, inferred from the network's shape, or only assumed. |
-| **Vulnerabilities** (`/vulns`) | Every CVE matched to a real service on a real device, with a KEV badge, CVSS, EPSS probability, which device and service it came from and what the match was based on. Filter to KEV-only or by minimum CVSS to see what genuinely matters first. |
-| **Host posture** (`/host`) | This computer's own health: Microsoft Defender status and the threats it handled in the last 30 days, Windows Update state and outdated apps, the grouped posture checks (firewall, accounts, encryption, network), autostart entries and what is listening on the network. Checks that need administrator rights are labelled, not failed. |
-| **DNS filter** (`/dns`) | Queries, blocks and clients over 24 hours, a queries-per-hour chart with blocks in red, the top blocked domains and busiest clients, which blocklists are loaded and how big they are, your allow/deny overrides, a live query log and the reputation cache. Empty until you enable the resolver. |
-| **Telemetry** (`/telemetry`) | The agent watching itself: metric charts, every scheduled job with its last run, duration, next run and failure count, the scan history and the raw event log. This is where you look when something is not running. |
-| **Scans** (`/scans`) | Buttons to run a scan right now — quick, full, host, exposure, feeds, files — plus the history of every scan with status, start time, duration, a summary of what it found and any error. |
-| **Settings** (`/settings`) | The config keys that are safe to change while running, grouped by section, saved to the database as overrides on top of `config.toml`. Also a "Test notifications" button, a support-bundle download and a findings/devices/vulns export. |
+| **Home** (Overview, `/`) | One sentence about the whole network ("Eight things need your attention, two of them urgent"), the safety score with a word beside it (Good, Fair, Needs work), what needs fixing by urgency, the devices seen at the last check, web blocking over 24 hours, **Fix these first** (the problems costing the most points, and how far the score would rise), the devices that need attention, what your home relies on, and the latest activity in plain sentences. It never calls the network healthy unless every core check has actually run recently. The one page to check daily, and the one to leave up on a screen. |
+| **Things to fix** (Findings, `/findings`) | Every problem Home SOC has raised, opening on the ones that need attention. Each row leads with a plain headline and why it matters, beside an urgency badge with its action word ("Fix now", "Fix this week", "Worth fixing", "When you have time", "Good to know"). Open a row (click it, or Tab to its title and press Enter) for what Home SOC found, how to fix it, the buttons *I've seen this*, *I've fixed it* and *Ignore this from now on…*, and the technical details (check ID, evidence, references). Something you marked fixed reads "Marked fixed" until Home SOC's own check confirms it is gone. |
+| **Devices** (`/devices`) | Every device by name, with its address beside it: what kind it is, whether it was seen at the last network check (not a live reading), what it has to fix and whether it is yours. Open a device for its open doors (ports), known flaws, what it depends on, and to check just that one again. |
+| **What happened** (Activity feed, `/feed`) | One timeline of everything that happened: problems found and fixed, devices joining or going missing, checks finishing, threat lists updating, blocked look-ups, antivirus detections, alerts sent. Rows of medium urgency and above say so in words. Filter by kind, urgency, time window or text; there is an RSS version at `/feed.rss`. |
+| **Report** (Security summary, `/summary`) | "Your safety report": the score trend, found and fixed by urgency, what was fixed and how long it stayed open (fixed and confirmed by a later check, or marked fixed by you), the still-open worklist with *How to fix this*, and what Home SOC checked and could not check. Export it as Markdown or JSON, or print it. |
+| **This computer** (Host posture, `/host`) | This computer's own protection: Windows' built-in antivirus (Defender) and what it handled in the last 30 days, Windows updates and outdated apps, the safety settings (firewall, accounts, encryption, network), programs that start by themselves and what is listening on the network. Settings that need administrator rights to check are labelled, not failed. |
+| **Web blocking** (DNS filter, `/dns`) | Look-ups, blocks and devices over 24 hours, a per-hour chart, the most-blocked websites with the reason in words, the busiest devices, your always-allow / always-block list, the blocklists, and the latest look-ups (called "live" only while the resolver is running and the rows are recent). Empty until you enable the resolver. |
+
+Advanced pages:
+
+| Page | What you see |
+|---|---|
+| **What depends on what** (Dependency map, `/map`) | Which devices rely on which: your router, the look-up service web blocking runs, and the services devices offer the house. It is not a traffic diagram — Home SOC cannot see devices talking to each other. Select a device for its blast radius: what would stop working, what would lose a service, and how many devices are *not known* to be affected. Every line says how sure Home SOC is: seen, worked out, or assumed. |
+| **Known flaws** (Vulnerabilities, `/vulns`) | Every known software flaw (CVE) matched to a device, with whether attackers are known to have used it (KEV), how bad it could be (CVSS, out of 10) and the chance it is exploited somewhere in the world in the next 30 days (EPSS — a worldwide forecast, not the chance your home is attacked). |
+| **Checks** (Scans, `/scans`) | Buttons to run a check now — quick, full, this computer, internet exposure, threat lists, downloads — and when each check last ran and how it went, with the full history one click away. |
+| **System health** (Telemetry, `/telemetry`) | Home SOC watching itself: whether each background job is working, the recent checks, its own log and its measurements over time. This is where you look when something is not running. |
+| **Settings** (`/settings`) | The settings that are safe to change while running, saved as overrides on top of `config.toml`. Also a "Test notifications" button, a support-bundle download and an export. |
+
+### Themes
+
+The dashboard is designed to be left up on a screen. **Day** ("Stone & Sage", the default) is a
+warm stone-and-paper page with deep slate-green text: calm, not a light box. **Dusk** is the same
+room after sunset — warm cocoa, never black-and-neon. **Auto** follows the computer's light/dark
+setting. Switch with the **Theme** button at the foot of the sidebar; the choice is remembered in
+that browser. In both themes a healthy screen shows no alarm colours at all, colour is never the
+only signal (every badge carries words and the map's nodes carry letters), and the text meets
+WCAG contrast. When the last network check is old, every page says so at the top.
 
 ## Screenshots
 
 *Every screenshot on this page and in `docs/images/` was taken against a fictional demo network, not a real home — the
 devices, addresses, findings and DNS queries in them are all made up.*
 
-**Summary** — what was found, what got fixed, and what is still open, with numbered remediation steps.
+**Your safety report** (Summary) — what was found, what got fixed, and what is still open, with the steps to fix it.
 
-![The Summary page](docs/images/03-summary.png)
+![The safety report page](docs/images/03-summary.png)
 
-**Findings** — every issue ever raised, filterable, each one opening into evidence, fix steps and references.
+**Things to fix** (Findings) — each problem with a plain headline and why it matters, opening into what was found, how to fix it and the technical details.
 
-![The Findings page](docs/images/04-findings.png)
+![The Things to fix page](docs/images/04-findings.png)
 
-**Devices** — the inventory, with vendor, kind, open ports, findings and online state.
+**Devices** — every device by name, with its kind, what it has to fix and whether it was seen at the last check.
 
 ![The Devices page](docs/images/06-devices.png)
 
-**DNS filter** — queries, blocks and clients over 24 hours, the live query log and your allow/deny overrides.
+**Web blocking** (DNS filter) — look-ups, blocks and devices over 24 hours, the most-blocked websites and why.
 
-![The DNS filter page](docs/images/10-dns-filter.png)
+![The Web blocking page](docs/images/10-dns-filter.png)
 
 The remaining pages are in [docs/images/](docs/images/), and the [walkthrough](docs/WALKTHROUGH.md) puts them in order.
 
@@ -199,7 +221,7 @@ The short version:
 3. On Windows, allow inbound DNS through the firewall — from an **elevated** PowerShell:
    `powershell -ExecutionPolicy Bypass -File scripts\enable-lan-dns.ps1`
 4. In your router's DHCP settings, set the DNS server handed out to clients to this PC's LAN IP. Renew the lease (or
-   reboot) on a device and watch the query log fill up on the DNS filter page.
+   reboot) on a device and watch the look-ups fill up on the Web blocking page (`/dns`).
 
 Two honest caveats. First, the PC has to be on: if it sleeps, the whole house loses DNS until it wakes or the router
 falls back. Second, **many ISP-supplied gateways do not let you change the DHCP DNS server at all** — this is common
@@ -211,7 +233,7 @@ The full walkthrough — router-by-router, per-device fallback, IPv6, what to do
 
 ## The dependency map — what breaks if this dies?
 
-The **Map** page (`/map`) draws what each device depends on, what depends on it, and what stops working when it fails.
+The **What depends on what** page (the dependency map, `/map`) draws what each device depends on, what depends on it, and what stops working when it fails.
 Click a node and the map highlights its blast radius, with a sentence you can act on:
 
 > If Living-room router fails, 5 devices lose their internet connection. They stay on the local network and can still
@@ -333,7 +355,7 @@ Global options, valid before any command:
 | `feed` | Plain-text activity feed for the terminal. | `--limit N` (default 50), `--kinds a,b`, `--since AGE` — `30m`, `24h`, `7d`, `2w` or an ISO timestamp. |
 | `defender` | Windows Defender actions. | `--quick-scan` or `--update` (exactly one is required). |
 | `dns-test DOMAIN` | Show the policy decision and the upstream answer for one domain. | — |
-| `blast DEVICE` | What stops working if this device fails: the one-sentence headline, what is degraded, what genuinely goes offline, what is unaffected, and the evidence behind it. `DEVICE` is an IP, a MAC, or a nickname/hostname. | — |
+| `blast DEVICE` | What stops working if this device fails: the one-sentence headline, what is degraded, what genuinely goes offline, what is unaffected as far as Home SOC has recorded (it cannot see devices using each other), and the evidence behind it. `DEVICE` is an IP, a MAC, or a nickname/hostname. | — |
 | `lens` | Pair a phone with [Lens](#lens--point-your-phone-at-a-device), list or revoke its tokens, manage the HTTPS certificate. | `pair [--host H] [--port P] [--invert]`, `tokens`, `revoke <id> \| --all`, `cert [--regenerate] [--hosts a,b]`. |
 
 A few things worth trying on day one:
@@ -415,7 +437,7 @@ ping. This is expected and Home SOC works fine that way.
 
 **"Home SOC is not running as administrator" (`SOC-SYS-002`).** This is normal and by design — the default path needs no
 elevation. A handful of Windows checks (Secure Boot, TPM, BitLocker) cannot run as a standard user; they are reported as
-"needs administrator" on the Host posture page and listed under "Not checked" on the Summary, never counted as failures.
+"needs administrator" on the This computer page (Host posture) and listed under "What Home SOC could not check" in the Report, never counted as failures.
 Run from an elevated terminal once if you want those answers.
 
 **Port 53 is already in use.** The resolver will not bind and you get `NET-DNS-002` on the dashboard. On Windows the
@@ -437,7 +459,7 @@ from the machine it runs on. To reach it from your phone, set `[web] host = "0.0
 `http://<that-pc-lan-ip>:8787/login?token=<your-token>`. It is plain HTTP on your LAN, so do not do this on a network
 you share with strangers.
 
-**Nothing appears on a page.** Check the Telemetry page: it shows every job's last run, duration and failure count, plus
+**Nothing appears on a page.** Check the System health page (Telemetry, `/telemetry`): it shows every job's last run, duration and failure count, plus
 the raw event log. `python -m homesoc status` prints the same thing in the terminal. Launcher-level failures (wrong
 Python, no network on the first install) are appended to `data/logs/launcher.log`; everything after startup goes to
 `data/logs/homesoc.log`.

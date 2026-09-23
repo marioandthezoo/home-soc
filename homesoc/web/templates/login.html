@@ -3,23 +3,30 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e5e0d5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#3a332d" media="(prefers-color-scheme: dark)">
 <title>{{ page_title }} · Home SOC</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+{# External, not deferred: applies the saved Day/Dusk choice before the first paint (CSP forbids inline script). #}
+<script src="{{ url_for('static', filename='theme.js') }}"></script>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body data-page="{{ page }}" data-refresh="0">
 <main class="main">
   <div class="card login">
+    <div class="brand login-brand"><span class="brand-mark" aria-hidden="true">◉</span><span class="brand-name">Home SOC<small class="brand-sub">Home network safety</small></span></div>
     {% if not_found %}
     <h1>Not found</h1>
     <p>{{ error }}</p>
-    <p><a href="/">Back to the overview</a></p>
+    <p><a class="link" href="/">Back to Home</a></p>
     {% else %}
-    <h1>◉ Home SOC</h1>
-    <p>This dashboard is protected by the token from <span class="mono">config.toml</span> (<span class="mono">[web] token</span>).</p>
-    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <h1>Sign in</h1>
+    <p>Enter the dashboard's access code. It is the <span class="mono">token</span> under <span class="mono">[web]</span>
+      in <span class="mono">config.toml</span>, Home SOC's settings file.</p>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
     <form method="post" action="/login">
-      <div class="field"><label for="token">token</label><input type="password" id="token" name="token" autocomplete="current-password" autofocus required></div>
+      <div class="field"><span class="plain-title" id="token-name">Access code</span><label for="token" id="token-key">token</label><input type="password" id="token" name="token" aria-labelledby="token-name token-key" autocomplete="current-password" autofocus required></div>
       <button class="btn btn-primary" type="submit">Sign in</button>
     </form>
     {% endif %}

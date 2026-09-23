@@ -1,100 +1,196 @@
 {% extends "base.html" %}
-{% block content %}
+{% import "_macros.html" as ui %}
+{#- Your safety report (the Summary page, and a printable handout). Plain words beside the
+    technical ones; the steps for each open problem are collapsed behind "How to fix this" and
+    print expanded. Everything here is autoescaped; nothing from the database is marked safe. -#}
+
+{#- "8 days ago" (the |ago filter already speaks in words). -#}
+{% macro when(ts) -%}{{ ts|ago }}{%- endmacro %}
+
+{#- Numbers up to ten as words ("two things"), larger ones as digits. -#}
+{% macro number(n) -%}
+{{ ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'][n] if 0 <= n <= 10 else n }}
+{%- endmacro %}
+{% macro things(n, noun='thing') -%}
+{{ number(n) }} {{ noun if n == 1 else noun ~ 's' }}
+{%- endmacro %}
+
+{% set KIND_WORDS = {'accounts': 'User accounts', 'defender': 'Antivirus (Defender)', 'devices': 'Devices on your network',
+    'dns': 'Websites looked up', 'files': 'Downloaded files', 'firewall': 'Firewall',
+    'host-network': "This computer's network settings", 'lan-services': 'Open doors on devices',
+    'services': 'Open doors on devices', 'persistence': 'Programs that start by themselves',
+    'posix': "This computer's settings", 'soc': 'Home SOC itself', 'system': "This computer's system settings",
+    'topology': 'What depends on what', 'updates': 'Software updates', 'vulns': 'Known software flaws',
+    'wan': 'Seen from the internet', 'router': 'Your router', 'wifi': 'Wi-Fi'} %}
+{% set CHECK_WORDS = {'discovery': 'Device check', 'services': 'Open-port check', 'vulns': 'Software-flaw check',
+    'host': 'Check of this computer', 'exposure': 'Internet-exposure check', 'feeds': 'Threat-list update',
+    'files': 'Downloads check', 'wifi': 'Wi-Fi check'} %}
+
 {% set t = data.totals %}
 {% set cov = data.coverage %}
 {% set dfn = data.defender %}
 {% set ttr = data.time_to_remediate %}
+{% set work = data.open_worklist %}
+{% set crit = work|selectattr('severity', 'equalto', 'critical')|list|length %}
+{% set high = work|selectattr('severity', 'equalto', 'high')|list|length %}
+{% set small = work|selectattr('severity', 'in', ['medium', 'low'])|list|length %}
+
+{#- What was open at the last check, for when that check is old. The banner already says the
+    check is old; this says what it found, in the past tense, without claiming it is current. -#}
+{% macro at_last_check() -%}
+At that check,
+{%- if crit and high %} {{ things(crit) }} needed fixing right away and {{ number(high) }} more this week.
+{%- elif crit %} {{ things(crit) }} needed fixing right away.
+{%- elif high %} {{ things(high) }} needed fixing this week.
+{%- elif small %} nothing urgent was open; {{ things(small, 'smaller thing') }} {{ 'was' if small == 1 else 'were' }} worth fixing when you have time.
+{%- else %} nothing needed your attention.
+{%- endif -%}
+{%- endmacro %}
+
+{#- The report's own stale banner: the same element (ids and all) that app.js keeps current, plus
+    what was open at that check, so the warning appears once, not twice. -#}
+{% block stale_banner %}
+<div class="status-banner is-stale stale-banner" id="stale-banner" role="status"{% if not staleness.stale %} hidden{% endif %}>
+  <span><span class="stale-text" id="stale-text">Home SOC last checked your network <b>{{ staleness.age_text or 'a while ago' }}</b> — what you see may be out of date.</span>
+  {% if staleness.stale %}<span>{{ at_last_check() }}</span>{% endif %}</span>
+  <button class="btn btn-sm no-print" type="button" data-action="scan" data-kind="quick" title="Runs a quick check now: looks for devices, then their open doors (ports)">Check now</button>
+</div>
+{% endblock %}
+
+{% block content %}
 <script type="application/json" id="summary-data">{{ {'trend': data.score.trend, 'by_severity': data.by_severity, 'severities': severities}|tojson }}</script>
+
+{#- The status sentence. The server's own sentence (data.status_line, from build_summary(plain=True))
+    is used when the page is handed one. Otherwise it is worked out here from the open list, and it
+    never calls the network "healthy": this page cannot see whether every check finished. -#}
+{% if not staleness.stale %}
+{% if data.status_line is defined and data.status_line %}
+<div class="status-banner status-line-main is-{{ (data.status_tone or 'healthy')|css_token }}" role="status"><span>{{ data.status_line }}</span></div>
+{% else %}
+<div class="status-banner status-line-main{% if crit %} is-attention{% elif high %} is-week{% elif staleness.never %} is-stale{% endif %}" role="status"><span>
+  {%- if staleness.never %}Home SOC hasn't checked your network yet.
+  {%- elif crit %}{{ things(crit)|capitalize }} {{ 'needs' if crit == 1 else 'need' }} fixing right away{% if high %}, and {{ number(high) }} more this week{% endif %}.
+  {%- elif high %}{{ things(high)|capitalize }} {{ 'needs' if high == 1 else 'need' }} fixing this week.
+  {%- elif small %}Nothing urgent is open; {{ things(small, 'smaller thing') }} {{ 'is' if small == 1 else 'are' }} worth fixing when you have time.
+  {%- else %}Nothing is waiting to be fixed right now.{% endif -%}
+</span></div>
+{% endif %}
+{% endif %}
 
 <div class="toolbar no-print">
   <form class="inline-form" method="get" action="/summary">
-    <label class="muted small">Window
+    <label class="muted small">Show
       <select name="days" aria-label="Report window">
-        {% for d in [7, 30, 90, 365] %}<option value="{{ d }}"{% if days == d %} selected{% endif %}>last {{ d }} days</option>{% endfor %}
+        {% for d in [7, 30, 90, 365] %}<option value="{{ d }}"{% if days == d %} selected{% endif %}>the last {{ d }} days</option>{% endfor %}
       </select>
     </label>
     <button class="btn" type="submit">Apply</button>
   </form>
-  <a class="btn" href="/api/summary/report.json?days={{ days }}">Download JSON</a>
-  <a class="btn" href="/api/summary/report.md?days={{ days }}">Download Markdown</a>
+  <a class="btn" href="/api/summary/report.json?days={{ days }}" title="The whole report as data (JSON)">Download (JSON)</a>
+  <a class="btn" href="/api/summary/report.md?days={{ days }}" title="The whole report as a text document (Markdown)">Download (Markdown)</a>
   <button class="btn" data-action="print">Print</button>
 </div>
 
-<p class="lede">Home SOC has found <b>{{ t.found_all_time }}</b> issue{{ '' if t.found_all_time == 1 else 's' }} on this
-  network and host; <b>{{ t.resolved }}</b> {{ 'is' if t.resolved == 1 else 'are' }} fixed and <b>{{ t.open }}</b> still
-  need{{ 's' if t.open == 1 else '' }} attention. Window: last {{ data.window_days }} days · generated {{ data.generated_at|ts }}.</p>
+<p class="lede">Home SOC has found <b>{{ t.found_all_time }}</b> problem{{ '' if t.found_all_time == 1 else 's' }} on this
+  network and this computer; <b>{{ t.resolved }}</b> {{ 'is' if t.resolved == 1 else 'are' }} fixed{% if fixed_split is defined and t.resolved %} ({{ fixed_split.confirmed }} confirmed by a later check, {{ fixed_split.marked }} marked fixed by you){% endif %} and <b>{{ t.open }}</b> still
+  need{{ 's' if t.open == 1 else '' }} attention. This report covers the last {{ data.window_days }} days · made {{ data.generated_at|ts }}.</p>
 
 <div class="grid grid-4">
-  <section class="card card-fill"><h2>Security score</h2>
-    <div class="kpi"><b>{{ data.score.current }}</b><span class="muted">/100 · grade {{ data.score.grade }}</span></div>
-    <div class="kpi-sub push-down">{{ t.found_in_window }} found and {{ t.resolved_in_window }} fixed in this window</div>
+  <section class="card card-fill"><h2>Safety score</h2>
+    {% if staleness.never %}<div class="kpi"><b class="muted">–</b><span class="muted">/100 · not checked yet</span></div>
+    {% else %}<div class="kpi"><b>{{ data.score.current }}</b><span class="muted">/100 · {{ data.score.current|score_word }}</span></div>{% endif %}
+    <div class="kpi-sub push-down">{% if staleness.never %}Nothing has been checked yet, so this only means nothing has been found — not that all is well.{% else %}grade <b class="grade-{{ data.score.grade }}">{{ data.score.grade }}</b> · higher is safer. {{ t.found_in_window }} found and {{ t.resolved_in_window }} fixed in the last {{ data.window_days }} days.{% endif %}</div>
   </section>
-  <section class="card card-fill"><h2>Found · all time</h2>
+  <section class="card card-fill"><h2>Found <span class="page-tech">all time</span></h2>
     <div class="kpi"><b>{{ t.found_all_time }}</b></div>
-    <div class="kpi-sub push-down">{{ t.acknowledged }} acknowledged · {{ t.suppressed }} suppressed</div>
+    <div class="kpi-sub push-down">{{ t.acknowledged }} {{ 'acknowledged'|status_word|lower }} · {{ t.suppressed }} {{ 'suppressed'|status_word|lower }}</div>
   </section>
-  <section class="card card-fill"><h2>Remediated</h2>
+  <section class="card card-fill"><h2>Fixed <span class="page-tech">remediated</span></h2>
     <div class="kpi"><b>{{ t.resolved }}</b></div>
-    <div class="kpi-sub push-down">{{ (t.remediation_rate * 100)|round|int }}% remediation rate</div>
+    <div class="kpi-sub push-down">{% if fixed_split is defined and t.resolved %}{{ fixed_split.confirmed }} confirmed by a later check · {{ fixed_split.marked }} marked fixed<br>{% endif %}{{ (t.remediation_rate * 100)|round|int }}% of everything found</div>
   </section>
-  <section class="card card-fill"><h2>Still open</h2>
+  <section class="card card-fill"><h2>Still to fix</h2>
     <div class="kpi"><b>{{ t.open }}</b></div>
-    <div class="kpi-sub push-down">median time to fix {{ ttr.median_hours|hours }} · p90 {{ ttr.p90_hours|hours }}</div>
+    <div class="kpi-sub push-down" title="median {{ ttr.median_hours|hours }} · 90th percentile {{ ttr.p90_hours|hours }}">{{ ttr.text if ttr.text is defined and ttr.text else 'Median time to fix ' ~ (ttr.median_hours|hours) ~ '.' }}</div>
+  </section>
+</div>
+
+<div class="grid grid-2 grid-top">
+  <section class="card card-fill">
+    <h2>Is it getting better? <span class="page-tech">Score trend · last {{ data.window_days }} days</span></h2>
+    <div class="chart chart-line" id="chart-summary-trend"></div>
+    {% set trend = data.score.trend or [] %}
+    <p class="muted small">
+      {%- if trend|length > 1 -%}
+        {%- set first = trend[0][1]|float -%}{%- set diff = (data.score.current|float) - first -%}
+        {%- if diff >= 1 %}Yes: the safety score is up from {{ first|round|int }} to {{ data.score.current }} over this period.
+        {%- elif diff <= -1 %}No: the safety score is down from {{ first|round|int }} to {{ data.score.current }} over this period.
+        {%- else %}About the same: the safety score has stayed near {{ data.score.current }}.{% endif %}
+      {%- endif -%}</p>
+    <h2 class="h-mt">What is costing the most points</h2>
+    <ol class="cost-list" id="score-breakdown">
+      <li class="empty">Working out which problems cost the most…</li>
+    </ol>
+    <p class="muted small" id="score-breakdown-note" hidden>
+      <b>+N</b> is roughly how far the safety score rises once every problem of that type is fixed.
+      Every one of them is in the list below.</p>
+  </section>
+  <section class="card card-fill">
+    <h2>Found and fixed, by urgency <span class="page-tech">Found vs remediated, by severity</span></h2>
+    <div class="chart chart-bars" id="chart-found-remediated"></div>
+    <p class="muted small">Every problem Home SOC has ever raised, grouped by how urgent it is and
+      whether it is still waiting, seen, or fixed.</p>
   </section>
 </div>
 
 <div class="grid grid-2">
   <section class="card card-fill">
-    <h2>Score trend · last {{ data.window_days }} days</h2>
-    <div class="chart chart-line" id="chart-summary-trend"></div>
-    <h2 class="h-mt">What is costing the most points</h2>
-    <ol class="cost-list" id="score-breakdown">
-      <li class="empty">Working out which open findings cost the most…</li>
-    </ol>
-    <p class="muted small" id="score-breakdown-note" hidden>
-      <b>+N</b> is roughly how far the security score rises once every finding of that type is cleared.
-      Every one of them is in the worklist below.</p>
+    <h2>By kind of problem <span class="page-tech">By category</span></h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Kind</th><th class="num">Found</th><th class="num">Still to fix</th><th class="num">Fixed</th></tr></thead>
+      <tbody>
+        {% for c in data.by_category %}
+        <tr><td>{{ KIND_WORDS.get(c.category, c.category) }} <span class="tech-word">{{ c.category }}</span></td><td class="num">{{ c.found }}</td><td class="num">{{ c.open }}</td><td class="num">{{ c.resolved }}</td></tr>
+        {% else %}<tr><td colspan="4" class="empty">Nothing found yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
   </section>
   <section class="card card-fill">
-    <h2>Found vs remediated, by severity</h2>
-    <div class="chart chart-bars" id="chart-found-remediated"></div>
-    <p class="muted small push-down">Every finding Home SOC has ever raised, grouped by how bad it is and
-      whether it is still outstanding. The chart carries its own colour key.</p>
+    <h2>Devices with the most to fix</h2>
+    <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>Device</th><th class="num">Still to fix</th><th class="num">Fixed</th></tr></thead>
+      <tbody>
+        {% for d in data.top_devices %}
+        <tr><td class="wrap">{{ ui.device_name(d) }}</td><td class="num">{{ d.open }}</td><td class="num">{{ d.resolved }}</td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No device has had a problem yet.</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    </div>
   </section>
 </div>
 
 <section class="card">
-  <h2>By category</h2>
-  <div class="tbl-wrap">
-  <table class="tbl">
-    <thead><tr><th>Category</th><th class="num">Found</th><th class="num">Open</th><th class="num">Resolved</th></tr></thead>
-    <tbody>
-      {% for c in data.by_category %}
-      <tr><td>{{ c.category }}</td><td class="num">{{ c.found }}</td><td class="num">{{ c.open }}</td><td class="num">{{ c.resolved }}</td></tr>
-      {% else %}<tr><td colspan="4" class="empty">Nothing found yet.</td></tr>{% endfor %}
-    </tbody>
-  </table>
-  </div>
-</section>
-
-<section class="card">
-  <div class="card-head"><h2>Remediated · last {{ data.window_days }} days</h2>
+  <div class="card-head"><h2>Fixed in the last {{ data.window_days }} days <span class="page-tech">Remediated</span></h2>
     <span class="muted small">{{ data.remediated|length }} item{{ '' if data.remediated|length == 1 else 's' }}</span></div>
   <div class="tbl-wrap">
   <table class="tbl" id="remediated-table" data-page-size="25">
-    <thead><tr><th>Finding</th><th>Severity</th><th>Where</th><th>Opened</th><th>Fixed</th><th class="num">Time open</th><th>How</th></tr></thead>
+    <thead><tr><th>What</th><th>How urgent</th><th>Where</th><th>Fixed</th><th>Time open</th><th>How it was fixed</th></tr></thead>
     <tbody>
       {% for r in data.remediated %}
+      {% set where = r.device_label or r.device_name or r.subject %}
       <tr>
-        <td class="wrap">{{ r.title }}</td>
+        <td class="wrap">{{ r.plain_title or r.title }}</td>
         <td>{{ sev(r.severity) }}</td>
-        <td class="mono small wrap">{{ r.device_name or r.subject }}</td>
-        <td class="nowrap" title="{{ r.first_seen }}">{{ r.first_seen|ts }}</td>
-        <td class="nowrap" title="{{ r.resolved_at }}">{{ r.resolved_at|ts }}</td>
-        <td class="num">{{ r.hours_open|hours }}</td>
-        <td>{{ badge('resolved', 'verified by rescan') if r.how == 'auto' else badge('acknowledged', 'marked fixed') }}</td>
+        <td class="wrap">{% if r.link_device_id %}<a href="/devices/{{ r.link_device_id }}">{{ where }}</a>{% else %}{{ where }}{% endif %}
+          {%- if r.device_ip and r.device_ip != where %} <span class="device-ip">{{ r.device_ip }}</span>{% endif %}</td>
+        <td class="nowrap" title="Found {{ r.first_seen|ts }}; fixed {{ r.resolved_at|ts }}">{{ when(r.resolved_at) }}</td>
+        <td class="nowrap" title="{{ r.hours_open|hours }}">{{ (r.time_open_text or (r.hours_open|hours))|replace('Open for ', '') }}</td>
+        <td class="wrap">{{ r.how_text or '' }} <span class="tech-word">{{ 'verified by rescan' if r.how == 'auto' else 'marked fixed' }}</span></td>
       </tr>
-      {% else %}<tr><td colspan="7" class="empty">Nothing has been remediated in this window yet.</td></tr>{% endfor %}
+      {% else %}<tr><td colspan="6" class="empty">Nothing has been fixed in this period yet.</td></tr>{% endfor %}
     </tbody>
   </table>
   </div>
@@ -102,70 +198,70 @@
 </section>
 
 <section class="card">
-  <div class="card-head"><h2>Still open — what to do next</h2>
-    <span class="muted small">highest severity and oldest first</span></div>
-  {% for w in data.open_worklist %}
+  <div class="card-head"><h2>What to do next <span class="page-tech">Still open</span></h2>
+    <span class="muted small">most urgent and oldest first · open each one for the steps</span></div>
+  {% for w in work %}
+  {% set where = w.device_label or w.device_name or w.subject %}
   <article class="work" data-id="{{ w.row_id }}">
     <div class="work-head">
       {{ sev(w.severity) }}
-      <b class="work-title">{{ w.title }}</b>
-      <span class="muted small">{{ w.device_name or w.subject }} · open {{ w.age_days }} day{{ '' if w.age_days == 1 else 's' }} · seen {{ w.occurrences }}× · <span class="mono">{{ w.finding_id }}</span></span>
-      <button class="btn btn-sm no-print" data-action="toggle" data-target="#work-{{ w.row_id }}">steps</button>
+      <b class="work-title">{{ w.plain_title or w.title }}</b>
     </div>
-    <div class="work-body" id="work-{{ w.row_id }}">
+    <div class="work-head">
+      <span class="muted small">
+        {%- if w.link_device_id %}<a href="/devices/{{ w.link_device_id }}">{{ where }}</a>{% else %}{{ where }}{% endif %}
+        {%- if w.device_ip and w.device_ip != where %} <span class="device-ip">{{ w.device_ip }}</span>{% endif %}
+        · {{ w.age_text or ('open ' ~ w.age_days ~ ' days') }} · found {{ w.occurrences }} time{{ '' if w.occurrences == 1 else 's' }}</span>
+      <button class="btn btn-sm no-print" type="button" data-action="toggle" data-target="#work-{{ w.row_id }}" data-label-alt="Hide the steps" aria-expanded="false" aria-controls="work-{{ w.row_id }}">How to fix this</button>
+    </div>
+    <div class="work-body" id="work-{{ w.row_id }}" hidden>
       {% if w.detail %}<p class="muted small wrap">{{ w.detail }}</p>{% endif %}
       {% if w.remediation %}
       <h4>How to fix it</h4>
       <ol>{% for step in w.remediation %}<li>{{ step }}</li>{% endfor %}</ol>
-      {% else %}<p class="muted small">No remediation steps are recorded for {{ w.finding_id }} yet.</p>{% endif %}
+      {% else %}<p class="muted small">No steps are recorded for {{ w.finding_id }} yet.</p>{% endif %}
+      <div class="actions no-print">
+        <button class="btn btn-sm" data-action="finding-status" data-id="{{ w.row_id }}" data-status="acknowledged" title="Keeps it on the list, marked as seen (acknowledged)">I've seen this</button>
+        <button class="btn btn-sm btn-ok" data-action="finding-status" data-id="{{ w.row_id }}" data-status="resolved" title="{{ 'Home SOC cannot re-check this one; it stays closed until it happens again' if w.finding_id in not_rechecked else 'Home SOC checks again on the next scan and reopens it if it is still there' }}">I've fixed it</button>
+        <a class="btn btn-sm" href="/findings?status=open&q={{ w.finding_id }}">Open in Things to fix</a>
+      </div>
+      {% call ui.tech_details() %}
+      <p class="small">{% if w.plain_title and w.plain_title != w.title %}{{ w.title }} · {% endif %}<span class="mono">{{ w.finding_id }}</span> · category {{ w.category }} · severity {{ w.severity }} · subject <span class="mono">{{ w.subject }}</span> · first seen {{ w.first_seen|ts }}</p>
       {% if w.refs %}
       <h4>References</h4>
       <ul>{% for r in w.refs %}<li><a class="link wrap" href="{{ r }}" rel="noreferrer noopener" target="_blank">{{ r }}</a></li>{% endfor %}</ul>
       {% endif %}
-      <div class="actions no-print">
-        <button class="btn btn-sm" data-action="finding-status" data-id="{{ w.row_id }}" data-status="acknowledged">Acknowledge</button>
-        <button class="btn btn-sm btn-ok" data-action="finding-status" data-id="{{ w.row_id }}" data-status="resolved">Mark resolved</button>
-        <a class="btn btn-sm" href="/findings?focus={{ w.row_id }}">Open in Findings</a>
-      </div>
+      {% endcall %}
     </div>
   </article>
   {% else %}
-  <p class="empty">Nothing is open. Everything Home SOC found has been fixed, acknowledged or suppressed.</p>
+  <p class="empty">Nothing is open.{% if staleness.never %} Home SOC hasn't checked your network yet, so nothing has been found.{% else %} Everything Home SOC found has been fixed, marked as seen, or ignored.{% endif %}</p>
   {% endfor %}
 </section>
 
 <div class="grid grid-2">
   <section class="card">
-    <h2>Coverage — what was actually checked</h2>
+    <h2>What Home SOC checked <span class="page-tech">Coverage — what was actually checked</span></h2>
     <ul class="check-list">
-      <li><span class="cid">Devices</span><span class="cv">{{ cov.devices_total }} known, {{ cov.devices_online }} online</span><span>{{ badge('ok' if cov.devices_total else 'never', 'scanned' if cov.devices_total else 'never') }}</span></li>
-      <li><span class="cid">Open ports</span><span class="cv">{{ cov.services_seen }} open service port(s) seen</span><span></span></li>
-      <li><span class="cid">CVEs</span><span class="cv">{{ cov.cves_matched }} matched, {{ cov.kev_matches }} in CISA KEV</span><span>{{ badge('kev', 'KEV ' ~ cov.kev_matches) if cov.kev_matches else '' }}</span></li>
-      <li><span class="cid">Feeds</span><span class="cv">{{ cov.feeds_current }} / {{ cov.feeds_total }} current{% if cov.feeds_stale %} · stale: {{ cov.feeds_stale|join(', ') }}{% endif %}</span><span>{{ badge('warn' if cov.feeds_stale else 'ok', 'stale' if cov.feeds_stale else 'fresh') }}</span></li>
-      <li><span class="cid">DNS filter</span><span class="cv">{{ cov.dns.queries_24h|num }} queries / 24 h, {{ cov.dns.blocked_24h|num }} blocked ({{ (cov.dns.block_rate * 100)|round|int }}%), {{ cov.dns.clients_24h }} client(s)</span><span>{{ badge('ok' if cov.dns.enabled else 'off', 'on' if cov.dns.enabled else 'off') }}</span></li>
-      <li><span class="cid">Defender</span><span class="cv">{% if dfn.available %}antivirus {{ 'on' if dfn.av_enabled else 'off' }}, real-time protection {{ 'on' if dfn.rtp else 'off' }}, signatures {{ dfn.signature_age_days }} day(s) old, {{ dfn.threats_30d }} detection(s){% else %}no status recorded yet{% endif %}</span><span>{{ badge('ok' if dfn.av_enabled else 'warn', 'protected' if dfn.av_enabled else 'unknown') }}</span></li>
+      <li><span class="cid">Devices</span><span class="cv">{{ cov.devices_total }} known, {{ cov.devices_online }} online at the last device check</span><span>{{ badge('ok' if cov.devices_total else 'never', 'checked' if cov.devices_total else 'not yet') }}</span></li>
+      <li><span class="cid">Open doors</span><span class="cv">{{ cov.services_seen }} open {{ ui.term('port', 'ports') }} seen on your devices</span><span></span></li>
+      <li><span class="cid">Known flaws</span><span class="cv">{{ cov.cves_matched }} known software flaws ({{ ui.term('CVE', 'CVEs') }}) matched; {{ cov.kev_matches }} {{ 'is' if cov.kev_matches == 1 else 'are' }} on the list of flaws attackers are known to have used ({{ ui.term('KEV') }})</span><span>{{ badge('kev', 'KEV ' ~ cov.kev_matches) if cov.kev_matches else '' }}</span></li>
+      <li><span class="cid">Threat lists</span><span class="cv">{{ cov.feeds_current }} of {{ cov.feeds_total }} up to date{% if cov.feeds_stale %}
+          {% call ui.tech_details('Which ones are out of date') %}<span class="mono">{{ cov.feeds_stale|join(', ') }}</span>{% endcall %}{% endif %}</span><span>{{ badge('never', 'not downloaded') if not cov.feeds_total else badge('warn' if cov.feeds_stale else 'ok', 'out of date' if cov.feeds_stale else 'up to date') }}</span></li>
+      <li><span class="cid">Web blocking</span><span class="cv">{{ cov.dns.queries_24h|num }} website look-ups ({{ ui.term('DNS') }}) in the last 24 h, {{ cov.dns.blocked_24h|num }} blocked ({{ (cov.dns.block_rate * 100)|round|int }}%), {{ cov.dns.clients_24h }} device{{ '' if cov.dns.clients_24h == 1 else 's' }}</span><span>{{ badge('ok' if cov.dns.enabled else 'off', 'switched on' if cov.dns.enabled else 'off') }}</span></li>
+      <li><span class="cid">Antivirus</span><span class="cv">{% if dfn.available %}Windows Defender {{ 'on' if dfn.av_enabled else 'off' }}, real-time protection {{ 'on' if dfn.rtp else 'off' }}, virus definitions {{ dfn.signature_age_days }} day{{ '' if dfn.signature_age_days == 1 else 's' }} old, {{ dfn.threats_30d }} detection{{ '' if dfn.threats_30d == 1 else 's' }} in 30 days{% else %}No antivirus status recorded yet{% endif %}</span><span>{{ badge('ok' if dfn.av_enabled else 'warn', 'protected' if dfn.av_enabled else 'not confirmed') }}</span></li>
     </ul>
-    <h3>Last scan of each kind</h3>
-    <div class="chips">
-      {% for kind, ts in cov.last_scans.items() %}<span class="chip"><b>{{ kind }}</b> {{ ts|ago }}</span>{% endfor %}
-    </div>
+    <h3 class="h-mt">When each check last ran</h3>
+    <ul class="check-list">
+      {% for kind, ts in cov.last_scans.items() %}<li><span class="cid">{{ CHECK_WORDS.get(kind, kind) }}</span><span class="cv" title="{{ ts|ts }}">{{ when(ts) }}</span><span class="tech-word">{{ kind }}</span></li>
+      {% else %}<li><span class="cv">No check has run yet.</span></li>{% endfor %}
+    </ul>
   </section>
   <section class="card">
-    <h2>Not checked</h2>
+    <h2>What Home SOC could not check <span class="page-tech">Not checked</span></h2>
     {% if data.notes %}
     <ul class="notes">{% for n in data.notes %}<li>{{ n }}</li>{% endfor %}</ul>
     {% else %}<p class="muted small">Nothing was skipped: every check Home SOC knows about ran.</p>{% endif %}
-    <h3>Devices with the most open findings</h3>
-    <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr><th>Device</th><th>IP</th><th class="num">Open</th><th class="num">Resolved</th></tr></thead>
-      <tbody>
-        {% for d in data.top_devices %}
-        <tr><td class="wrap"><a class="link" href="/devices/{{ d.device_id }}">{{ d.name }}</a></td><td class="mono">{{ d.ip or '' }}</td><td class="num">{{ d.open }}</td><td class="num">{{ d.resolved }}</td></tr>
-        {% else %}<tr><td colspan="4" class="empty">No device findings yet.</td></tr>{% endfor %}
-      </tbody>
-    </table>
-    </div>
   </section>
 </div>
 {% endblock %}

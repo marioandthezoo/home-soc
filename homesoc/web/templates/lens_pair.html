@@ -3,8 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e5e0d5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#3a332d" media="(prefers-color-scheme: dark)">
 <title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+{# External, not deferred: applies the saved Day/Dusk choice before the first paint (CSP forbids inline script). #}
+<script src="{{ url_for('static', filename='theme.js') }}"></script>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
 </head>
@@ -12,11 +17,11 @@
 <main class="main pair-main">
 
   <header class="topbar">
-    <h1 class="page-title">Pair a phone</h1>
+    <div class="page-head"><h1 class="page-title">Pair a phone</h1><span class="page-tech">Lens pairing</span></div>
     <div class="topbar-stats">
       <a class="chip" href="/lens/stickers">Sticker sheet</a>
       <a class="chip" href="/devices">Devices</a>
-      <a class="chip" href="/">Dashboard</a>
+      <a class="chip" href="/">Home</a>
     </div>
   </header>
 
@@ -32,7 +37,8 @@
             <p class="muted small">{{ chk.detail }}</p>
             {% if chk.fix %}
             <ol class="steps">
-              {% for step in chk.fix %}<li><code>{{ step }}</code></li>{% endfor %}
+              {#- Prose stays prose; only the command, script or file is set in monospace. -#}
+              {% for step in chk.fix %}<li>{% for text, is_code in step|code_parts %}{% if is_code %}<code>{{ text }}</code>{% else %}{{ text }}{% endif %}{% endfor %}</li>{% endfor %}
             </ol>
             {% endif %}
           </div>
@@ -58,9 +64,10 @@
           <button class="btn" type="submit">New pairing code</button>
         </form>
         <ol class="steps pair-steps">
-          <li>The phone will warn that the certificate is not trusted — this is expected for a self-signed certificate on your own LAN.</li>
-          <li>Check the fingerprint the phone shows against the one printed below, then choose <b>Advanced → Proceed</b>.</li>
-          <li>Lens claims the code, stores a token on the phone, and opens the viewfinder.</li>
+          <li>The phone will warn that the connection's certificate is not trusted. That is expected: Home SOC made its
+            own certificate (self-signed) for your home network.</li>
+          <li>Check the security fingerprint the phone shows against the one on this page, then choose <b>Advanced → Proceed</b>.</li>
+          <li>Lens uses the code once, remembers the pairing on the phone (a token), and opens the camera.</li>
         </ol>
       {% elif can_mint and not minted %}
         <p class="muted">A pairing code is only created when you ask for one, and it stops working after five minutes
@@ -69,32 +76,33 @@
           <button class="btn btn-primary" type="submit">Show a pairing code</button>
         </form>
       {% elif not blocked %}
-        <p class="warn-strip">The pairing service is not installed in this build, so no code could be minted.
+        <p class="warn-strip">The pairing service is not installed in this build, so no code could be made.
           Everything else on this page is live. Install the Lens package and reload.</p>
       {% else %}
-        <p class="muted">No pairing code was minted — fix the items on the left first.</p>
+        <p class="muted">No pairing code yet: fix the items marked <b>Fix</b> first.</p>
       {% endif %}
     </section>
 
     <section class="card panel">
-      <h2>Certificate fingerprint (SHA-256)</h2>
+      <h2>Security fingerprint <span class="page-tech">Certificate fingerprint (SHA-256)</span></h2>
       {% if fingerprint %}
       {# The groups are visual only: the separating ":" stays in the markup (hidden from view
          by .fp-sep) so selecting the line and copying it yields the real colon-separated
          fingerprint, which is exactly what the user is told to compare against. #}
       <p class="fingerprint mono">{% for group in fingerprint %}{% if not loop.first %}<span class="fp-sep">:</span>{% endif %}<span class="fp-group">{{ group }}</span>{% endfor %}</p>
-      <p class="muted small">Compare this with the fingerprint the phone shows when it warns about the certificate.
-        They must match exactly. If they do not, stop: something else answered on that address.</p>
+      <p class="muted small">This proves the phone is talking to your Home SOC. Compare it with the fingerprint the
+        phone shows when it warns about the certificate. They must match exactly. If they do not, stop: something
+        else answered on that address.</p>
       {% if cert.not_after %}<p class="muted small">Valid until {{ cert.not_after[:10] }}{% if cert.sans %} · covers {{ cert.sans|join(', ') }}{% endif %}.</p>{% endif %}
       {% else %}
       <p class="muted">No certificate to fingerprint yet. {{ cert.error or 'Generate one with the command above.' }}</p>
       {% endif %}
       <h3>Afterwards</h3>
       <ul class="plain-list muted small">
-        <li>Paired phones expire after {{ ttl_days }} day{{ '' if ttl_days == 1 else 's' }}{{ ' (never, while token_ttl_days is 0)' if not ttl_days else '' }}.</li>
-        <li>List them with <code>python -m homesoc lens tokens</code>.</li>
-        <li>Revoke one with <code>python -m homesoc lens revoke &lt;id&gt;</code>, or all of them with <code>--all</code>.</li>
-        <li>Lens is read-only unless <code>[lens] allow_actions</code> is true (currently {{ 'on' if lens.allow_actions else 'off' }}).</li>
+        <li>A paired phone stops working after {{ ttl_days }} day{{ '' if ttl_days == 1 else 's' }}{{ ' (never, while token_ttl_days is 0)' if not ttl_days else '' }}, and is paired again the same way.</li>
+        <li>See the paired phones with <code>python -m homesoc lens tokens</code>.</li>
+        <li>Un-pair one with <code>python -m homesoc lens revoke &lt;id&gt;</code>, or all of them with <code>--all</code>.</li>
+        <li>Lens can only look, not change anything, unless <code>[lens] allow_actions</code> is true (currently {{ 'on' if lens.allow_actions else 'off' }}).</li>
       </ul>
     </section>
   </div>

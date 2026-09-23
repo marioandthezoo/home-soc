@@ -13,6 +13,7 @@ import importlib
 import json
 import logging
 import re
+import secrets
 import socket
 import sqlite3
 from dataclasses import dataclass, field
@@ -44,20 +45,44 @@ FEED_WINDOWS: tuple[tuple[str, str, int], ...] = (
     ("30d", "Last 30 days", 24 * 30),
     ("all", "All time", 0),
 )
-NAV: list[tuple[str, str, str]] = [
-    ("overview", "/", "Overview"),
-    ("feed", "/feed", "Activity feed"),
-    ("summary", "/summary", "Summary"),
-    ("findings", "/findings", "Findings"),
-    ("devices", "/devices", "Devices"),
-    ("map", "/map", "Dependency map"),
-    ("vulns", "/vulns", "Vulnerabilities"),
-    ("host", "/host", "Host posture"),
-    ("dns", "/dns", "DNS filter"),
-    ("telemetry", "/telemetry", "Telemetry"),
-    ("scans", "/scans", "Scans"),
-    ("settings", "/settings", "Settings"),
+#: Sidebar navigation: (page key, URL, plain label, technical name). Everyday pages first, then
+#: the "Advanced" group (NAV_ADVANCED). The URLs never change — bookmarks, Lens and the docs
+#: depend on them; only the words do. The technical name is kept beside the plain one (the
+#: link's tooltip and the page heading), never dropped: the owner still needs it.
+#: The map's label is deliberately about dependence, never "connections": Home SOC cannot see
+#: devices talking to each other, and the map is not a traffic diagram (SPEC_TOPOLOGY C1).
+NAV: list[tuple[str, str, str, str]] = [
+    ("overview", "/", "Home", "Overview"),
+    ("findings", "/findings", "Things to fix", "Findings"),
+    ("devices", "/devices", "Devices", "Devices"),
+    ("feed", "/feed", "What happened", "Activity feed"),
+    ("summary", "/summary", "Report", "Security summary"),
+    ("host", "/host", "This computer", "Host posture"),
+    ("dns", "/dns", "Blocking", "DNS filter"),
 ]
+NAV_ADVANCED: list[tuple[str, str, str, str]] = [
+    ("map", "/map", "What depends on what", "Dependency map"),
+    ("vulns", "/vulns", "Known flaws", "Vulnerabilities"),
+    ("scans", "/scans", "Checks", "Scans"),
+    ("telemetry", "/telemetry", "System health", "Telemetry"),
+    ("settings", "/settings", "Settings", "Settings"),
+]
+#: Page headings (plain words) and the technical name shown beside them.
+PAGE_TITLES: dict[str, str] = {
+    "overview": "Home",
+    "findings": "Things to fix",
+    "devices": "Devices",
+    "feed": "What happened",
+    "summary": "Your safety report",
+    "host": "This computer",
+    "dns": "Web blocking",
+    "map": "What depends on what",
+    "vulns": "Known software flaws",
+    "scans": "Checks",
+    "telemetry": "System health",
+    "settings": "Settings",
+}
+PAGE_TECH: dict[str, str] = {key: tech for key, _href, _label, tech in NAV + NAV_ADVANCED}
 
 # Lens (SPEC addendum B). Paths that authenticate themselves rather than through the dashboard
 # token: the two phone pages are shells with no device data in them (everything they show is
@@ -312,7 +337,7 @@ _HTTPS_REQUIRED_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#0b0d13">
+<meta name="theme-color" content="#1d1915">
 <title>Lens needs HTTPS</title>
 <link rel="stylesheet" href="/static/lens.css">
 </head><body class="lens no-video">
@@ -484,9 +509,11 @@ def _register_template_helpers(app: Flask) -> None:
         if dt is None:
             return "never"
         secs = int((api.utcnow() - dt).total_seconds())
+        # Words, not unit letters: "8 days ago", "in 3 hours", "just now".
         if secs < 0:
-            return "in " + _span(-secs)
-        return _span(secs) + " ago"
+            ahead = human_age(-secs)
+            return "in a moment" if ahead == "just now" else "in " + ahead[: -len(" ago")]
+        return human_age(secs)
 
     @app.template_filter("ts")
     def _ts(value: Any) -> str:
@@ -518,14 +545,379 @@ def _register_template_helpers(app: Flask) -> None:
             return f"{value:.1f} h"
         return f"{value / 24:.1f} days"
 
+    app.add_template_filter(sev_word, "sev_word")
+    app.add_template_filter(status_word, "status_word")
+    app.add_template_filter(score_word, "score_word")
+    app.add_template_filter(device_label, "device_label")
+    app.add_template_filter(css_token, "css_token")
+    app.add_template_filter(code_parts, "code_parts")
+
     app.jinja_env.globals.update(
         badge=_badge,
-        sev=lambda s: _badge(s, s),
+        sev=sev_badge_markup,
         nav=NAV,
+        nav_advanced=NAV_ADVANCED,
         severities=api.SEVERITIES,
         statuses=api.STATUSES,
         icon_glyph=ICON_GLYPH,
+        glossary=GLOSSARY,
+        glossary_tip=glossary_tip,
+        sev_words=SEV_WORDS,
+        status_words=STATUS_WORDS,
+        not_rechecked=api.NOT_RECHECKED_IDS,
+        term_id=term_id,
     )
+
+    @app.context_processor
+    def _shell_context() -> dict[str, Any]:
+        # Every page (base.html) gets the staleness of the last network check, so the honesty
+        # banner can render at the top of any page. Computed once per request.
+        return {"staleness": _request_staleness(app)}
+
+
+# --------------------------------------------------------------------------- plain language
+#
+# Friendly words sit BESIDE the technical ones, never instead of them: the owner is technical
+# and still needs the detail. Every helper below returns plain text; escaping stays Jinja's job
+# (autoescape), so nothing here may be wrapped in Markup unless it escapes its inputs itself.
+
+SEV_WORDS: dict[str, str] = {
+    "critical": "Fix now",
+    "high": "Fix this week",
+    "medium": "Worth fixing",
+    "low": "When you have time",
+    "info": "Good to know",
+}
+STATUS_WORDS: dict[str, str] = {
+    "open": "Needs attention",
+    "acknowledged": "Seen, not fixed yet",
+    "resolved": "Fixed",
+    "suppressed": "Ignored (your choice)",
+}
+#: Safety-score bands for the plain word next to the number (the letter grade stays in the
+#: tooltip): 0-49 "Needs work", 50-79 "Fair", 80-100 "Good".
+SCORE_BANDS: tuple[tuple[int, str], ...] = ((80, "Good"), (50, "Fair"), (0, "Needs work"))
+
+#: The glossary behind ``_macros.html``'s ``term()``: a technical word -> one plain sentence.
+#: EPSS is worded as the flaw being exploited *somewhere*, never as a risk to this household:
+#: it says nothing about whether this household is targeted.
+GLOSSARY: dict[str, str] = {
+    "DNS": "The internet's phone book: it turns website names into the numeric addresses computers use.",
+    "CVE": "An ID number for a publicly known software flaw, such as CVE-2024-3400.",
+    "KEV": "CISA's Known Exploited Vulnerabilities list: flaws that attackers are known to have used in real attacks.",
+    "EPSS": ("An estimate of the chance that a flaw is exploited somewhere in the world in the next 30 days. "
+             "It says nothing about whether your home in particular will be targeted."),
+    "CVSS": "How bad a flaw could be if someone used it, on a scale from 0 (harmless) to 10 (worst).",
+    "UPnP": "Universal Plug and Play: lets devices open doors (ports) in your router by themselves, without asking you.",
+    "port": "A numbered door on a device that a program listens behind. Fewer open doors is safer.",
+    "MAC": "A device's hardware ID on the network (its MAC address). Some phones use a different random one on each network.",
+    "IP": "A device's address on your network (its IP address). Your router may hand it a different one over time.",
+    "resolver": "The service that answers \"where is this website?\" (a DNS resolver). Web blocking works by being the one your devices ask.",
+    "firmware": "The built-in software that runs a device such as a router, camera or smart plug. Updates fix security flaws.",
+    "telemetry": ("Measurements sent automatically. For a device, the usage data it sends to its maker; "
+                  "on the System health page, Home SOC's own measurements of its checks."),
+    "Telnet": "An old way to log in to a device remotely. Everything, passwords included, travels unencrypted.",
+    "SSH": "Secure Shell: an encrypted way to log in to a device remotely. Safe with a strong password or key.",
+    "SMB": "Windows file and printer sharing. The old version, SMBv1, is unsafe and should be switched off.",
+    "RDP": "Remote Desktop: lets someone control a Windows computer over the network. Risky if others can reach it.",
+    "CPE": "A standard code naming a product and version, used to match it against lists of known flaws.",
+    "mDNS": ("How devices announce themselves on your home network (multicast DNS), for example a printer "
+             "saying \"I can print\" or a speaker saying \"you can play music here\"."),
+    "subnet": ("The range of addresses your home network hands out, such as 192.168.1.1 to 192.168.1.254. "
+               "Devices on the same subnet can reach each other directly."),
+    "gateway": ("Your router, in its role as the way out: every device sends anything meant for the internet "
+                "to it (the default gateway)."),
+    "default gateway": ("Your router, in its role as the way out: every device sends anything meant for the "
+                        "internet to it."),
+}
+_GLOSSARY_FOLDED: dict[str, str] = {k.lower(): v for k, v in GLOSSARY.items()}
+
+#: Friendly nouns for ``devices.kind`` in "Unnamed <kind>".
+KIND_NOUNS: dict[str, str] = {
+    "router": "router", "gateway": "router", "computer": "computer", "laptop": "laptop", "pc": "computer",
+    "phone": "phone", "tablet": "tablet", "tv": "TV", "speaker": "speaker", "camera": "camera",
+    "printer": "printer", "iot": "smart device", "console": "games console", "nas": "network storage",
+    "watch": "watch", "access_point": "access point", "ap": "access point", "switch": "network switch",
+}
+_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_MACISH = re.compile(r"^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$", re.IGNORECASE)
+_CSS_TOKEN = re.compile(r"[^a-z0-9-]+")
+
+
+def sev_word(severity: Any) -> str:
+    """"critical" -> "Fix now". Unknown severities get no word (the technical label stands alone)."""
+    return SEV_WORDS.get(str(severity or "").strip().lower(), "")
+
+
+def status_word(status: Any) -> str:
+    """"open" -> "Needs attention". Unknown statuses get no word."""
+    return STATUS_WORDS.get(str(status or "").strip().lower(), "")
+
+
+def score_word(score: Any) -> str:
+    """Safety score -> "Needs work" / "Fair" / "Good"; "" when there is no number."""
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return ""
+    for floor, word in SCORE_BANDS:
+        if value >= floor:
+            return word
+    return SCORE_BANDS[-1][1]
+
+
+def css_token(value: Any) -> str:
+    """A value made safe to splice into a class name: lower-case letters, digits and dashes."""
+    return _CSS_TOKEN.sub("-", str(value or "").strip().lower().replace("_", "-")).strip("-") or "unknown"
+
+
+#: The parts of a pairing "fix" step that are typed or opened literally: a command, a script, a
+#: document, a config key. Only these are set in monospace; the sentence around them is prose.
+_CODE_BITS = re.compile(
+    r'(python -m homesoc[^()]*?(?=\)|$)|pip install \S+|scripts/[\w./-]+|docs/[\w./-]+|config\.toml'
+    r'|\[web\] host = "[^"]*"|\[lens\] \w+|web\.host|(?<!\S)--[a-z][\w-]*)'
+)
+
+
+def code_parts(step: Any) -> list[tuple[str, bool]]:
+    """Split a step into ``(text, is_code)`` runs so only the command or path is monospace.
+
+    "Run scripts/enable-lens.ps1 as administrator" ->
+    ``[("Run ", False), ("scripts/enable-lens.ps1", True), (" as administrator", False)]``.
+    Plain text; escaping stays Jinja's job.
+    """
+    text = str(step or "")
+    out: list[tuple[str, bool]] = []
+    pos = 0
+    for m in _CODE_BITS.finditer(text):
+        bit = m.group(0).rstrip(" .")
+        start, end = m.start(), m.start() + len(bit)
+        if start > pos:
+            out.append((text[pos:start], False))
+        out.append((bit, True))
+        pos = end
+    if pos < len(text):
+        out.append((text[pos:], False))
+    return out or [(text, False)]
+
+
+def term_id() -> str:
+    """A page-unique id for a glossary tooltip's hidden description (``aria-describedby``)."""
+    try:
+        n = int(getattr(g, "_term_seq", 0)) + 1
+        g._term_seq = n
+    except RuntimeError:  # rendered outside a request (a test calling the macro directly)
+        n = secrets.randbelow(1_000_000)
+    return f"term-tip-{n}"
+
+
+def glossary_tip(word: Any) -> str:
+    """The plain explanation for a technical word, or "" when the glossary has none.
+
+    Exact key first, then case-insensitively, then without a plural "s" ("ports" -> "port")."""
+    key = str(word or "").strip()
+    if not key:
+        return ""
+    if key in GLOSSARY:
+        return GLOSSARY[key]
+    folded = key.lower()
+    if folded in _GLOSSARY_FOLDED:
+        return _GLOSSARY_FOLDED[folded]
+    if folded.endswith("s") and folded[:-1] in _GLOSSARY_FOLDED:
+        return _GLOSSARY_FOLDED[folded[:-1]]
+    return ""
+
+
+def sev_badge_markup(severity: Any, count: Any = None) -> Markup:
+    """Python twin of ``_macros.html``'s ``sev_badge``: the technical badge and its action word.
+
+    Every interpolated value goes through ``escape``; ``css_token`` keeps class names clean.
+    """
+    sev = str(severity or "").strip().lower()
+    word = sev_word(sev)
+    zero = count is not None and not _truthy_count(count)
+    text = f"{count} {sev}" if count is not None else sev
+    classes = f"badge badge-{css_token(sev)}" + (" is-zero quiet-badge" if zero else "")
+    out = f'<span class="sev-pair"><span class="{escape(classes)}" title="Severity: {escape(sev)}">{escape(text)}</span>'
+    if word:
+        word_cls = "sev-word " + ("is-zero" if zero else f"sev-word-{css_token(sev)}")
+        out += f'<span class="{escape(word_cls)}">{escape(word)}</span>'
+    return Markup(out + "</span>")
+
+
+def _truthy_count(count: Any) -> bool:
+    try:
+        return float(count) != 0
+    except (TypeError, ValueError):
+        return bool(count)
+
+
+def _get(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key)
+    try:
+        return obj[key]  # sqlite3.Row
+    except (KeyError, IndexError, TypeError):
+        return getattr(obj, key, None)
+
+
+def _is_address(value: str) -> bool:
+    return bool(_IPV4.match(value) or _MACISH.match(value) or (":" in value and value.count(":") >= 2 and all(c in "0123456789abcdefABCDEF:." for c in value)))
+
+
+def _host_label(name: str) -> str:
+    """ "This computer (<name>)": the PC Home SOC runs on, by its friendliest name.
+
+    When the devices table knows this PC by a nickname ("Home PC" for HOME-PC), that is used.
+    """
+    name = (name or "").strip() or _local_hostname()
+    friendly = _nickname_for_hostname(name) if name else ""
+    shown = friendly or name
+    return f"This computer ({shown})" if shown else "This computer"
+
+
+def _local_hostname() -> str:
+    try:
+        from homesoc import util  # type: ignore
+
+        found = str(util.local_hostname() or "")
+    except Exception:
+        found = ""
+    if not found:
+        try:
+            found = socket.gethostname()
+        except OSError:
+            found = ""
+    return found
+
+
+def _nickname_for_hostname(hostname: str) -> str:
+    """A device nickname for ``hostname``, cached per request; "" outside a request or on error."""
+    try:
+        from flask import has_request_context
+
+        if not has_request_context() or getattr(g, "homesoc", None) is None:
+            return ""
+        cache: dict[str, str] = g.setdefault("homesoc_host_names", {})
+        key = hostname.lower()
+        if key not in cache:
+            row = api.one(
+                g.homesoc.conn,
+                "SELECT nickname FROM devices WHERE lower(hostname)=? AND nickname IS NOT NULL AND nickname<>'' "
+                "ORDER BY last_seen DESC LIMIT 1",
+                (key,),
+            )
+            cache[key] = str(row["nickname"]) if row and row.get("nickname") else ""
+        return cache[key]
+    except Exception:  # a label must never break a page
+        return ""
+
+
+def device_label(value: Any) -> str:
+    """What to call a device: its name, never its bare address when a name exists.
+
+    Accepts a device row, an API dict (``nickname``/``hostname``/``display_name``/``label``/
+    ``device_name``/``device_label``), a finding (``subject`` + ``device_name``), or a bare
+    subject string. The IP belongs *next to* this label, muted, in the template.
+
+    * named devices: nickname, then hostname, then any other name the payload carries;
+    * unnamed devices: "Unnamed camera", "Unnamed device" — never the IP twice;
+    * the PC Home SOC runs on (``host`` / ``host:NAME`` subjects): "This computer (NAME)".
+    """
+    if value is None:
+        return "Unnamed device"
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "host" or text.startswith("host:"):
+            return _host_label(text[5:] if text.startswith("host:") else "")
+        if not text or _is_address(text) or text.startswith("device:"):
+            return "Unnamed device"
+        return text
+    subject = str(_get(value, "subject") or "")
+    if (subject == "host" or subject.startswith("host:")) and _get(value, "device_id") is None:
+        return _host_label(subject[5:] if subject.startswith("host:") else "")
+    addresses = {str(_get(value, k) or "").strip().lower() for k in ("ip", "mac", "device_ip")} - {""}
+    for key in ("nickname", "hostname", "device_name", "display_name", "name", "label", "device_label"):
+        raw = _get(value, key)
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if name and name.lower() not in addresses and not _is_address(name) and not name.lower().startswith("unnamed"):
+            return name
+    precomputed = str(_get(value, "device_label") or "").strip()
+    if precomputed and not _is_address(precomputed):
+        return precomputed  # e.g. "Unnamed camera" from the API
+    kind = str(_get(value, "kind") or "").strip().lower()
+    return f"Unnamed {KIND_NOUNS.get(kind, 'device')}"
+
+
+# --------------------------------------------------------------------------- staleness
+#
+# An honesty feature: a screen left up for days must not look current when Home SOC has not
+# looked at the network in a week. "Last check" is the newest discovery scan that actually
+# finished (ok or partial — an aborted or failed run did not look). It is stale when it is older
+# than three discovery intervals, or older than 24 hours whatever the interval.
+
+STALE_FACTOR = 3
+STALE_CEILING_MINUTES = 24 * 60
+CHECKED_STATUSES: tuple[str, ...] = ("ok", "partial")
+
+
+def human_age(seconds: float) -> str:
+    """ "just now", "5 minutes ago", "3 hours ago", "8 days ago"."""
+    secs = int(max(0, seconds))
+    if secs < 60:
+        return "just now"
+    for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if secs >= size:
+            n = secs // size
+            return f"{n} {unit}{'' if n == 1 else 's'} ago"
+    return "just now"  # pragma: no cover - unreachable
+
+
+def discovery_minutes(cfg: Any) -> int:
+    try:
+        minutes = int(api.cfg_get(cfg, "schedule.discovery_minutes", 10) or 10)
+    except (TypeError, ValueError):
+        minutes = 10
+    return minutes if minutes > 0 else 10
+
+
+def last_network_check(conn: sqlite3.Connection) -> str | None:
+    """ISO time the newest discovery scan finished, or None when none has."""
+    placeholders = ",".join("?" for _ in CHECKED_STATUSES)
+    value = api.scalar(
+        conn,
+        f"SELECT max(finished_at) FROM scans WHERE kind='discovery' AND finished_at IS NOT NULL AND status IN ({placeholders})",
+        CHECKED_STATUSES,
+        default=None,
+    )
+    return str(value) if value else None
+
+
+def staleness(conn: sqlite3.Connection | None, cfg: Any, now: Any = None) -> dict[str, Any]:
+    """``{stale, age_text, last_check, schedule_minutes, never, threshold_minutes}``.
+
+    ``never`` is true when no discovery has finished yet; that is not "stale" (there is nothing
+    old on screen to distrust), and the overview says so in its own words.
+    """
+    # One rule, one implementation: the data layer's api.staleness (same keys, plus age,
+    # age_seconds and the banner message). Only the validated schedule is passed on, so the shell
+    # and the API can never disagree about whether the screen is current.
+    return api.staleness(conn, {"schedule": {"discovery_minutes": discovery_minutes(cfg)}}, now)
+
+
+def _request_staleness(app: Flask) -> dict[str, Any]:
+    c = getattr(g, "homesoc", None)
+    cached = getattr(g, "homesoc_staleness", None)
+    if cached is not None:
+        return cached
+    if c is None:  # sign-in and error pages: not authenticated, say nothing about the network
+        return {"stale": False, "age_text": "", "last_check": None, "never": False,
+                "schedule_minutes": 10, "threshold_minutes": 30}
+    result = staleness(c.conn, c.cfg)
+    g.homesoc_staleness = result
+    return result
 
 
 # Ascii/unicode glyphs for feed.FeedItem.icon — no image assets, CSP-safe.
@@ -554,9 +946,13 @@ def _span(secs: int) -> str:
 
 def _page(template: str, page: str, title: str, **data: Any) -> str:
     c: api.WebContext = g.homesoc
+    tech = PAGE_TECH.get(page, "")
     base = {
         "page": page,
         "page_title": title,
+        # The technical name, shown beside the plain heading (never instead of it).
+        # Only on the page's own heading: a device page is titled with the device's name.
+        "page_tech": tech if title == PAGE_TITLES.get(page) and tech.lower() != str(title).lower() else "",
         "app_name": str(api.cfg_get(c.cfg, "general.name", "Home SOC")),
         "refresh": int(api.cfg_get(c.cfg, "web.refresh_seconds", 15) or 15),
         "dns_enabled": api._bool(api.cfg_get(c.cfg, "dns.enabled", False)),
@@ -596,23 +992,33 @@ def _register_pages(app: Flask) -> None:
     def overview():
         c: api.WebContext = g.homesoc
         graph = map_view(c.conn, c.cfg)
-        return _page("overview.html", "overview", "Overview", summary=api.summary(c),
-                     load_bearing=load_bearing(graph, 3), topology_available=graph["available"])
+        # Devices that need attention: anything with open problems, or not yet marked as yours.
+        attention = _devices_needing_attention(c.conn)
+        return _page("overview.html", "overview", PAGE_TITLES["overview"], summary=api.summary(c),
+                     load_bearing=load_bearing(graph, 3), topology_available=graph["available"],
+                     devices_attention=attention[:6])
 
     @app.get("/feed")
     def feed_page():
         c: api.WebContext = g.homesoc
         f = _feed_filters()
         items, total = feedmod.build_feed(c.conn, **_feed_kwargs(f))
+        hours = {w: h for w, _, h in FEED_WINDOWS}.get(f["window"], 24)
+        counts = feedmod.feed_counts(c.conn, 24)
+        empty_state = feedmod.feed_empty_state(
+            c.conn, total, window_hours=hours or None,
+            filtered=bool(f["kinds"] or f["severity"] or f["q"]), cfg=c.cfg)
         return _page(
             "feed.html",
             "feed",
-            "Activity feed",
+            PAGE_TITLES["feed"],
             items=items,
             total=total,
             filters=f,
             kinds=feedmod.feed_kinds(),
-            counts=feedmod.feed_counts(c.conn, 24),
+            counts=counts,
+            chips=feedmod.feed_chips(counts),
+            empty_state=empty_state,
             windows=FEED_WINDOWS,
             groups=_group_by_day(items),
         )
@@ -621,21 +1027,26 @@ def _register_pages(app: Flask) -> None:
     def summary_page():
         c: api.WebContext = g.homesoc
         days = _int_arg("days", 30, 1, 3650)
-        data = summarymod.build_summary(c.conn, days=days)
-        return _page("summary.html", "summary", "Security summary", data=data, days=days)
+        data = summarymod.build_summary(c.conn, days=days, cfg=c.cfg, plain=True)
+        return _page("summary.html", "summary", PAGE_TITLES["summary"], data=data, days=days,
+                     fixed_split=api.resolved_split(c.conn))
 
     @app.get("/findings")
     def findings():
         c: api.WebContext = g.homesoc
         f = {k: (request.args.get(k) or "") for k in ("status", "severity", "category", "q")}
-        items = api.findings_list(c.conn, status=f["status"] or None, severity=f["severity"] or None, q=f["q"][:200] or None, category=f["category"] or None)
+        # "Things to fix" opens on what needs attention; an explicit ?status= (empty = everything)
+        # is always honoured. Filtering in SQL keeps the row limit for the open ones.
+        status = f["status"] if "status" in request.args else "open"
+        items = api.findings_list(c.conn, status=status or None, severity=f["severity"] or None, q=f["q"][:200] or None, category=f["category"] or None)
         categories = sorted(set(api.CATEGORY_BY_PREFIX.values()) | {i["category"] for i in items})
-        return _page("findings.html", "findings", "Findings", findings=items, filters=f, categories=categories, counts=api.finding_counts(c.conn))
+        return _page("findings.html", "findings", PAGE_TITLES["findings"], findings=items, filters=f, categories=categories,
+                     counts=api.finding_counts(c.conn), fixed_split=api.resolved_split(c.conn))
 
     @app.get("/devices")
     def devices():
         c: api.WebContext = g.homesoc
-        return _page("devices.html", "devices", "Devices", devices=api.devices_list(c.conn), counts=api.device_counts(c.conn))
+        return _page("devices.html", "devices", PAGE_TITLES["devices"], devices=api.devices_list(c.conn), counts=api.device_counts(c.conn))
 
     @app.get("/devices/<int:device_id>")
     def device_detail(device_id: int):
@@ -644,7 +1055,13 @@ def _register_pages(app: Flask) -> None:
         if d is None:
             abort(404)
         graph = map_view(c.conn, c.cfg)
-        return _page("device_detail.html", "devices", d["display_name"], device=d,
+        host_findings = None
+        if d.get("is_this_computer"):
+            # This computer's own settings findings are filed under "host:<NAME>", not its device id.
+            host_findings = [f for f in api.findings_list(c.conn, q="host", status="open", limit=5000)
+                             if f.get("device_id") is None and (str(f.get("subject") or "") == "host"
+                                                                or str(f.get("subject") or "").startswith("host:"))]
+        return _page("device_detail.html", "devices", device_label(d), device=d, host_findings=host_findings,
                      dep=device_dependencies(c.conn, c.cfg, device_id, graph))
 
     @app.get("/map")
@@ -671,7 +1088,7 @@ def _register_pages(app: Flask) -> None:
                 if blast is not None
             }
         return _page(
-            "map.html", "map", "Dependency map",
+            "map.html", "map", PAGE_TITLES["map"],
             mapdata={k: v for k, v in graph.items() if not k.startswith("_")},
             available=graph["available"],
             reason=graph["reason"],
@@ -711,7 +1128,7 @@ def _register_pages(app: Flask) -> None:
         except ValueError:
             min_cvss = None
         items = api.vulns_list(c.conn, kev=api._bool(f["kev"]), q=f["q"][:200] or None, min_cvss=min_cvss)
-        return _page("vulns.html", "vulns", "Vulnerabilities", vulns=items, filters=f)
+        return _page("vulns.html", "vulns", PAGE_TITLES["vulns"], vulns=items, filters=f)
 
     @app.get("/host")
     def host():
@@ -720,7 +1137,7 @@ def _register_pages(app: Flask) -> None:
         groups: dict[str, list[dict]] = {}
         for chk in data["checks"]:
             groups.setdefault(chk["group"], []).append(chk)
-        return _page("host.html", "host", "Host posture", host=data, groups=groups)
+        return _page("host.html", "host", PAGE_TITLES["host"], host=data, groups=groups)
 
     @app.get("/dns")
     def dns():
@@ -728,24 +1145,25 @@ def _register_pages(app: Flask) -> None:
         return _page(
             "dns.html",
             "dns",
-            "DNS filter",
+            PAGE_TITLES["dns"],
             dns=api.dns_summary(c),
             top_blocked=api.dns_top(c.conn, "blocked"),
             top_clients=api.dns_top(c.conn, "clients"),
             lists=api.dns_lists(c),
             overrides=api.dns_overrides(c.conn),
             reputation=api.dns_reputation(c.conn, 100),
+            threat_lists=sorted(feedmod.THREAT_LISTS),
         )
 
     @app.get("/telemetry")
     def telemetry():
         c: api.WebContext = g.homesoc
-        return _page("telemetry.html", "telemetry", "Telemetry", jobs=api.telemetry_jobs(c), scans=api.scans_list(c.conn, 50), metric_names=api.telemetry_metrics(c.conn)["names"])
+        return _page("telemetry.html", "telemetry", PAGE_TITLES["telemetry"], jobs=api.telemetry_jobs(c), scans=api.scans_list(c.conn, 50), metric_names=api.telemetry_metrics(c.conn)["names"])
 
     @app.get("/scans")
     def scans():
         c: api.WebContext = g.homesoc
-        return _page("scans.html", "scans", "Scans", scans=api.scans_list(c.conn), last=api.last_scans(c.conn), kinds=api.SCAN_KINDS)
+        return _page("scans.html", "scans", PAGE_TITLES["scans"], scans=api.scans_list(c.conn), last=api.last_scans(c.conn), kinds=api.SCAN_KINDS)
 
     @app.get("/settings")
     def settings():
@@ -754,7 +1172,42 @@ def _register_pages(app: Flask) -> None:
         sections: dict[str, list[dict]] = {}
         for it in items:
             sections.setdefault(it["section"], []).append(it)
-        return _page("settings.html", "settings", "Settings", sections=sections)
+        return _page("settings.html", "settings", PAGE_TITLES["settings"], sections=sections)
+
+
+def _devices_needing_attention(conn: sqlite3.Connection) -> list[dict]:
+    """Devices with open problems (worst first), then devices not yet marked as yours.
+
+    Each row gains ``to_fix`` (its own open findings plus, for this computer, the ones about its
+    settings) and ``worst_severity``, so the Home page can colour and word it like the rest.
+    """
+    rank = {s: i for i, s in enumerate(api.SEVERITIES)}
+    worst: dict[int, str] = {}
+    for r in api.rows(conn, "SELECT device_id, severity FROM findings WHERE status='open' AND device_id IS NOT NULL"):
+        sev = str(r.get("severity") or "info").lower()
+        did = int(r["device_id"])
+        if rank.get(sev, 9) < rank.get(worst.get(did, ""), 9):
+            worst[did] = sev
+    host_worst = ""
+    for r in api.rows(conn, "SELECT severity FROM findings WHERE status='open' AND device_id IS NULL AND "
+                            "(subject='host' OR substr(subject,1,5)='host:')"):
+        sev = str(r.get("severity") or "info").lower()
+        if rank.get(sev, 9) < rank.get(host_worst, 9):
+            host_worst = sev
+    out = []
+    for d in api.devices_list(conn):
+        to_fix = int(d.get("open_findings") or 0) + int(d.get("host_findings_open") or 0)
+        sev = worst.get(int(d["id"]), "")
+        if d.get("is_this_computer") and host_worst and rank.get(host_worst, 9) < rank.get(sev, 9):
+            sev = host_worst
+        if not to_fix and d.get("trusted"):
+            continue
+        d["to_fix"] = to_fix
+        d["worst_severity"] = sev or None
+        out.append(d)
+    out.sort(key=lambda d: (0 if d["to_fix"] else 1, rank.get(d["worst_severity"] or "", 9), -d["to_fix"],
+                            bool(d.get("trusted")), str(d.get("device_label") or "").lower()))
+    return out
 
 
 # --------------------------------------------------------------------------- topology (addendum C)
@@ -1460,6 +1913,7 @@ def _register_lens_pages(app: Flask) -> None:
             minting=installed,
             minted=minting_now,
             missing=sum(1 for i in ids if i not in codes),
+            device_total=int(api.scalar(c.conn, "SELECT count(*) FROM devices", default=0) or 0),
         )
 
 

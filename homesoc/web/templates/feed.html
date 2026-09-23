@@ -1,39 +1,98 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- "What happened" (the activity feed). Plain words sit beside the technical ones: each chip's
+    tooltip keeps the feed's own kind name, and the filter keeps the severity keys.
+
+    The plain kind names mirror homesoc/web/feed.py PLAIN_LABEL_BY_KIND. When the page is handed
+    `chips` (feed.feed_chips) or `empty_state` (feed.feed_empty_state) those win; until then the
+    same rules are applied here from what the page already has (counts, filters, staleness). -#}
 {% block content %}
+{%- set plain_kind = {
+  'finding_new': 'New problems found',
+  'finding_reopened': 'Problems that came back',
+  'finding_resolved': 'Marked fixed',
+  'finding_auto_resolved': 'Fixed and re-checked',
+  'finding_ack': 'Marked as seen',
+  'finding_suppressed': 'Ignored',
+  'device_new': 'New devices',
+  'device_offline': 'Devices that went offline',
+  'scan': 'Checks run',
+  'feed_update': 'Threat lists updated',
+  'dns_block': 'Websites blocked',
+  'dns_threat': 'Dangerous websites blocked',
+  'av_threat': 'Antivirus detections',
+  'notification': 'Alerts sent',
+  'system': 'Home SOC messages',
+} -%}
+{#- ...and for a count of one (feed.py PLAIN_LABEL_ONE_BY_KIND). -#}
+{%- set plain_kind_one = {
+  'finding_new': 'New problem found', 'finding_reopened': 'Problem that came back',
+  'finding_resolved': 'Marked fixed', 'finding_auto_resolved': 'Fixed and re-checked',
+  'finding_ack': 'Marked as seen', 'finding_suppressed': 'Ignored', 'device_new': 'New device',
+  'device_offline': 'Device that went offline', 'scan': 'Check run', 'feed_update': 'Threat list updated',
+  'dns_block': 'Website blocked', 'dns_threat': 'Dangerous website blocked', 'av_threat': 'Antivirus detection',
+  'notification': 'Alert sent', 'system': 'Home SOC message',
+} -%}
+{%- set window_hours = {} -%}
+{%- for value, _label, hours in windows %}{% set _ = window_hours.update({value: hours}) %}{% endfor -%}
+{%- set hours = window_hours.get(filters.window, 24) -%}
+{%- if not hours -%}{%- set within = 'so far' -%}
+{%- elif hours == 1 -%}{%- set within = 'in the last hour' -%}
+{%- elif hours % 24 == 0 and hours >= 48 -%}{%- set within = 'in the last ' ~ (hours // 24) ~ ' days' -%}
+{%- else -%}{%- set within = 'in the last ' ~ hours ~ ' hours' -%}{%- endif -%}
+{%- set wider = ('7d' if hours and hours < 24 * 7 else ('30d' if hours and hours < 24 * 30 else ('all' if hours else none))) -%}
+{%- set wider_label = {'7d': 'Show the last 7 days', '30d': 'Show the last 30 days', 'all': 'Show everything'} -%}
+{%- set filtered = filters.kinds or filters.severity or filters.q -%}
+
 <script type="application/json" id="feed-state">{{ {'filters': filters, 'total': total, 'newest': (items[0].ts if items else None), 'shown': items|length}|tojson }}</script>
 
-<div class="chips feed-chips">
-  {% for k in kinds %}
-  <a class="chip chip-kind{% if k.kind in filters.kinds %} chip-on{% endif %}" href="/feed?kinds={{ k.kind }}&window={{ filters.window }}"
-     title="{{ k.label }} in the last 24 hours">
-    <span class="glyph">{{ icon_glyph.get(k.icon, '•') }}</span><b>{{ counts.get(k.kind, 0) }}</b> {{ k.label }}
+{#- Zero-count chips are hidden: a row of "0 New finding · 0 Defender detection" is noise on a
+    quiet day. A chip that is the active filter stays, so it can still be switched off. -#}
+{%- set shown_chips = [] -%}
+{%- for k in kinds -%}
+  {%- set n = counts.get(k.kind, 0) or 0 -%}
+  {%- if n or k.kind in filters.kinds %}{% set _ = shown_chips.append((k, n)) %}{% endif -%}
+{%- endfor %}
+<div class="chips feed-chips" aria-label="What happened in the last 24 hours">
+  {% for k, n in shown_chips %}
+  {%- set on = k.kind in filters.kinds -%}
+  <a class="chip chip-kind{% if on %} chip-on{% endif %}"
+     href="/feed?{% if not on %}kinds={{ k.kind }}&{% endif %}window={{ filters.window }}"
+     title="{{ n }} in the last 24 hours · technical name: {{ k.label }}{% if on %} · click to show every kind again{% endif %}">
+    <span class="glyph" aria-hidden="true">{{ icon_glyph.get(k.icon, '•') }}</span><b>{{ n }}</b> {{ (plain_kind_one if n == 1 else plain_kind).get(k.kind, k.label) }}
   </a>
+  {% else %}
+  {% if items %}<span class="muted small">Nothing new in the last 24 hours.</span>{% endif %}
   {% endfor %}
 </div>
 
 <section class="card">
   <form class="filters" method="get" action="/feed" id="feed-filters">
-    <label>Kinds
-      <select name="kinds" multiple size="4" aria-label="Kinds">
-        {% for k in kinds %}<option value="{{ k.kind }}"{% if k.kind in filters.kinds %} selected{% endif %}>{{ k.label }}</option>{% endfor %}
+    {#- One kind at a time: the feed reads a single kinds= value (comma-separated), so a
+        ctrl-click multi-select only ever applied its first choice. The chips above do the rest. -#}
+    <label>What kind
+      <select name="kinds" aria-label="What kind of event">
+        <option value="">Everything</option>
+        {% if filters.kinds|length > 1 %}<option value="{{ filters.kinds|join(',') }}" selected>{{ filters.kinds|length }} kinds chosen</option>{% endif %}
+        {% for k in kinds %}<option value="{{ k.kind }}" title="Technical name: {{ k.label }}"{% if filters.kinds|length == 1 and k.kind in filters.kinds %} selected{% endif %}>{{ plain_kind.get(k.kind, k.label) }}</option>{% endfor %}
       </select>
     </label>
-    <label>Minimum severity
+    <label>How urgent
       <select name="severity" aria-label="Minimum severity">
-        <option value="">any</option>
-        {% for s in severities %}<option value="{{ s }}"{% if filters.severity == s %} selected{% endif %}>{{ s }} and above</option>{% endfor %}
+        <option value="">Anything</option>
+        {% for s in severities %}<option value="{{ s }}"{% if filters.severity == s %} selected{% endif %}>{{ s|sev_word or s }}{% if not loop.first %} and up{% endif %} ({{ s }}{% if not loop.first %}+{% endif %})</option>{% endfor %}
       </select>
     </label>
-    <label>Window
+    <label>When
       <select name="window" aria-label="Time window">
         {% for value, label, _hours in windows %}<option value="{{ value }}"{% if filters.window == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
       </select>
     </label>
-    <label>Search <input type="search" name="q" value="{{ filters.q }}" placeholder="text, domain, device" aria-label="Search"></label>
-    <button class="btn btn-primary" type="submit">Apply</button>
+    <label>Search <input type="search" name="q" value="{{ filters.q }}" placeholder="text, website, device" aria-label="Search"></label>
+    <button class="btn btn-primary" type="submit">Show</button>
     <a class="btn" href="/feed">Reset</a>
     <button class="btn" type="button" id="feed-pause" data-paused="0">Pause auto-refresh</button>
-    <a class="btn" href="/feed.rss">RSS</a>
+    <a class="btn" href="/feed.rss" title="A feed other apps (RSS readers) can subscribe to">RSS feed</a>
     <span class="muted small" id="feed-status">{{ items|length }} of {{ total }} shown</span>
   </form>
 </section>
@@ -44,13 +103,18 @@
     <li class="tl-day"><span>{{ label }}</span></li>
     {% for it in group %}
     {% set repeats = it.ref.get('count', 0) %}
-    <li class="tl-item sev-{{ it.severity }}" data-ts="{{ it.ts }}" data-kind="{{ it.kind }}" data-title="{{ it.title }}">
-      <span class="tl-glyph" title="{{ it.kind }}">{{ icon_glyph.get(it.icon, '•') }}</span>
-      <span class="tl-dot sev-dot-{{ it.severity }}" title="{{ it.severity }}"></span>
+    <li class="tl-item sev-{{ it.severity|css_token }}" data-ts="{{ it.ts }}" data-kind="{{ it.kind }}" data-title="{{ it.title }}">
+      <span class="tl-glyph" title="{{ plain_kind.get(it.kind, it.kind) }} ({{ it.kind }})">{{ icon_glyph.get(it.icon, '•') }}</span>
+      <span class="tl-dot sev-dot-{{ it.severity|css_token }}" title="{{ it.severity }}{% if it.severity|sev_word %} · {{ it.severity|sev_word }}{% endif %}"></span>
       <span class="tl-when" title="{{ it.ts }}">{{ it.ts|ago }}</span>
+      {#- Severity in words, never colour alone (WCAG 1.4.1): visible for medium and above, and
+          read out (visually hidden) for low and info, where a word on every row is noise. -#}
+      {%- set sv = (it.severity or '')|lower %}
       <span class="tl-body">
-        <span class="tl-title">{{ it.title }}{% if repeats > 1 %}
-          <span class="tl-x" title="{{ repeats }} identical events between {{ it.ref.get('from')|ts }} and {{ it.ref.get('to')|ts }}">×{{ repeats }}</span>{% endif %}</span>
+        <span class="tl-title">
+          {%- if sv in ('critical', 'high', 'medium') %}<span class="tl-sev sev-word sev-word-{{ sv|css_token }}" title="Severity: {{ sv }}">{{ sv|sev_word }}</span> · {% elif sv|sev_word %}<span class="visually-hidden">{{ sv|sev_word }} ({{ sv }}): </span>{% endif -%}
+          {{ it.title }}{% if repeats > 1 %}
+          <span class="tl-x" title="Happened {{ repeats }} times between {{ it.ref.get('from')|ts }} and {{ it.ref.get('to')|ts }}">×{{ repeats }}</span>{% endif %}</span>
         {% if it.detail %}<span class="tl-detail muted small">{{ it.detail }}</span>{% endif %}
         {% if repeats > 1 %}
         <button class="btn btn-sm tl-showall" type="button" aria-expanded="false" data-action="toggle" data-label-alt="hide"
@@ -72,8 +136,34 @@
     </li>
     {% endfor %}
     {% else %}
-    <li class="empty">Nothing here yet. The feed fills up as scans run, devices appear and the DNS filter answers
-      queries — start with <span class="kbd">Run quick scan</span> on the Overview page.</li>
+    {#- Why the list is empty, said honestly: a quiet day is normal, but a quiet screen is not a
+        safe one when Home SOC has not been checking (the stale rule), and filters can hide
+        everything. The class stays "empty": app.js removes it when a new item arrives. -#}
+    {%- if empty_state is defined and empty_state and empty_state.reason -%}
+      {%- set reason = empty_state.reason -%}{%- set message = empty_state.message -%}
+      {%- if empty_state.suggest_window is defined %}{% set wider = empty_state.suggest_window %}{% endif -%}
+    {%- elif filtered -%}
+      {%- set reason = 'filtered' -%}{%- set message = 'Nothing matches these filters ' ~ within ~ '.' -%}
+    {%- elif staleness.never -%}
+      {%- set reason = 'never_run' -%}{%- set message = "Nothing has happened yet: Home SOC hasn't checked your network yet." -%}
+    {%- elif staleness.stale -%}
+      {%- set reason = 'not_checking' -%}
+      {%- set message = 'Nothing new ' ~ within ~ ', but Home SOC last checked your network ' ~ (staleness.age_text or 'a while ago') ~ ', so this may just mean it has not been looking.' -%}
+    {%- else -%}
+      {%- set reason = 'quiet' -%}{%- set message = 'Nothing new ' ~ within ~ ' — that is normal on a quiet day.' -%}
+    {%- endif %}
+    <li class="empty feed-empty feed-empty-{{ reason|css_token }}">
+      <p class="feed-empty-text">{{ message }}</p>
+      {% if reason == 'never_run' %}
+      <p class="muted small">This page fills up as scans run, devices appear and web blocking answers look-ups.
+        Start with <span class="kbd">Check now</span>, or <b>Run quick check</b> on the <a class="link" href="/scans">Checks</a> page.</p>
+      {% else %}
+      <p class="feed-empty-actions">
+        {% if wider %}<a class="btn" href="/feed?window={{ wider }}{% if filters.kinds %}&kinds={{ filters.kinds|join(',') }}{% endif %}{% if filters.severity %}&severity={{ filters.severity }}{% endif %}{% if filters.q %}&q={{ filters.q|urlencode }}{% endif %}">{{ wider_label.get(wider, 'Show more') }}</a>{% endif %}
+        {% if reason == 'filtered' %}<a class="btn" href="/feed?window={{ filters.window }}">Clear the filters</a>{% endif %}
+      </p>
+      {% endif %}
+    </li>
     {% endfor %}
   </ol>
   <div class="form-actions">

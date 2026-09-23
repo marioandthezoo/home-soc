@@ -3,8 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e5e0d5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#3a332d" media="(prefers-color-scheme: dark)">
 <title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+{# External, not deferred: applies the saved Day/Dusk choice before the first paint (CSP forbids inline script). #}
+<script src="{{ url_for('static', filename='theme.js') }}"></script>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='lens.css') }}">
 </head>
@@ -12,11 +17,11 @@
 
 <div class="no-print">
   <header class="topbar">
-    <h1 class="page-title">Sticker sheet</h1>
+    <div class="page-head"><h1 class="page-title">Sticker sheet</h1><span class="page-tech">Lens QR labels</span></div>
     <div class="topbar-stats">
       <a class="chip" href="/lens/pair">Pair a phone</a>
       <a class="chip" href="/devices">Devices</a>
-      <a class="chip" href="/">Dashboard</a>
+      <a class="chip" href="/">Home</a>
     </div>
   </header>
 
@@ -45,9 +50,11 @@
       <button class="btn" id="btn-print" type="button">Print…</button>
     </form>
     <p class="muted small">
-      Each code is an opaque random token — it carries no MAC address, IP, hostname or device name, so a
-      photograph of a sticker tells a visitor nothing about the network. Reprinting is safe: the same device keeps
-      the same code, and stickers already stuck to things keep working.
+      Stick one on each device, then point the Lens phone camera at it to see that device's details.
+      Each code is a random number that means nothing by itself (an opaque token): it carries no MAC address,
+      IP address, hostname or device name, so a photo of a sticker tells a visitor nothing about your network.
+      Reprinting is safe: the same device keeps the same code, and stickers already stuck to things keep working.
+      The sheet always prints black on white, whatever the screen's theme.
       The caption is only ever the nickname you chose, or the kind of device (&ldquo;camera&rdquo;) when it has none
       &mdash; never its hostname, IP address or MAC address.
     </p>
@@ -67,15 +74,15 @@
     </form>
     {% endif %}
     {% if not labels %}
-    <p class="warn-strip">Nothing to print. {% if which == 'untagged' %}Every device already has a code the camera can read — switch to <b>All devices</b> to reprint.{% else %}No devices have been discovered yet.{% endif %}</p>
+    <p class="warn-strip">Nothing to print. {% if device_total is defined and not device_total %}Home SOC hasn't found any devices on your network yet — run a check first.{% elif which == 'untagged' %}Every device already has a code the camera can read — switch to <b>All devices</b> to reprint.{% else %}No devices have been discovered yet.{% endif %}</p>
     {% elif not minting and missing %}
-    <p class="warn-strip">The Lens identification package is not installed in this build, so no codes could be minted.
+    <p class="warn-strip">The Lens identification package is not installed in this build, so no codes could be made.
       The layout below is a preview with empty labels.</p>
     {% endif %}
   </section>
 </div>
 
-{% for page_labels in pages %}
+{% for page_labels in pages if page_labels %}
 <div class="page">
   <div class="label-grid">
     {% for item in page_labels %}

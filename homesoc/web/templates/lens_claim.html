@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#0b0d13">
+<meta name="theme-color" content="#1d1915">
 <title>Pair this phone · {{ app_name or 'Home SOC' }}</title>
 <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
 <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='lens-icon.svg') }}">
@@ -22,15 +22,15 @@
   <div id="claim-card" class="claim-card" role="status" aria-live="polite">
     <span id="claim-spinner" class="spinner" aria-hidden="true"></span>
     <h1 id="claim-title" class="claim-title">Pairing this phone…</h1>
-    <p id="claim-body" class="claim-body">Exchanging the pairing code for a token.</p>
+    <p id="claim-body" class="claim-body">Checking the pairing code with Home SOC.</p>
     <ol id="claim-steps" class="steps" hidden></ol>
     <a id="claim-go" class="btn btn-primary btn-wide" href="/lens" hidden>Open Lens</a>
     <button id="claim-retry" class="btn btn-ghost btn-wide" type="button" hidden>Try again</button>
   </div>
 
   <p class="claim-foot muted small">
-    The token is stored on this phone only. Revoke it any time from the dashboard with
-    <code>python -m homesoc lens revoke</code>.
+    The pairing is kept on this phone only. You can un-pair this phone any time from the Home SOC
+    computer (<code>python -m homesoc lens revoke</code>).
   </p>
 </main>
 

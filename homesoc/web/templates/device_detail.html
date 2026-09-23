@@ -1,88 +1,214 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% set d = device %}
-{% block heading %}<a href="/devices" class="muted">Devices</a> / {{ d.display_name }}{% endblock %}
+{% block heading %}<a href="/devices" class="muted">Devices</a> / {{ d|device_label }}{% endblock %}
+{% block heading_tech %}{% if d.ip %}<span class="page-tech mono">{{ d.ip }}</span>{% endif %}{% endblock %}
 {% block content %}
+{#- Plain words for the service names nmap reports; the technical name stays beside them. -#}
+{% set service_words = {
+  'ssh': 'Remote login', 'telnet': 'Remote login, unencrypted', 'http': 'Web page', 'https': 'Web page (encrypted)',
+  'http-alt': 'Web page', 'http-proxy': 'Web page', 'domain': 'Website name look-ups', 'upnp': 'Plug and Play',
+  'rtsp': 'Video stream', 'microsoft-ds': 'Windows file sharing', 'netbios-ssn': 'Windows file sharing',
+  'msrpc': 'Windows remote services', 'ms-wbt-server': 'Remote Desktop', 'ipp': 'Printing', 'printer': 'Printing',
+  'jetdirect': 'Printing', 'airplay': 'AirPlay', 'mdns': 'Device announcements', 'ftp': 'File transfer',
+  'smtp': 'Email sending', 'vnc': 'Screen sharing', 'rdp': 'Remote Desktop', 'sip': 'Phone calls'} %}
+{#- Where a dependency row comes from, in words. Never "connection": Home SOC cannot see devices
+    talking to each other (SPEC_TOPOLOGY C1); these are the reasons it believes one relies on another. -#}
+{% set edge_words = {
+  'gateway': 'reaches the internet through it', 'internet': "is your home's way out to it",
+  'dns': 'asks it to look up website names', 'cloud': 'looks up this online service',
+  'uses': 'uses a service it announces', 'hosted_by': 'runs on it',
+  'cloud_blocked': 'keeps looking up a site Home SOC blocks'} %}
+{% set confidence_words = {'observed': 'Seen', 'inferred': 'Worked out', 'assumed': 'Assumed', 'mixed': 'Seen and worked out'} %}
+{% set confidence_tips = {
+  'observed': 'Home SOC saw this happen (observed)',
+  'inferred': 'Not seen; it follows from the shape of the network (inferred)',
+  'assumed': 'A reasonable default that has not been confirmed (assumed)',
+  'mixed': 'Partly seen, partly worked out (mixed)'} %}
+{% macro confidence(level) -%}
+{%- set lv = (level or '')|string|lower -%}
+<span class="status-chip" title="{{ confidence_tips.get(lv, lv) }}"><span class="badge badge-{{ 'ok' if lv == 'observed' else 'unknown' }}">{{ confidence_words.get(lv, lv or 'unknown') }}</span> <span class="tech-word">{{ lv }}</span></span>
+{%- endmacro %}
+{% set label = d|device_label %}
+{#- "94%", "4.2%", "Less than 1%": the same rounding as api.epss_text, so the number in the
+    table and the sentence in its tooltip agree. -#}
+{% macro epss_short(pct) -%}
+{%- if pct is none -%}—{%- elif pct < 1 -%}&lt;1%{%- elif pct < 10 -%}{{ '%.1f'|format(pct)|replace('.0', '') }}%{%- else -%}{{ '%.0f'|format(pct) }}%{%- endif -%}
+{%- endmacro %}
+{% set open_here = d.findings|selectattr('status', 'equalto', 'open')|list %}
+{% set open_ports = d.services|selectattr('state', 'equalto', 'open')|list %}
+{% set host_open = d.host_findings_open or 0 %}
+{#- Has Home SOC ever looked at this device's open doors? Without that, "nothing to fix" would say
+    more than the evidence does (Lens words it the same way: nothing to report, not all clear). -#}
+{% set scanned = d.services or d.last_service_scan %}
+
+<p class="lede">
+  <b>{{ label }}</b> {{ 'was online' if d.online else 'was not seen' }} at Home SOC's last network check{% if d.online and staleness.age_text and not staleness.never %} ({{ staleness.age_text }}){% endif %}{% if not d.online %}; last seen <span title="{{ d.last_seen|ts }}">{{ d.last_seen|ago }}</span>{% endif %}.
+  {% if d.trusted %}You have marked it as yours.{% else %}It is not marked as yours yet.{% endif %}
+  {% if open_here or host_open -%}
+    {%- if open_here %}<b>{{ open_here|length }}</b> thing{{ '' if open_here|length == 1 else 's' }} to fix on it{% endif -%}
+    {%- if open_here and host_open %}, plus {% elif host_open %}There {{ 'is' if host_open == 1 else 'are' }} {% endif -%}
+    {%- if host_open %}<b>{{ host_open }}</b> about this computer's own settings{% endif %}.
+  {%- elif scanned %}Nothing to fix on it: its last port check{% if d.last_service_scan %} (<span title="{{ d.last_service_scan|ts }}">{{ d.last_service_scan|ago }}</span>){% endif %} found no problems.
+  {%- else %}Home SOC hasn't checked this device's open doors ({{ ui.term('port', 'ports') }}) yet, so it can't say whether anything needs fixing.{% endif %}
+  {% if d.services %}{{ open_ports|length }} open door{{ '' if open_ports|length == 1 else 's' }} ({{ ui.term('port', 'ports') }}) at the last port check.{% endif %}
+</p>
+
 <div class="toolbar">
-  {{ badge('online' if d.online else 'offline') }}
-  {% if d.trusted %}{{ badge('trusted') }}{% endif %}
-  {% if d.kind %}{{ badge('kind', d.kind) }}{% endif %}
-  <span class="mono">{{ d.ip or '' }}</span> <span class="mono muted">{{ d.mac }}</span>
-  <span class="muted">{{ d.vendor or 'unknown vendor' }}</span>
-  <button class="btn btn-primary" data-action="device-scan" data-id="{{ d.id }}">Scan this device now</button>
+  <span title="Seen at Home SOC's last network check, not live">{{ badge('online' if d.online else 'offline', 'Seen at last check' if d.online else 'Not seen at last check') }}</span>
+  {% if d.trusted %}{{ badge('trusted', 'Trusted') }}{% endif %}
+  {% if d.is_this_computer %}<span class="badge badge-trusted" title="Home SOC runs on this computer">This computer</span>{% endif %}
+  <span class="muted">{{ 'Made by ' ~ d.vendor if d.vendor else 'Maker not known' }}</span>
+  <button class="btn btn-primary" data-action="device-scan" data-id="{{ d.id }}" title="Looks at this device's open doors (ports) again now">Check this device now</button>
 </div>
+
+{% if d.is_this_computer %}
+<div class="status-banner" role="note">
+  <span>This is the computer Home SOC runs on.
+  {%- if host_open %} <b>{{ host_open }}</b> open finding{{ '' if host_open == 1 else 's' }} {{ 'is' if host_open == 1 else 'are' }} about its own settings (updates, antivirus, sharing and so on). They are filed under “This computer” rather than this network address.{% else %} Nothing about its own settings needs fixing right now.{% endif %}</span>
+  <span>{% if host_open and d.host_findings_link %}<a class="link" href="{{ d.host_findings_link }}">See the {{ host_open }} to fix →</a> · {% endif %}<a class="link" href="/host">This computer's protection →</a></span>
+</div>
+{% endif %}
+
+<section class="card" id="things-to-fix">
+  <h2>Things to fix on this device</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>How urgent</th><th>Finding</th><th>Status</th><th>Last seen</th></tr></thead>
+    <tbody>
+      {#- Findings about the computer's own settings carry no device id (their subject is
+          "host:<name>"). If the route ever passes them as host_findings, they are listed here too. -#}
+      {% set extra = host_findings if (host_findings is defined and host_findings and d.is_this_computer) else [] %}
+      {% for f in d.findings|list + extra|list %}
+      <tr>
+        <td>{{ ui.sev_badge(f.severity) }}</td>
+        <td class="wrap"><a href="/findings?q={{ f.finding_id|urlencode }}" title="{{ f.title }}"><b>{{ f.plain_title or f.title }}</b></a><br>
+          {%- if f.plain_title and f.plain_title != f.title %}<span class="muted small">{{ f.title }}</span> {% endif %}<span class="tech-word">{{ f.finding_id }}</span></td>
+        <td>{{ ui.status_chip(f.status, f) }}</td>
+        <td class="nowrap">{{ f.last_seen|ago }}</td>
+      </tr>
+      {% else %}<tr><td colspan="4" class="empty">
+        {%- if host_open -%}
+        Nothing is filed against this device's network address. The {{ host_open }} open finding{{ '' if host_open == 1 else 's' }} about this computer's own settings {{ 'is' if host_open == 1 else 'are' }} on the <a href="{{ d.host_findings_link or '/host' }}">Things to fix list</a>.
+        {%- else -%}
+        Nothing found on this device{% if scanned %} at the last check{% if not d.services %}: it had no open doors (ports){% endif %}{% else %} yet — Home SOC has not looked at its open doors (ports){% endif %}.
+        {%- endif -%}
+      </td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+<section class="card">
+  <h2>Known software flaws <span class="muted small">({{ ui.term('CVE', 'CVEs') }})</span></h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>What the flaw is</th><th title="On CISA's Known Exploited Vulnerabilities list (KEV): attackers are known to have used it in real attacks">Known to be used by attackers?</th><th class="num" title="CVSS: how bad it could be, 0 to 10">How bad</th><th class="num" title="EPSS: the chance this flaw is exploited somewhere in the world in the next 30 days">Exploited somewhere, 30 days</th></tr></thead>
+    <tbody>
+      {% for v in d.vulns %}
+      <tr>
+        <td class="wrap">{{ v.title or 'No description published' }}<br><a class="tech-word" href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">{{ v.cve }}</a></td>
+        <td class="wrap">{% if v.kev %}{{ badge('kev') }} <span class="small sev-word-critical">Yes — attackers are known to have used this flaw in real attacks</span>{% else %}<span class="muted small">Not known to be</span>{% endif %}</td>
+        <td class="num nowrap">{{ v.cvss_text or '—' }}</td>
+        <td class="num nowrap" title="{{ v.epss_text or 'No EPSS estimate' }}">{{ epss_short(v.epss_pct) }}</td>
+      </tr>
+      {% else %}<tr><td colspan="4" class="empty">No known software flaws matched{% if not d.services and scanned %} — it had no open doors (ports) at the last check, so there was no software to match{% elif not d.services %} — Home SOC needs to see the device's open doors (ports) first{% endif %}.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% if d.vulns %}
+  <p class="muted small">{{ ui.term('CVSS') }} is how bad a flaw could be, out of 10. {{ ui.term('EPSS') }} is the chance the flaw is exploited somewhere in the world in the next 30 days; it does not say whether your home is being targeted. <a href="/vulns?q={{ (d.ip or '')|urlencode }}">All flaws on this device →</a></p>
+  {% call ui.tech_details() %}
+  <ul class="notes">{% for v in d.vulns %}<li><span class="mono">{{ v.cve }}</span> matched on <span class="mono small">{{ v.matched_on }}</span>{% if v.epss is not none %} · EPSS {{ '%.4f'|format(v.epss) }}{% endif %}{% if v.cvss is not none %} · CVSS {{ v.cvss }}{% endif %}</li>{% endfor %}</ul>
+  {% endcall %}
+  {% endif %}
+</section>
 
 <div class="grid grid-2">
   <section class="card">
-    <h2>Identity</h2>
+    <h2>About this device</h2>
     <form class="form-grid" data-post="/api/devices/{{ d.id }}" data-reload data-success="Device updated">
-      <div class="field"><label for="nickname">nickname</label><input type="text" id="nickname" name="nickname" value="{{ d.nickname or '' }}" maxlength="80" placeholder="{{ d.hostname or d.ip or '' }}"></div>
-      <div class="field field-row"><input type="checkbox" id="trusted" name="trusted"{% if d.trusted %} checked{% endif %}><label for="trusted">trusted (new-device alerts become info)</label></div>
-      <div class="field"><label for="notes">notes</label><textarea id="notes" name="notes" maxlength="2000">{{ d.notes or '' }}</textarea></div>
+      <div class="field"><span id="nickname-label">Name (your name for it)</span><input type="text" id="nickname" aria-labelledby="nickname-label" name="nickname" value="{{ d.nickname or '' }}" maxlength="80" placeholder="{{ d.hostname or ('Unnamed ' ~ ((d.kind or 'device')|lower)) }}"></div>
+      <div class="actions"><label><input type="checkbox" id="trusted" name="trusted"{% if d.trusted %} checked{% endif %}> Trusted: this is ours (no new-device warnings)</label></div>
+      <div class="field"><span id="notes-label">Notes</span><textarea id="notes" aria-labelledby="notes-label" name="notes" maxlength="2000">{{ d.notes or '' }}</textarea></div>
       <div class="form-actions"><button class="btn btn-primary" type="submit">Save</button></div>
     </form>
-    <p class="muted small">hostname <span class="mono">{{ d.hostname or '—' }}</span> · first seen {{ d.first_seen|ts }} · last seen {{ d.last_seen|ts }} · last service scan {{ d.last_service_scan|ago }}</p>
-    {% if d.mdns_services %}<p class="muted small">mDNS: {% for m in d.mdns_services %}<span class="mono">{{ m }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    {% call ui.tech_details() %}
+    <p class="small">{{ ui.term('IP') }} address <span class="mono">{{ d.ip or '—' }}</span> · {{ ui.term('MAC') }} address <span class="mono">{{ d.mac or '—' }}</span><br>
+      Network name (hostname) <span class="mono">{{ d.hostname or '—' }}</span> · kind <span class="mono">{{ d.kind or '—' }}</span><br>
+      First seen {{ d.first_seen|ts }} · last seen {{ d.last_seen|ts }} · last port check {{ d.last_service_scan|ago }}</p>
+    {% if d.mdns_services %}<p class="small">Announces itself (mDNS) as: {% for m in d.mdns_services %}<span class="mono">{{ m }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>{% endif %}
+    {% endcall %}
   </section>
   <section class="card">
-    <h2>Presence · last 7 days</h2>
-    <div class="presence" aria-label="Daily presence">
-      {% for p in d.presence %}<span class="presence-cell{% if p.count %} seen{% endif %}" title="{{ p.date }}: {{ p.count }} sightings"></span>{% endfor %}
+    <h2>When it was seen · last 7 days</h2>
+    <div class="presence" aria-label="Days this device was seen in the last 7 days">
+      {% for p in d.presence %}<span class="presence-cell{% if p.count %} seen{% endif %}" title="{{ p.date }}: {{ 'seen ' ~ p.count ~ (' time' if p.count == 1 else ' times') if p.count else 'not seen' }}"></span>{% endfor %}
     </div>
-    <p class="muted small">{{ d.sightings|length }} sightings in the last 7 days</p>
-    <div class="tbl-wrap">
+    <p class="muted small">Seen on {{ d.presence|selectattr('count')|list|length }} of the last 7 days ({{ d.sightings|length }} sighting{{ '' if d.sightings|length == 1 else 's' }}). A day with no sighting can simply mean Home SOC did not check that day.</p>
+    {% call ui.tech_details('Every sighting (most recent 25)') %}
+    <div class="tbl-wrap tbl-scroll">
     <table class="tbl">
-      <thead><tr><th>Seen</th><th>IP</th><th>Method</th></tr></thead>
+      <thead><tr><th>Seen</th><th>{{ ui.term('IP') }} address</th><th>How</th></tr></thead>
       <tbody>
         {% for s in d.sightings[:25] %}<tr><td class="nowrap" title="{{ s.seen_at }}">{{ s.seen_at|ts }}</td><td class="mono">{{ s.ip }}</td><td>{{ s.method }}</td></tr>
-        {% else %}<tr><td colspan="3" class="empty">No sightings recorded.</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="3" class="empty">No sightings in the last 7 days.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
+    {% endcall %}
   </section>
 </div>
 
 <section class="card">
-  <h2>Services</h2>
+  <h2>Open doors on this device <span class="muted small">({{ ui.term('port', 'ports') }} and the services behind them)</span></h2>
   <div class="tbl-wrap">
   <table class="tbl">
-    <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Product</th><th>Version</th><th>CPE</th><th>Last seen</th></tr></thead>
+    <thead><tr><th>Door ({{ ui.term('port') }})</th><th>Open?</th><th>What answers</th><th>Software</th><th>Version</th><th>Last seen</th></tr></thead>
     <tbody>
       {% for s in d.services %}
       <tr>
         <td class="mono">{{ s.port }}/{{ s.proto }}</td>
-        <td>{{ badge('ok' if s.state == 'open' else 'off', s.state) }}</td>
-        <td>{{ s.name or '' }}{% if s.tunnel %} <span class="muted small">({{ s.tunnel }})</span>{% endif %}</td>
+        <td>{% if s.state == 'open' %}Open{% else %}<span class="muted">{{ s.state|capitalize if s.state else 'Unknown' }}</span>{% endif %}</td>
+        <td class="wrap">{%- set sn = (s.name or '')|lower -%}{% if service_words.get(sn) %}{{ service_words[sn] }} <span class="tech-word">{{ s.name }}</span>{% elif sn and sn != 'unknown' and not sn.endswith('?') %}{{ s.name }}{% else %}<span class="muted">Not identified</span>{% endif %}{% if s.tunnel %} <span class="muted small">(over {{ s.tunnel }})</span>{% endif %}</td>
         <td class="wrap">{{ s.product or '' }}{% if s.extrainfo %} <span class="muted small">{{ s.extrainfo }}</span>{% endif %}</td>
         <td class="mono">{{ s.version or '' }}</td>
-        <td class="mono small wrap">{{ s.cpe or '' }}</td>
         <td class="nowrap">{{ s.last_seen|ago }}</td>
       </tr>
-      {% else %}<tr><td colspan="7" class="empty">No services recorded — run a service scan.</td></tr>{% endfor %}
+      {% else %}<tr><td colspan="6" class="empty">{% if d.last_service_scan %}No open doors were found at the last port check, {{ d.last_service_scan|ago }}.{% else %}No open doors recorded yet. They appear after Home SOC's port check has looked at this device.{% endif %}</td></tr>{% endfor %}
     </tbody>
   </table>
   </div>
+  {% set with_cpe = d.services|selectattr('cpe')|list %}
+  {% if with_cpe %}
+  {% call ui.tech_details('Technical details: product codes (' ~ 'CPE' ~ ')') %}
+  <ul class="notes">
+    {% for s in with_cpe %}<li><span class="mono">{{ s.port }}/{{ s.proto }}</span> · <span class="mono small">{{ s.cpe }}</span></li>{% endfor %}
+  </ul>
+  <p class="muted small">{{ ui.term('CPE') }} codes are what Home SOC matches against lists of known software flaws.</p>
+  {% endcall %}
+  {% endif %}
 </section>
 
 {# Dependencies and blast radius (SPEC addendum C7). Every row states how the link was
    established; nothing here is drawn from anything but the edges the topology package produced. #}
 <section class="card">
   <div class="card-head">
-    <h2>Depends on · Depended on by · If this fails</h2>
-    <a class="link" href="/map">Dependency map →</a>
+    <h2>What depends on what <span class="muted small">(dependencies and blast radius)</span></h2>
+    <a class="link" href="/map">Open the dependency map →</a>
   </div>
   {% if dep.available %}
   <div class="grid grid-3">
     <div>
       <h3>Depends on</h3>
       <div class="tbl-wrap tbl-scroll">
-      <table class="tbl">
-        <thead><tr><th>What</th><th>How we know</th></tr></thead>
+      <table class="tbl dep-tbl">
+        <thead><tr><th>What</th><th>How sure</th></tr></thead>
         <tbody>
           {% for r in dep.depends_on %}
           <tr>
             <td class="wrap">{% if r.device_id %}<a href="/devices/{{ r.device_id }}">{{ r.label }}</a>{% else %}{{ r.label }}{% endif %}
-              <br><span class="muted small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span></td>
-            <td class="wrap">{{ badge(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
+              <br><span class="muted small" title="Technical: {{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}">{{ label }} {{ edge_words.get(r.edge_type, 'relies on it') }}</span></td>
+            <td class="wrap">{{ confidence(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
           </tr>
           {% else %}<tr><td colspan="2" class="empty">Nothing recorded. Home SOC has seen no lookups,
             advertisements or port mappings from this device.</td></tr>{% endfor %}
@@ -93,14 +219,14 @@
     <div>
       <h3>Depended on by</h3>
       <div class="tbl-wrap tbl-scroll">
-      <table class="tbl">
-        <thead><tr><th>What</th><th>How we know</th></tr></thead>
+      <table class="tbl dep-tbl">
+        <thead><tr><th>What</th><th>How sure</th></tr></thead>
         <tbody>
           {% for r in dep.dependents %}
           <tr>
             <td class="wrap">{% if r.device_id %}<a href="/devices/{{ r.device_id }}">{{ r.label }}</a>{% else %}{{ r.label }}{% endif %}
-              <br><span class="muted small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span></td>
-            <td class="wrap">{{ badge(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
+              <br><span class="muted small" title="Technical: {{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}">{{ edge_words.get(r.edge_type, 'relies on it') }}</span></td>
+            <td class="wrap">{{ confidence(r.confidence) }}<br><span class="muted small">{{ r.evidence or '' }}</span></td>
           </tr>
           {% else %}<tr><td colspan="2" class="empty">No confirmed consumers. Nothing has been observed
             depending on this device, and Home SOC will not guess which devices might.</td></tr>{% endfor %}
@@ -111,66 +237,38 @@
     <div>
       <h3>If this fails</h3>
       {% if dep.blast %}
+      {% set bc = dep.blast.counts %}
       <p>{{ dep.blast.headline }}</p>
       <p>
-        {{ badge('fail', dep.blast.counts.offline ~ ' unreachable') }}
-        {{ badge('warn', dep.blast.counts.degraded ~ ' degraded') }}
-        {{ badge('ok', dep.blast.counts.unaffected ~ ' unaffected') }}
+        {{ badge('fail' if bc.offline else 'off', bc.offline ~ ' unreachable', '' if bc.offline else 'is-zero quiet-badge') }}
+        {{ badge('warn' if bc.degraded else 'off', bc.degraded ~ ' degraded', '' if bc.degraded else 'is-zero quiet-badge') }}
+        <span class="badge badge-off is-zero quiet-badge" title="Nothing recorded depends on these (technical: unaffected)">{{ bc.unaffected }} not known to be affected</span>
       </p>
+      <p class="muted small">Unreachable: would stop working. Degraded: would still work, but worse. No known effect: Home SOC has recorded nothing that depends on it — it cannot see devices using each other.</p>
       {% if dep.blast.services_lost %}
       <p class="small">The house loses: {% for s in dep.blast.services_lost %}{{ s }}{% if not loop.last %}; {% endif %}{% endfor %}.</p>
       {% endif %}
-      <p class="muted small">{{ badge(dep.blast.confidence) }}
+      <p class="muted small">{{ confidence(dep.blast.confidence) }}
         {{ dep.blast.evidence or 'Nothing like this has actually been recorded — this follows from the
         shape of the network, not from a failure Home SOC has watched.' }}</p>
       {% else %}
-      <p class="muted small">No blast radius has been worked out for this device yet.</p>
+      <p class="muted small">Home SOC has not worked out what would happen if this device failed yet.</p>
       {% endif %}
     </div>
   </div>
+  {% if dep.depends_on or dep.dependents %}
+  {% call ui.tech_details('Technical details: link types') %}
+  <ul class="notes">
+    {% for r in dep.depends_on %}<li>{{ label }} → {{ r.label }}: <span class="mono small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span> ({{ r.confidence }})</li>{% endfor %}
+    {% for r in dep.dependents %}<li>{{ r.label }} → {{ label }}: <span class="mono small">{{ r.edge_type }}{% if r.protocol %} · {{ r.protocol }}{% endif %}</span> ({{ r.confidence }})</li>{% endfor %}
+  </ul>
+  {% endcall %}
+  {% endif %}
   {% else %}
   <p class="empty">{{ dep.reason }}</p>
+  <p class="muted small">When the dependency map is available, this card shows three things: Depends on (what this device relies on), Depended on by (what relies on it) and If this fails (what would stop working).</p>
   {% endif %}
   <p class="muted small push-down">{{ dep.note }} <a class="link" href="{{ dep.doc }}">Why, and what would make it better →</a></p>
 </section>
 
-<div class="grid grid-2">
-  <section class="card">
-    <h2>Vulnerabilities</h2>
-    <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr><th>CVE</th><th>KEV</th><th class="num">CVSS</th><th class="num">EPSS</th><th>Matched on</th></tr></thead>
-      <tbody>
-        {% for v in d.vulns %}
-        <tr>
-          <td class="mono"><a href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">{{ v.cve }}</a></td>
-          <td>{% if v.kev %}{{ badge('kev') }}{% endif %}</td>
-          <td class="num">{{ v.cvss if v.cvss is not none else '' }}</td>
-          <td class="num">{{ '%.2f'|format(v.epss) if v.epss is not none else '' }}</td>
-          <td class="wrap small">{{ v.matched_on }}</td>
-        </tr>
-        {% else %}<tr><td colspan="5" class="empty">No vulnerabilities matched.</td></tr>{% endfor %}
-      </tbody>
-    </table>
-    </div>
-  </section>
-  <section class="card">
-    <h2>Findings</h2>
-    <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr><th>Severity</th><th>Finding</th><th>Status</th><th>Last seen</th></tr></thead>
-      <tbody>
-        {% for f in d.findings %}
-        <tr>
-          <td>{{ sev(f.severity) }}</td>
-          <td class="wrap"><a href="/findings?q={{ f.finding_id }}">{{ f.title }}</a><br><span class="mono muted small">{{ f.finding_id }}</span></td>
-          <td>{{ badge(f.status) }}</td>
-          <td class="nowrap">{{ f.last_seen|ago }}</td>
-        </tr>
-        {% else %}<tr><td colspan="4" class="empty">No findings for this device.</td></tr>{% endfor %}
-      </tbody>
-    </table>
-    </div>
-  </section>
-</div>
 {% endblock %}

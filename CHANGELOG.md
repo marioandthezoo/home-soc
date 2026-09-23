@@ -41,6 +41,80 @@ and its proof of concept re-run against the fixed code. Highlights:
 - **Supply chain**: `requirements.txt` is a hash-locked lock of the whole dependency tree, installed with
   `--require-hashes`; pytest (>= 9.0.3) is dev-only.
 
+A second round (2026-09-22) covered what the first did not reach outside the web layer:
+
+- **No token-less dashboard on the network**: `serve`/`run` on anything but loopback (`localhost`,
+  127.0.0.0/8, `::1`) generate and store a token when `web.token` is empty and refuse one shorter than 16
+  characters; the startup message says when the dashboard may already have been open, and what to clean up.
+  `SOC-SYS-003` and `SOC-LENS-001` follow the address the server actually bound to.
+- **DNS resolver under forged traffic**: no thread per UDP packet (a listener plus a fixed worker pool); a
+  pinned upstream valve answers TC=1 instead of SERVFAIL; a full TCP table evicts the oldest idle connection
+  instead of refusing the victim; inventory devices keep their own query-log and reputation budgets; one
+  client may spend at most 10% of the VirusTotal quota; 0x20 is re-enabled after a wrong-case reply.
+- **Feeds**: the per-feed wall clock is enforced on the socket (a byte-at-a-time server can no longer hold the
+  scheduler), every connect is re-checked against the real address (no backslash/userinfo URL trick or
+  rebinding reaches the LAN), lines are bounded before parsing (a one-line feed no longer costs 20x its size
+  in RAM), and malformed NVD JSON costs one lookup instead of the whole vulns scan. VirusTotal file lookups
+  and notification posts get the same wall clock.
+- **Host scanners**: a changed autostart command is reported with the old one; unreviewed entries stay open;
+  tasks are no longer hidden by a self-declared Microsoft author, nor services by a path that merely starts
+  with the Windows folder; VirusTotal "unknown"/"clean" verdicts are re-checked; the file lookup never follows
+  a redirect with the API key.
+- **Elevated autostart**: `make-autostart.ps1 -Elevated` also requires the venv's base interpreter to be
+  admin-only and runs `pythonw -I -S scripts\run-elevated.py`, which ignores user `PYTHON*` variables and
+  replaces the inherited user environment; an elevated process never runs `winget`.
+- **Topology and alerts**: graph builds and outage detection are linear rather than quadratic in churned
+  devices; DNS-based attributions say they come from a source address; ntfy/Discord bodies are sized in
+  bytes/UTF-16 units; one sanitiser (bidi incl. U+061C, zero-width and other invisible characters) now covers
+  device names, alerts, the scheduled digest and map labels.
+
+### Changed — a calmer, plainer dashboard
+
+**New look: "Stone & Sage".** The dashboard was redesigned for people who are not security experts and for a screen
+left up all day. **Day** (the default) is warm stone and paper with deep slate-green text instead of a dark, neon
+page; **Dusk** is the same room in warm cocoa; **Auto** follows the computer's light/dark setting (Theme button, foot
+of the sidebar; remembered per browser). Severities are earth tones (brick, terracotta, ochre, moss, slate blue), a
+healthy screen carries no alarm colour at all, status pills have their own colours so "Needs attention" is never
+drawn in a severity colour, and every colour pair meets WCAG contrast in both themes. No web fonts, no CDN: CSP is
+still `default-src 'self'`.
+
+**Plain words beside the technical ones.** Pages have plain names with the old name beside the title — Home
+(Overview), Things to fix (Findings), What happened (Activity feed), Report (Security summary), This computer (Host
+posture), Web blocking (DNS filter), What depends on what (Dependency map), Known flaws (Vulnerabilities), Checks
+(Scans), System health (Telemetry). **URLs are unchanged.** Severities carry action words ("Fix now", "Fix this
+week", "Worth fixing", "When you have time", "Good to know"); statuses read "Needs attention", "Seen, not fixed yet",
+"Fixed", "Ignored (your choice)"; devices are named, with the address muted beside them ("Unnamed camera"). Every
+finding has a plain headline and why it matters; the technical title, check ID and evidence are one click away under
+**Technical details**. Recent activity on Home is written as sentences, with the raw log line in the tooltip.
+
+**Honesty.**
+- Home only says the network "looks healthy", and System health only says "working normally", when the data is
+  fresh, no check failed, and every core check (open ports, software flaws, this computer, threat lists) finished
+  within its schedule. A device check alone now reads "Home SOC has only looked for devices so far…", and the score
+  reads "not fully checked yet". "Web blocking is not running" is added whenever it applies.
+- When the last network check is older than three times its schedule, every page says so at the top; the sidebar's
+  refresh time is labelled "Screen refreshed", separate from "Network last checked".
+- "Online" is "seen at the last check" everywhere, and Web blocking's look-ups are only called "live" while the
+  resolver runs and the rows are recent.
+- A finding you marked fixed reads **Marked fixed** until Home SOC's own check confirms it; the Report and the
+  Things-to-fix tab split fixed into "confirmed by a later check" and "marked fixed". Findings that no scan re-checks
+  (a new device, a lookup that already happened) say so.
+- The dependency map never claims to show connections or traffic; its blast-radius panel counts devices "not known to
+  be affected" instead of "unaffected".
+- EPSS is "the chance this flaw is exploited somewhere in the next 30 days", never a chance of attack on your home;
+  KEV is "attackers are known to have used this flaw in real attacks", not "right now". Plain titles no longer claim
+  more than the check saw (Defender switched off, a UPnP port answering, a camera stream reachable).
+- A device page never says "nothing to fix" about a device Home SOC has not port-checked.
+
+**Accessibility.** Every expandable row (findings, devices, flaws, startup programs) has a real toggle button, so the
+keyboard reaches the finding actions, the Ignore confirmation and Technical details; filter selects no longer reload
+the page on each arrow key; glossary terms are focusable and show their explanation on focus; a "Skip to page
+content" link; map focus is visible in blast-radius mode; the activity feed states urgency in words, not colour
+alone; and the opened-row tint keeps text above 4.5:1 at dusk.
+
+**Docs.** The screenshots in `docs/images/` were re-shot in the day theme (still the fictional demo network), and
+`video/shoot_docs.py` now serves a time-shifted working copy of the demo data so the images read as freshly checked.
+
 ### Added
 
 **Lens — point your phone at a device.** A phone-sized web app Home SOC serves itself at `/lens`. Point the camera at

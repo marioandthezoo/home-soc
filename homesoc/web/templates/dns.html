@@ -1,46 +1,127 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- Web blocking (the DNS filter). Look-ups, not traffic: Home SOC sees which website names a
+    device asks for, never what it then sends. Devices are named, with the address muted. -#}
 {% block content %}
 {% set vt = dns.vt_budget %}
+{#- Blocklists whose entries mean malware, phishing or attack infrastructure (mirrors
+    homesoc.web.feed.THREAT_LISTS). Allowing a site one of these blocked asks the loudest question. -#}
+{% if threat_lists is not defined %}{% set threat_lists = ['urlhaus', 'urlhaus_filter', 'threatfox', 'openphish', 'phishing_army', 'feodo', 'feodo_ips', 'spamhaus_drop'] %}{% endif %}
+{% set list_words = {
+  'oisd_small': 'Ads and trackers', 'oisd_big': 'Ads and trackers', 'hagezi_pro': 'Ads, trackers and scams',
+  'stevenblack': 'Ads and malware', 'adguard_dns': 'Ads and trackers', 'urlhaus': 'Malware sites', 'urlhaus_filter': 'Malware sites',
+  'threatfox': 'Malware sites', 'phishing_army': 'Phishing (fake log-in pages)', 'openphish': 'Phishing (fake log-in pages)',
+  'feodo_ips': 'Banking-malware servers', 'feodo': 'Banking-malware servers', 'spamhaus_drop': 'Criminal networks'} %}
+{% set verdict_words = {'malicious': 'Dangerous', 'suspicious': 'Suspicious', 'harmless': 'Not flagged', 'undetected': 'Not flagged', 'unknown': 'Not known'} %}
+{% set rep_by_domain = {} %}
+{% for r in reputation %}{% if r.domain not in rep_by_domain %}{% set _ = rep_by_domain.update({r.domain: r.verdict}) %}{% endif %}{% endfor %}
+{#- Why a look-up was blocked, in words; the technical reason stays beside it. -#}
+{% macro reason_words(reason) -%}
+{%- set r = (reason or '')|string -%}
+{%- if r.startswith('list:') -%}{%- set name = r[5:] -%}
+  {%- if name in threat_lists %}On a threat list: {{ (list_words.get(name) or 'dangerous sites')|lower }}{% else %}On a blocklist: {{ (list_words.get(name) or 'blocked sites')|lower }}{% endif -%}
+{%- elif r == 'override:deny' -%}You chose to always block it
+{%- elif r == 'override:allow' -%}You chose to always allow it
+{%- elif r == 'reputation' -%}Security services flagged it as dangerous
+{%- elif r == 'default' -%}Allowed (not on any list)
+{%- else -%}{{ r or 'No reason recorded' }}{%- endif -%}
+{%- endmacro %}
+{% macro is_threat(reason) -%}
+{%- set r = (reason or '')|string -%}{{ 'yes' if r == 'reputation' or (r.startswith('list:') and r[5:] in threat_lists) else '' }}
+{%- endmacro %}
+
+{#- The live log's reason words come from the same two lists as the tables above (app.js reads
+    this; it is data, never executed). -#}
+<script type="application/json" id="dns-words">{{ {'lists': list_words, 'threat': threat_lists}|tojson }}</script>
+{% if dns.enabled and not dns.running %}
+<div class="status-banner is-stale" role="status">
+  <span><b>Web blocking is switched on but not running</b>, so nothing is being filtered right now. The numbers below are from before it stopped. Check <a href="/telemetry">System health</a>, or restart Home SOC.</span>
+</div>
+{% elif not dns.enabled %}
+<div class="status-banner" role="status">
+  <span>Web blocking is switched off, so Home SOC is not filtering any website look-ups. It can be switched on under <a href="/settings">Settings</a> (DNS).</span>
+</div>
+{% endif %}
+
 <div class="grid grid-4">
-  <section class="card"><h2>Queries · 24 h</h2><div class="kpi"><b data-bind="dns-total">{{ dns.total24h|num }}</b></div><div class="kpi-sub">{{ dns.cached24h|num }} from cache · avg {{ dns.avg_ms }} ms</div></section>
-  <section class="card"><h2>Blocked · 24 h</h2><div class="kpi"><b data-bind="dns-blocked">{{ dns.blocked24h|num }}</b><span class="muted">{{ dns.blocked_pct }}%</span></div><div class="kpi-sub">{{ dns.overrides }} overrides · {{ dns.reputation_entries }} reputation entries</div></section>
-  <section class="card"><h2>Clients · 24 h</h2><div class="kpi"><b data-bind="dns-clients">{{ dns.clients24h }}</b></div><div class="kpi-sub">upstreams: {% for u in dns.upstreams %}<span class="mono">{{ u }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</div></section>
-  <section class="card"><h2>Resolver</h2>
-    <div class="kpi">{{ badge('ok' if dns.running else 'off', 'running' if dns.running else 'stopped') }}</div>
-    <div class="kpi-sub"><span class="mono">{{ dns.listen }}:{{ dns.port }}</span> · mode {{ dns.block_mode }} · {{ 'enabled' if dns.enabled else 'disabled in config' }}</div>
-    <div class="kpi-sub">VirusTotal today: {{ vt.used }} / {{ vt.limit }}{% if not vt.key_set %} (no key){% endif %}</div>
+  <section class="card"><h2>Websites looked up · last 24 h</h2><div class="kpi"><b data-bind="dns-total">{{ dns.total24h|num }}</b></div><div class="kpi-sub">{% if dns.total24h %}{{ dns.cached24h|num }} answered from memory · usually in {{ dns.avg_ms }} ms{% else %}None in the last 24 hours.{% endif %}</div></section>
+  <section class="card"><h2>Blocked · last 24 h</h2><div class="kpi"><b data-bind="dns-blocked">{{ dns.blocked24h|num }}</b>{% if dns.total24h %}<span class="muted">{{ dns.blocked_pct }}% of look-ups</span>{% endif %}</div><div class="kpi-sub">{{ dns.overrides }} site{{ '' if dns.overrides == 1 else 's' }} you always allow or block · {{ dns.reputation_entries }} safety verdict{{ '' if dns.reputation_entries == 1 else 's' }} on file</div></section>
+  <section class="card"><h2>Devices using it · last 24 h</h2><div class="kpi"><b data-bind="dns-clients">{{ dns.clients24h }}</b></div><div class="kpi-sub">Only devices that send their look-ups to Home SOC are protected.</div></section>
+  <section class="card"><h2>Status</h2>
+    <div class="kpi">{{ badge('ok' if dns.running else ('warn' if dns.enabled else 'off'), 'Running' if dns.running else ('Not running' if dns.enabled else 'Switched off')) }}</div>
+    <div class="kpi-sub">Safety look-ups (VirusTotal) today: {{ vt.used }} of {{ vt.limit }}{% if not vt.key_set %} — no key set, so none are made{% endif %}</div>
     <div class="budget"><span id="vt-budget-bar" data-pct="{{ (100 * vt.used / vt.limit) if vt.limit else 0 }}"></span></div>
+    {% call ui.tech_details() %}
+    <p class="small">{{ ui.term('resolver', 'Resolver') }} listening on <span class="mono">{{ dns.listen }}:{{ dns.port }}</span> · block mode <span class="mono">{{ dns.block_mode }}</span> · {{ 'enabled' if dns.enabled else 'disabled' }} in config<br>
+      Asks upstream: {% for u in dns.upstreams %}<span class="mono">{{ u }}</span>{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none set</span>{% endfor %}</p>
+    {% endcall %}
   </section>
 </div>
 
 <section class="card">
-  <h2>Queries per hour · blocked in red</h2>
+  <h2>Website look-ups per hour · last 24 hours</h2>
+  <p class="muted small">Each bar is every look-up in that hour; the part at the bottom of the bar is how many were blocked. Hover a bar for the numbers.</p>
   <div class="chart chart-line" id="chart-dns-hours"></div>
 </section>
 
-<div class="grid grid-2">
+<section class="card">
+  <h2>Most-blocked websites · last 24 h</h2>
+  <div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Website</th><th class="num">Times</th><th class="num">Devices</th><th>Why it was blocked</th><th></th></tr></thead>
+    <tbody>
+      {% for t in top_blocked %}
+      {%- set threat = is_threat(t.reason) -%}
+      {%- set verdict = rep_by_domain.get(t.domain, '') -%}
+      <tr>
+        <td class="mono wrap">{{ t.domain }}</td>
+        <td class="num">{{ t.hits|num }}</td>
+        <td class="num">{{ t.clients }}</td>
+        <td class="wrap small">{% if threat %}{{ badge('malicious', 'Threat') }} {% endif %}{{ reason_words(t.reason) }} <span class="tech-word">{{ t.reason or '' }}</span></td>
+        <td>
+          {%- if threat or verdict in ('malicious', 'suspicious') -%}
+          <button class="btn btn-sm" data-action="dns-override" data-domain="{{ t.domain }}" data-op="allow" data-note="allowed from top-blocked" data-reputation="{{ verdict if verdict in ('malicious', 'suspicious') else 'malicious' }}" data-reload title="This site is on a threat list: allowing it asks you to confirm first">Allow anyway…</button>
+          {%- else -%}
+          <button class="btn btn-sm btn-ok" data-action="dns-override" data-domain="{{ t.domain }}" data-op="allow" data-note="allowed from top-blocked" data-reload title="Always allow this site for every device (asks you to confirm)">Allow</button>
+          {%- endif -%}
+        </td>
+      </tr>
+      {% else %}<tr><td colspan="5" class="empty">{% if dns.running %}Nothing was blocked in the last 24 hours.{% else %}Nothing was blocked in the last 24 hours{% if dns.enabled %} — web blocking is not running{% endif %}.{% endif %}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<div class="grid grid-2 grid-top">
   <section class="card">
-    <h2>Top blocked domains · 24 h</h2>
+    <h2>Devices that look up the most · last 24 h</h2>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Domain</th><th class="num">Hits</th><th class="num">Clients</th><th>Reason</th><th></th></tr></thead>
+      <thead><tr><th>Device</th><th class="num">Look-ups</th><th class="num">Blocked</th></tr></thead>
       <tbody>
-        {% for t in top_blocked %}
-        <tr><td class="mono wrap">{{ t.domain }}</td><td class="num">{{ t.hits }}</td><td class="num">{{ t.clients }}</td><td class="muted small">{{ t.reason or '' }}</td>
-          <td><button class="btn btn-sm btn-ok" data-action="dns-override" data-domain="{{ t.domain }}" data-op="allow" data-note="allowed from top-blocked">allow</button></td></tr>
-        {% else %}<tr><td colspan="5" class="empty">Nothing blocked in the last 24 h.</td></tr>{% endfor %}
+        {% for c in top_clients %}<tr><td class="wrap">{{ ui.device_name(c) }}</td><td class="num">{{ c.total|num }}</td><td class="num">{{ c.blocked|num }}</td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No devices have used web blocking in the last 24 hours. To protect every device, point your router's DHCP {{ ui.term('DNS') }} setting at this computer: run <span class="kbd">scripts/enable-lan-dns.ps1</span> as administrator — it opens the firewall and prints the router steps to follow.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
   </section>
   <section class="card">
-    <h2>Top clients · 24 h</h2>
+    <h2>Sites you always allow or block <span class="muted small">(overrides)</span></h2>
+    <form class="inline-form" data-post="/api/dns/override" data-reload data-success="Saved">
+      <input type="text" name="domain" placeholder="website.example" required aria-label="Website name">
+      <select name="action" aria-label="Always allow or always block"><option value="allow">Always allow</option><option value="deny">Always block</option></select>
+      <input type="text" name="note" placeholder="Why (optional)" aria-label="Note">
+      <button class="btn btn-primary" type="submit">Add</button>
+    </form>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Client</th><th class="num">Queries</th><th class="num">Blocked</th></tr></thead>
+      <thead><tr><th>Website</th><th>Rule</th><th>Why</th></tr></thead>
       <tbody>
-        {% for c in top_clients %}<tr><td class="mono">{{ c.client }}</td><td class="num">{{ c.total|num }}</td><td class="num">{{ c.blocked|num }}</td></tr>
-        {% else %}<tr><td colspan="3" class="empty">No clients yet. Point your router's DHCP DNS at this machine: run <span class="kbd">scripts/enable-lan-dns.ps1</span> as administrator — it opens the firewall and prints the router steps to follow.</td></tr>{% endfor %}
+        {% for o in overrides %}
+        <tr><td class="mono wrap">{{ o.domain }}</td><td class="nowrap">{{ badge(o.action, 'Always allowed' if o.action == 'allow' else ('Always blocked' if o.action == 'deny' else o.action)) }}
+            <div class="actions"><button class="btn btn-sm" data-action="dns-override-delete" data-domain="{{ o.domain }}" title="Remove this rule: the site goes back to following the blocklists">Remove</button></div></td>
+          <td class="small wrap">{{ o.note or '' }}<br><span class="muted">added {{ o.created_at|ago }}</span></td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No sites always allowed or blocked yet.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
@@ -49,34 +130,35 @@
 
 <div class="grid grid-2">
   <section class="card">
-    <h2>Blocklists</h2>
+    <h2>Blocklists <span class="muted small">(public lists of bad sites)</span></h2>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>List</th><th>Kind</th><th class="num">Entries</th><th>Updated</th><th>Status</th><th>Active</th></tr></thead>
+      <thead><tr><th>List</th><th>What it blocks</th><th class="num">Sites</th><th>Updated</th><th>In use?</th></tr></thead>
       <tbody>
         {% for l in lists %}
-        <tr><td class="mono">{{ l.name }}</td><td>{{ l.kind }}</td><td class="num">{{ l.entries|num }}</td><td title="{{ l.last_updated|ts }}">{{ l.last_updated|ago }}</td><td>{{ badge(l.status or 'never') }}</td><td>{{ badge('yes' if l.active else 'off', 'in policy' if l.active else 'not used') }}</td></tr>
-        {% else %}<tr><td colspan="6" class="empty">No blocklist feeds recorded — run “Update feeds”.</td></tr>{% endfor %}
+        <tr>
+          <td class="mono wrap">{{ l.name }}</td>
+          <td class="wrap small">{{ list_words.get(l.name, l.kind) }}{% if l.name in threat_lists %} <span class="tech-word">threat list</span>{% endif %}</td>
+          <td class="num">{{ l.entries|num }}</td>
+          <td class="wrap small"><span title="{{ l.last_updated|ts }}">{{ l.last_updated|ago }}</span>{% if l.status and l.status not in ('ok', 'updated', 'not_modified') %}<br>{{ badge(l.status) }}{% endif %}</td>
+          <td class="nowrap">{{ badge('yes' if l.active else 'off', 'In use' if l.active else 'Not used') }}</td>
+        </tr>
+        {% else %}<tr><td colspan="5" class="empty">No blocklists downloaded yet. They arrive with the next threat-list update (System health › feeds).</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
   </section>
   <section class="card">
-    <h2>Overrides</h2>
-    <form class="inline-form" data-post="/api/dns/override" data-reload data-success="Override saved">
-      <input type="text" name="domain" placeholder="domain.example" required aria-label="Domain">
-      <select name="action" aria-label="Action"><option value="allow">allow</option><option value="deny">deny</option></select>
-      <input type="text" name="note" placeholder="note (optional)" aria-label="Note">
-      <button class="btn btn-primary" type="submit">Add</button>
-    </form>
+    <h2>What security services say about sites <span class="muted small">(reputation)</span></h2>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Domain</th><th>Action</th><th>Note</th><th>Created</th><th></th></tr></thead>
+      <thead><tr><th>Website</th><th>Verdict</th><th>Checked</th></tr></thead>
       <tbody>
-        {% for o in overrides %}
-        <tr><td class="mono wrap">{{ o.domain }}</td><td>{{ badge(o.action) }}</td><td class="muted small wrap">{{ o.note or '' }}</td><td class="nowrap">{{ o.created_at|ago }}</td>
-          <td><button class="btn btn-sm btn-danger" data-action="dns-override-delete" data-domain="{{ o.domain }}">remove</button></td></tr>
-        {% else %}<tr><td colspan="5" class="empty">No overrides yet.</td></tr>{% endfor %}
+        {% for r in reputation %}
+        <tr><td class="mono wrap">{{ r.domain }}</td>
+          <td class="wrap">{{ badge(r.verdict, verdict_words.get(r.verdict, r.verdict)) }}{% if r.malicious or r.suspicious %}<br><span class="small muted">{{ r.malicious or 0 }} said dangerous, {{ r.suspicious or 0 }} suspicious</span>{% endif %}</td>
+          <td class="wrap small"><span class="nowrap">{{ r.checked_at|ago }}</span><br><span class="muted">by {{ r.source }}</span></td></tr>
+        {% else %}<tr><td colspan="3" class="empty">No safety look-ups yet{% if not vt.key_set %} — add a VirusTotal key in Settings to turn them on{% endif %}.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
@@ -85,31 +167,21 @@
 
 <section class="card">
   <div class="card-head">
-    <h2>Live query log</h2>
+    {#- "live" only while the resolver is running and the newest row is recent; app.js keeps this
+        current from the rows it loads. Old rows next to "live" read as current activity. -#}
+    <h2>Latest look-ups <span class="muted small" id="log-freshness" data-running="{{ 1 if dns.running else 0 }}">(newest first{% if not dns.running %} — web blocking is not running{% endif %})</span></h2>
     <div class="filters">
-      <input type="text" id="log-client" placeholder="client ip" aria-label="Client filter">
-      <select id="log-action" aria-label="Action filter"><option value="">any action</option><option value="allow">allow</option><option value="block">block</option><option value="cache">cache</option><option value="error">error</option></select>
+      <input type="text" id="log-client" placeholder="Device address, e.g. 192.168.1.20" aria-label="Show only one device's look-ups (its IP address)">
+      <select id="log-action" aria-label="Show only one result"><option value="">Every result</option><option value="allow">Allowed</option><option value="block">Blocked</option><option value="cache">Answered from memory</option><option value="error">Failed</option></select>
     </div>
   </div>
-  <div class="tbl-wrap">
+  <p class="muted small">Allowing a site always asks you to confirm first, and warns you if security services have flagged it.</p>
+  <div class="tbl-wrap tbl-scroll">
   <table class="tbl log-tail">
-    <thead><tr><th>Time</th><th>Client</th><th>Query</th><th>Type</th><th>Action</th><th>Reason</th><th class="num">ms</th><th>Quick</th></tr></thead>
+    <thead><tr><th>Time</th><th>Device</th><th>Website</th><th title="The kind of answer asked for (DNS record type)">Asked for</th><th>Result</th><th>Why</th><th class="num" title="How long the answer took, in milliseconds">Answer time</th><th>Quick rule</th></tr></thead>
     <tbody id="log-body"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
   </table>
   </div>
 </section>
 
-<section class="card">
-  <h2>Reputation cache</h2>
-  <div class="tbl-wrap">
-  <table class="tbl">
-    <thead><tr><th>Domain</th><th>Verdict</th><th class="num">Malicious</th><th class="num">Suspicious</th><th>Source</th><th>Checked</th></tr></thead>
-    <tbody>
-      {% for r in reputation %}
-      <tr><td class="mono wrap">{{ r.domain }}</td><td>{{ badge(r.verdict) }}</td><td class="num">{{ r.malicious }}</td><td class="num">{{ r.suspicious }}</td><td>{{ r.source }}</td><td class="nowrap">{{ r.checked_at|ago }}</td></tr>
-      {% else %}<tr><td colspan="6" class="empty">No reputation lookups yet{% if not vt.key_set %} — add a VirusTotal key in Settings to enable them{% endif %}.</td></tr>{% endfor %}
-    </tbody>
-  </table>
-  </div>
-</section>
 {% endblock %}

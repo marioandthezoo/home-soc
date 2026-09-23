@@ -13,14 +13,18 @@ import importlib
 import ipaddress
 import json
 import logging
+import math
 import platform
+import re
 import secrets
+import socket
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
@@ -266,6 +270,774 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def _bool(value: Any) -> bool:
     return bool(value) and str(value).lower() not in ("0", "false", "no", "")
+
+
+# --------------------------------------------------------------------------- plain language
+#
+# The owner is technical; the rest of the household is not. Everything in this section turns a
+# stored fact into the words the dashboard shows BESIDE the technical value, never instead of it:
+# a severity's action word, a device's name rather than its address, how long ago Home SOC last
+# looked at the network. It is computed here, once, so every page, the JSON API and the shell's
+# context processor say exactly the same thing and no template has to do the arithmetic.
+#
+# Two honesty rules shape the wording and are pinned by tests/test_plain_data.py:
+#   * nothing here may say the network is healthy when the data is stale or a check failed;
+#   * EPSS is a worldwide exploitation forecast for a flaw, not a chance that this home is attacked.
+
+SEV_WORDS: dict[str, str] = {
+    "critical": "Fix now",
+    "high": "Fix this week",
+    "medium": "Worth fixing",
+    "low": "When you have time",
+    "info": "Good to know",
+}
+STATUS_WORDS: dict[str, str] = {
+    "open": "Needs attention",
+    "acknowledged": "Seen, not fixed yet",
+    "resolved": "Fixed",
+    "suppressed": "Ignored (your choice)",
+}
+#: Score bands of DESIGN §8.2. The letter grade stays available; this is the word beside it.
+SCORE_WORDS: tuple[tuple[int, str], ...] = ((80, "Good"), (50, "Fair"), (0, "Needs work"))
+
+#: devices.kind -> the noun in "Unnamed <kind>". Discovery writes router/self/randomized and the
+#: mDNS hints printer/camera/apple/iot/nas; the rest are what an owner or an older import may set.
+KIND_WORDS: dict[str, str] = {
+    "router": "router",
+    "gateway": "router",
+    "self": "computer",
+    "computer": "computer",
+    "laptop": "laptop",
+    "desktop": "computer",
+    "phone": "phone",
+    "tablet": "tablet",
+    "tv": "TV",
+    "speaker": "speaker",
+    "printer": "printer",
+    "camera": "camera",
+    "iot": "smart device",
+    "console": "games console",
+    "nas": "network storage",
+    "apple": "Apple device",
+    "watch": "watch",
+    "pc": "computer",
+    "access_point": "access point",
+    "ap": "access point",
+    "switch": "network switch",
+    "randomized": "device",
+    "unknown": "device",
+}
+
+#: A discovery sweep older than this many times its own schedule means the dashboard is showing
+#: an old picture (DESIGN §8.1 rule 1; the shell's banner and every status line share it) — and
+#: never more than a day, whatever the schedule says.
+STALE_FACTOR = 3
+STALE_CEILING_MINUTES = 24 * 60
+DEFAULT_DISCOVERY_MINUTES = 10
+#: Scan statuses that count as "Home SOC looked": a partial run still swept what it could.
+_CHECKED_STATUSES: tuple[str, ...] = ("ok", "partial")
+#: Scan statuses that mean the newest run of a kind did not complete its look.
+_UNFINISHED_STATUSES: tuple[str, ...] = ("error", "aborted", "partial")
+#: scans.kind -> the plain name of that check.
+SCAN_WORDS: dict[str, str] = {
+    "discovery": "device check",
+    "services": "open-port check",
+    "vulns": "software-flaw check",
+    "host": "check of this computer",
+    "exposure": "internet-exposure check",
+    "feeds": "threat-list update",
+    "files": "downloads check",
+    "wifi": "Wi-Fi check",
+    "quick": "quick check",
+    "full": "full check",
+}
+
+_NUMBER_WORDS: tuple[str, ...] = ("no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
+_MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$|^[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}$")
+
+
+def sev_word(severity: Any) -> str:
+    """``high`` -> ``Fix this week``; '' for anything that is not a severity."""
+    return SEV_WORDS.get(str(severity or "").strip().lower(), "")
+
+
+def status_word(status: Any) -> str:
+    """``acknowledged`` -> ``Seen, not fixed yet``; '' for anything that is not a status."""
+    return STATUS_WORDS.get(str(status or "").strip().lower(), "")
+
+
+def score_word(score: Any) -> str:
+    """0-49 ``Needs work``, 50-79 ``Fair``, 80-100 ``Good``."""
+    try:
+        value = int(score)
+    except (TypeError, ValueError):
+        return ""
+    for floor, word in SCORE_WORDS:
+        if value >= floor:
+            return word
+    return SCORE_WORDS[-1][1]
+
+
+def number_words(n: Any) -> str:
+    """Numbers up to ten as words ("two"), larger ones as digits with separators ("1,204")."""
+    try:
+        value = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    return _NUMBER_WORDS[value] if 0 <= value < len(_NUMBER_WORDS) else f"{value:,}"
+
+
+def _cap(text: str) -> str:
+    return text[:1].upper() + text[1:] if text else text
+
+
+def _things(n: int, noun: str = "thing") -> str:
+    return f"{number_words(n)} {noun}{'' if n == 1 else 's'}"
+
+
+def span_words(seconds: Any) -> str:
+    """A duration as a person says it: '40 minutes', '5 hours', '8 days' (rounded down)."""
+    try:
+        s = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return ""
+    if s < 60:
+        return "less than a minute"
+    for size, unit, limit in ((60, "minute", 3600), (3600, "hour", 48 * 3600), (86400, "day", None)):
+        if limit is None or s < limit:
+            n = s // size
+            return f"{n} {unit}{'' if n == 1 else 's'}"
+    return ""  # pragma: no cover - the last band has no limit
+
+
+def _within_words(hours: float) -> str:
+    """Upper bound of a duration, rounded UP, so "usually fixed within X" is never an undercount."""
+    if hours < 1:
+        minutes = max(1, math.ceil(hours * 60))
+        return f"{minutes} minute{'' if minutes == 1 else 's'}"
+    if hours < 48:
+        n = math.ceil(hours - 1e-9)
+        return f"{n} hour{'' if n == 1 else 's'}"
+    n = math.ceil(hours / 24 - 1e-9)
+    return f"{n} day{'' if n == 1 else 's'}"
+
+
+def time_to_fix_text(median_hours: Any, p90_hours: Any, count: Any) -> str:
+    """"Usually fixed within 12 hours; almost always within 3 days", honest about small samples.
+
+    "Almost always" is the 90th percentile, which says nothing until there are a handful of fixes:
+    below five the sentence names the slowest fix instead and says the sample is small.
+    """
+    try:
+        n = int(count or 0)
+        median = float(median_hours) if median_hours is not None else None
+        p90 = float(p90_hours) if p90_hours is not None else None
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0 or median is None:
+        return "Nothing was fixed in this period, so there is no typical time to fix yet."
+    if n == 1:
+        return f"The one fix in this period took about {_within_words(median)}."
+    usual = f"Usually fixed within {_within_words(median)}"
+    if n < 5:
+        slowest = p90 if p90 is not None else median
+        return f"{usual}; the slowest took {_within_words(slowest)} (only {number_words(n)} fixes so far, so this is a rough guide)."
+    if p90 is None or _within_words(p90) == _within_words(median):
+        return f"{usual}."
+    return f"{usual}; almost always within {_within_words(p90)}."
+
+
+def cvss_text(cvss: Any) -> str | None:
+    """CVSS base score as "8.8 / 10" (it is a 0-10 scale; a bare 8.8 reads like a percentage)."""
+    try:
+        value = float(cvss)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value < 0:  # NaN or nonsense
+        return None
+    return f"{min(value, 10.0):.1f} / 10"
+
+
+def epss_pct(epss: Any) -> float | None:
+    """EPSS as a percentage; values above 1 are taken to be percentages already."""
+    try:
+        value = float(epss)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value < 0:
+        return None
+    pct = value * 100.0 if value <= 1.0 else value
+    return round(min(pct, 100.0), 1)
+
+
+#: The one caveat every EPSS figure travels with (CORRECTION 2 of the redesign brief).
+EPSS_NOTE = (
+    "EPSS is a forecast for the flaw itself, worldwide. It does not say whether your home is "
+    "being targeted."
+)
+
+
+def epss_text(epss: Any) -> str | None:
+    """"94% chance this flaw is exploited somewhere in the next 30 days".
+
+    EPSS estimates exploitation of the flaw anywhere in the wild; it is never phrased as a chance
+    that this household is attacked.
+    """
+    pct = epss_pct(epss)
+    if pct is None:
+        return None
+    if pct < 1:
+        shown = "Less than 1%"
+    elif pct < 10:
+        shown = f"{pct:.1f}%".replace(".0%", "%")
+    else:
+        shown = f"{pct:.0f}%"
+    return f"{shown} chance this flaw is exploited somewhere in the next 30 days"
+
+
+def kev_text(kev: Any) -> str:
+    return (
+        "Yes: attackers are known to have used this flaw in real attacks (on CISA's known-exploited list)"
+        if _bool(kev)
+        else "Not on CISA's known-exploited list"
+    )
+
+
+def _as_mapping(row: Any) -> dict:
+    if isinstance(row, dict):
+        return row
+    if hasattr(row, "keys"):
+        try:
+            return {k: row[k] for k in row.keys()}
+        except Exception:
+            return {}
+    if hasattr(row, "__dict__"):
+        return dict(vars(row))
+    return {}
+
+
+def looks_like_address(value: Any) -> bool:
+    """True for an IP or MAC address: an identifier, not a name a person gave the device."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _MAC_RE.match(text):
+        return True
+    try:
+        ipaddress.ip_address(text.split("%", 1)[0])
+        return True
+    except ValueError:
+        return False
+
+
+def _name(value: Any) -> str | None:
+    text = " ".join(str(value or "").split())[:200]
+    return text if text and not looks_like_address(text) else None
+
+
+def kind_word(kind: Any) -> str:
+    """``iot`` -> ``smart device``; anything unrecognised is just a ``device``."""
+    return KIND_WORDS.get(" ".join(str(kind or "").strip().lower().split()), "device")
+
+
+def host_name_from_subject(subject: Any) -> str:
+    """``host:HOME-PC:invoice.pdf.exe`` -> ``HOME-PC``; '' for a bare ``host`` subject."""
+    text = str(subject or "")
+    if not (text == "host" or text.startswith("host:")):
+        return ""
+    return text.split(":", 2)[1].strip() if ":" in text else ""
+
+
+def this_computer_label(name: Any = None) -> str:
+    shown = " ".join(str(name or "").split())[:200]
+    return f"This computer ({shown})" if shown else "This computer"
+
+
+def subject_label(subject: Any) -> str | None:
+    """Plain words for a finding subject that is not a single LAN device, else ``None``."""
+    text = str(subject or "")
+    head = text.split(":", 1)[0].strip().lower()
+    if head == "host":
+        return this_computer_label(host_name_from_subject(text))
+    return {
+        "wan": "Your internet connection",
+        "wifi": "Your Wi-Fi",
+        "network": "Your home network",
+        "feed": "Home SOC's threat lists",
+        "soc": "Home SOC itself",
+        "job": "Home SOC itself",
+    }.get(head)
+
+
+def device_label(row: Any) -> str:
+    """What to call a device: its name first, never the bare IP when a name exists.
+
+    Accepts a devices row, a joined row (``device_nickname``/``device_hostname``/``device_kind``),
+    a finding (whose ``subject`` may be the host) or anything already carrying ``device_label``.
+    Precedence: nickname, hostname, any other name field that is not itself an address, then
+    "Unnamed <kind>" ("Unnamed camera"). The IP is shown next to this by the page, muted — it is
+    never folded into the label, which is what produced "192.168.1.142 192.168.1.142".
+    """
+    if row is None:
+        return "Unnamed device"
+    d = _as_mapping(row)
+    ready = d.get("device_label")
+    if isinstance(ready, str) and ready.strip():
+        return ready.strip()
+    for key in ("nickname", "device_nickname", "hostname", "device_hostname", "display_name", "device_name", "name"):
+        name = _name(d.get(key))
+        if name:
+            return name
+    subject = str(d.get("subject") or "")
+    if subject == "host" or subject.startswith("host:"):
+        return this_computer_label(host_name_from_subject(subject))
+    kind = d.get("kind") if d.get("kind") not in (None, "") else d.get("device_kind")
+    if str(kind or "").strip().lower() == "self":
+        return "This computer"
+    if kind or any(d.get(k) for k in ("ip", "mac", "device_ip", "device_mac", "device_id")):
+        return f"Unnamed {kind_word(kind)}"
+    return subject_label(subject) or "Unnamed device"
+
+
+_DEVICE_LABEL_COLUMNS = "id, ip, mac, hostname, nickname, kind, last_seen"
+
+
+def _device_rows_by(conn: sqlite3.Connection, column: str, values: list[Any]) -> list[dict]:
+    """Devices whose ``column`` is in ``values``, in chunks so SQLite's variable limit is never hit."""
+    out: list[dict] = []
+    values = [v for v in dict.fromkeys(values) if v not in (None, "")]
+    for start in range(0, len(values), 400):
+        chunk = values[start : start + 400]
+        marks = ",".join("?" for _ in chunk)
+        out.extend(rows(conn, f"SELECT {_DEVICE_LABEL_COLUMNS} FROM devices WHERE {column} IN ({marks})", chunk))
+    return out
+
+
+def device_labels_by_id(conn: sqlite3.Connection, ids: Any) -> dict[int, dict]:
+    """device id -> ``{device_label, ip}`` for every id that exists."""
+    wanted = [i for i in (_int_or_none(x) for x in (ids or [])) if i is not None]
+    return {int(r["id"]): {"device_label": device_label(r), "ip": r.get("ip")} for r in _device_rows_by(conn, "id", wanted)}
+
+
+def device_labels_by_ip(conn: sqlite3.Connection, ips: Any) -> dict[str, dict]:
+    """ip -> ``{device_id, device_label}``. Several rows can have held one address over time; the
+    most recently seen one is the device using it now."""
+    out: dict[str, dict] = {}
+    best: dict[str, str] = {}
+    for r in _device_rows_by(conn, "ip", [str(i) for i in (ips or []) if i]):
+        ip = str(r.get("ip") or "")
+        seen = str(r.get("last_seen") or "")
+        if ip and (ip not in best or seen > best[ip]):
+            best[ip] = seen
+            out[ip] = {"device_id": int(r["id"]), "device_label": device_label(r)}
+    return out
+
+
+def host_device(conn: sqlite3.Connection, host_name: Any = None) -> dict | None:
+    """The devices row for the computer Home SOC runs on, or ``None``.
+
+    Discovery marks it ``kind='self'``; an older inventory is matched on hostname instead (the
+    ``host:<NAME>`` finding subject, then this machine's own name), ignoring case and a domain
+    suffix, so ``HOME-PC`` finds ``home-pc.lan``.
+    """
+    found = one(conn, f"SELECT {_DEVICE_LABEL_COLUMNS} FROM devices WHERE kind='self' ORDER BY last_seen DESC LIMIT 1")
+    if found:
+        return found
+    names: list[str] = []
+    for candidate in (host_name, _safe_gethostname(socket)):
+        name = str(candidate or "").strip().lower()
+        if name and name not in names:
+            names.append(name)
+    for name in names:
+        found = one(
+            conn,
+            f"SELECT {_DEVICE_LABEL_COLUMNS} FROM devices WHERE lower(hostname)=? OR substr(lower(hostname),1,?)=? "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (name, len(name) + 1, name + "."),
+        )
+        if found:
+            return found
+    return None
+
+
+def _safe_gethostname(socket_mod: Any) -> str:
+    try:
+        return str(socket_mod.gethostname() or "")
+    except OSError:
+        return ""
+
+
+def _host_label(conn: sqlite3.Connection, subject: str, cache: dict) -> tuple[str, int | None, str | None]:
+    """("This computer (Home PC)", 2, "192.168.1.20") for a ``host:`` subject; memoised in ``cache``."""
+    name = host_name_from_subject(subject)
+    if name not in cache:
+        dev = host_device(conn, name)
+        shown = (_name(dev.get("nickname")) or _name(dev.get("hostname"))) if dev else None
+        cache[name] = (this_computer_label(shown or name), int(dev["id"]) if dev else None,
+                       (dev.get("ip") or None) if dev else None)
+    return cache[name]
+
+
+def label_subject_rows(conn: sqlite3.Connection, items: list[dict]) -> list[dict]:
+    """Give every finding-shaped row ``device_label`` and ``link_device_id``.
+
+    A row joined to its device keeps that device's name; a ``host:`` subject becomes
+    "This computer (<name>)" and links to the host's own device page; a ``dns:<ip>`` or
+    ``device:<mac>`` subject that was written before its device row existed is looked up; any
+    other subject ("wan:...", "wifi:...") gets plain words. ``device_name`` — the old join column
+    that fell back to the IP and so rendered "192.168.1.142 192.168.1.142" next to ``device_ip`` —
+    is set to the same label wherever there is a device, so existing pages stop doubling it.
+    """
+    host_cache: dict = {}
+    by_ip: dict[str, dict] = {}
+    by_mac: dict[str, dict] = {}
+    orphans_ip = [str(f.get("subject") or "")[4:] for f in items
+                  if not f.get("device_id") and str(f.get("subject") or "").startswith("dns:")]
+    if orphans_ip:
+        by_ip = device_labels_by_ip(conn, orphans_ip)
+    orphans_mac = [str(f.get("subject") or "") for f in items
+                   if not f.get("device_id") and str(f.get("subject") or "").startswith("device:")]
+    if orphans_mac:
+        for r in rows(conn, f"SELECT {_DEVICE_LABEL_COLUMNS} FROM devices WHERE mac IS NOT NULL AND mac<>''"):
+            by_mac[str(r["mac"]).lower()] = r
+    for f in items:
+        subject = str(f.get("subject") or "")
+        link: int | None = _int_or_none(f.get("device_id"))
+        label: str | None = None
+        if link is not None:
+            label = device_label({
+                "nickname": f.get("device_nickname"),
+                "hostname": f.get("device_hostname"),
+                "kind": f.get("device_kind"),
+                "device_id": link,
+                "name": f.get("device_name"),
+            })
+            f["device_name"] = label
+        elif subject == "host" or subject.startswith("host:"):
+            label, link, host_ip = _host_label(conn, subject, host_cache)
+            if host_ip and not f.get("device_ip"):
+                f["device_ip"] = host_ip
+        elif subject.startswith("dns:") and subject[4:] in by_ip:
+            hit = by_ip[subject[4:]]
+            label, link = hit["device_label"], hit["device_id"]
+            f.setdefault("device_ip", subject[4:])
+        elif subject.startswith("device:") and by_mac:
+            rest = subject[len("device:"):].lower()
+            cut = len(rest)
+            while cut > 0 and label is None:
+                dev = by_mac.get(rest[:cut])
+                if dev is not None:
+                    label, link = device_label(dev), int(dev["id"])
+                    f.setdefault("device_ip", dev.get("ip"))
+                cut = rest.rfind(":", 0, cut)
+        if label is None:
+            label = subject_label(subject)
+            if label is None and subject.startswith("dns:"):
+                label = "Unnamed device"
+                f.setdefault("device_ip", subject[4:])
+            label = label or subject or "Unnamed device"
+        f["device_label"] = label
+        f["link_device_id"] = link
+    return items
+
+
+def last_network_check(conn: sqlite3.Connection) -> str | None:
+    """When the newest discovery sweep that actually looked at the network finished."""
+    marks = ",".join("?" for _ in _CHECKED_STATUSES)
+    value = scalar(
+        conn,
+        f"SELECT finished_at FROM scans WHERE kind='discovery' AND finished_at IS NOT NULL AND status IN ({marks}) "
+        "ORDER BY id DESC LIMIT 1",
+        _CHECKED_STATUSES,
+        default=None,
+    )
+    return str(value) if value else None
+
+
+def _discovery_minutes(cfg: Any) -> int:
+    if cfg is None:
+        try:
+            cfg = ctx().cfg
+        except (RuntimeError, KeyError, AttributeError):  # no app context: use the default schedule
+            cfg = None
+    minutes = _int_or_none(cfg_get(cfg, "schedule.discovery_minutes", DEFAULT_DISCOVERY_MINUTES))
+    return minutes if minutes and minutes > 0 else DEFAULT_DISCOVERY_MINUTES
+
+
+def staleness(conn: sqlite3.Connection | None, cfg: Any = None, now: Any = None) -> dict:
+    """Is the picture on screen current? The one answer the shell's banner, the sidebar and every
+    status line share (the shell's context processor should call this, not re-derive it).
+
+    ``stale`` is true when the newest finished discovery sweep is older than STALE_FACTOR times
+    ``schedule.discovery_minutes`` (capped at a day). ``never`` is true when no sweep has finished
+    at all; that is not "stale" — there is nothing old on screen to distrust — and the status line
+    says it in its own words. ``age_text`` reads naturally after "last checked your network":
+    "8 days ago", "4 minutes ago", "just now", "never". ``message`` is the banner sentence when
+    stale, else ``None``.
+    """
+    minutes = _discovery_minutes(cfg)
+    threshold = min(minutes * STALE_FACTOR, STALE_CEILING_MINUTES)
+    out: dict[str, Any] = {
+        "stale": False,
+        "never": False,
+        "age_text": "",
+        "age": None,
+        "age_seconds": None,
+        "last_check": None,
+        "schedule_minutes": minutes,
+        "threshold_minutes": threshold,
+        "message": None,
+    }
+    if conn is None:
+        return out
+    try:
+        last = last_network_check(conn)
+    except sqlite3.Error:
+        return out
+    if last is None:
+        out.update(never=True, age_text="never")
+        return out
+    dt = parse_ts(last)
+    if dt is None:
+        return out
+    current = now if isinstance(now, datetime) else utcnow()
+    seconds = max(0, int((current - dt).total_seconds()))
+    age = span_words(seconds)
+    stale = seconds > threshold * 60
+    out.update(
+        stale=stale,
+        age_text=f"{age} ago" if seconds >= 60 else "just now",
+        age=age,
+        age_seconds=seconds,
+        last_check=dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        message=(f"Home SOC last checked your network {age} ago — what you see may be out of date."
+                 if stale else None),
+    )
+    return out
+
+
+def unfinished_checks(conn: sqlite3.Connection) -> list[dict]:
+    """The newest run of each check kind that failed, stopped early or only partly worked."""
+    marks = ",".join("?" for _ in _UNFINISHED_STATUSES)
+    data = rows(
+        conn,
+        f"SELECT kind, status, finished_at, error FROM scans WHERE status IN ({marks}) AND id IN "
+        "(SELECT max(id) FROM scans WHERE status<>'running' GROUP BY kind) ORDER BY kind",
+        _UNFINISHED_STATUSES,
+    )
+    return [
+        {"kind": r["kind"], "status": r["status"], "finished_at": r.get("finished_at"),
+         "word": SCAN_WORDS.get(str(r["kind"]), f"{r['kind']} check")}
+        for r in data
+    ]
+
+
+#: The checks that must each have finished recently before the dashboard may call the network
+#: healthy or say Home SOC is "working normally": (scans.kind, schedule key, default hours). A device
+#: check alone only says which devices exist; it says nothing about their open doors, their software
+#: or this computer. ``vulns`` runs on the services schedule (cli.build_jobs).
+CORE_CHECKS: tuple[tuple[str, str, int], ...] = (
+    ("services", "schedule.services_hours", 24),
+    ("vulns", "schedule.services_hours", 24),
+    ("host", "schedule.host_hours", 6),
+    ("feeds", "schedule.feeds_hours", 6),
+)
+#: What a never-run core check means, in words (it hasn't ... yet).
+_NEVER_RAN_WORDS: dict[str, str] = {
+    "services": "checked the devices' open doors (ports)",
+    "vulns": "matched the devices' software against known flaws",
+    "host": "checked this computer",
+    "feeds": "downloaded its threat lists",
+}
+
+
+def _cfg_or_app(cfg: Any) -> Any:
+    if cfg is not None:
+        return cfg
+    try:
+        return ctx().cfg
+    except (RuntimeError, KeyError, AttributeError):  # no app context: stock schedule
+        return None
+
+
+def overdue_checks(conn: sqlite3.Connection, cfg: Any = None, now: Any = None) -> list[dict]:
+    """The core checks that have never finished, or whose newest finished run is older than
+    STALE_FACTOR times its schedule. Each item: ``{kind, word, never, age_text, schedule_hours}``.
+
+    ``feeds`` is left out when ``feeds.enabled`` is false. A run that finished but only partly
+    worked still counts as having looked (:func:`unfinished_checks` reports it separately).
+    """
+    cfg = _cfg_or_app(cfg)
+    current = now if isinstance(now, datetime) else utcnow()
+    marks = ",".join("?" for _ in _CHECKED_STATUSES)
+    out: list[dict] = []
+    for kind, key, default in CORE_CHECKS:
+        if kind == "feeds" and not _bool(cfg_get(cfg, "feeds.enabled", True)):
+            continue
+        hours = _int_or_none(cfg_get(cfg, key, default)) or default
+        try:
+            last = scalar(
+                conn,
+                f"SELECT finished_at FROM scans WHERE kind=? AND finished_at IS NOT NULL AND status IN ({marks}) "
+                "ORDER BY id DESC LIMIT 1",
+                (kind, *_CHECKED_STATUSES),
+                default=None,
+            )
+        except sqlite3.Error:
+            continue
+        word = SCAN_WORDS.get(kind, f"{kind} check")
+        if not last:
+            out.append({"kind": kind, "word": word, "never": True, "age_text": "", "schedule_hours": hours})
+            continue
+        dt = parse_ts(last)
+        if dt is None:
+            continue
+        seconds = max(0, int((current - dt).total_seconds()))
+        if seconds > hours * STALE_FACTOR * 3600:
+            out.append({"kind": kind, "word": word, "never": False, "age_text": f"{span_words(seconds)} ago",
+                        "schedule_hours": hours})
+    return out
+
+
+def overdue_feeds(conn: sqlite3.Connection, cfg: Any = None, now: Any = None) -> list[dict]:
+    """Enabled threat lists that downloaded once but are now older than their own refresh interval
+    plus one feeds-job cadence (the latest they should have been refreshed by). A list that has
+    never downloaded is covered by the ``feeds`` core check instead."""
+    try:
+        registry = importlib.import_module("homesoc.feeds.registry")
+        specs = {str(name): int(getattr(spec, "hours", 0) or 0) for name, spec in registry.FEEDS.items()}
+    except Exception:  # the feeds package is optional for the web layer
+        return []
+    cfg = _cfg_or_app(cfg)
+    if not _bool(cfg_get(cfg, "feeds.enabled", True)):
+        return []
+    cadence = _int_or_none(cfg_get(cfg, "schedule.feeds_hours", 6)) or 6
+    current = now if isinstance(now, datetime) else utcnow()
+    try:
+        data = rows(conn, "SELECT name, last_updated, enabled FROM feeds WHERE last_updated IS NOT NULL ORDER BY name")
+    except sqlite3.Error:
+        return []
+    out: list[dict] = []
+    for r in data:
+        hours = specs.get(str(r["name"]))
+        if not hours or not _bool(r.get("enabled", 1)):
+            continue
+        dt = parse_ts(r.get("last_updated"))
+        if dt is None:
+            continue
+        seconds = max(0, int((current - dt).total_seconds()))
+        if seconds > (hours + cadence) * 3600:
+            out.append({"name": r["name"], "age_text": f"{span_words(seconds)} ago", "interval_hours": hours})
+    return out
+
+
+def _join_words(words: list[str]) -> str:
+    if len(words) <= 1:
+        return "".join(words)
+    return ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def status_summary(conn: sqlite3.Connection, cfg: Any = None, *, counts: dict | None = None,
+                   stale: dict | None = None, dns: dict | None = None) -> dict:
+    """One plain sentence about the whole network, built from the real state.
+
+    Returns ``{status_line, status_tone, status_link, unfinished}``. ``status_tone`` is the
+    banner's modifier (``attention`` | ``week`` | ``stale`` | ``healthy``). First match wins:
+    never checked, stale, something to fix now, something to fix this week, a check that did not
+    finish, a core check that never ran or is overdue, small things only, nothing at all.
+    "Healthy" is only ever said when the data is fresh, every check's newest run completed, and
+    each core check (open ports, software flaws, this computer, threat lists) finished within
+    STALE_FACTOR times its schedule: a device check alone proves nothing about the devices it
+    found. When web blocking is switched on but not running, the line says so.
+    ``dns`` is ``{enabled, running}``; without it the running app's DNS state is used.
+    """
+    stale = stale if stale is not None else staleness(conn, cfg)
+    open_counts = (counts if counts is not None else finding_counts(conn)).get("open", {}) or {}
+    crit = int(open_counts.get("critical", 0) or 0)
+    high = int(open_counts.get("high", 0) or 0)
+    small = int(open_counts.get("medium", 0) or 0) + int(open_counts.get("low", 0) or 0)
+    unfinished = unfinished_checks(conn)
+    failed_words = _join_words([u["word"] for u in unfinished][:3])
+    failed_clause = f"the last {failed_words} did not finish" if unfinished else ""
+    overdue = overdue_checks(conn, cfg)
+    never_ran = [o for o in overdue if o["never"]]
+    late = [o for o in overdue if not o["never"]]
+    what = ""
+    if never_ran:
+        what = _join_words([_NEVER_RAN_WORDS.get(o["kind"], f"run its {o['word']}") for o in never_ran])
+        what = what.replace(" and ", " or ")
+    if dns is None:
+        try:
+            c = ctx()
+            dns = {"enabled": _bool(cfg_get(c.cfg, "dns.enabled", False)), "running": dns_running(c)}
+        except (RuntimeError, KeyError, AttributeError):
+            dns = {}
+    dns_off = bool(dns.get("enabled")) and not dns.get("running")
+
+    def attention() -> str:
+        n = crit + high
+        if crit and n == crit:
+            if n == 1:
+                return "One thing needs your attention, and it is urgent"
+            return f"{_cap(_things(n))} need your attention, and {'both' if n == 2 else 'all of them'} are urgent"
+        if crit:
+            return f"{_cap(_things(n))} {'needs' if n == 1 else 'need'} your attention, {number_words(crit)} of them urgent"
+        return f"{_cap(_things(high))} {'needs' if high == 1 else 'need'} your attention this week"
+
+    if stale.get("never"):
+        line, tone, link = "Home SOC hasn't checked your network yet.", "stale", "/scans"
+    elif stale.get("stale"):
+        age = stale.get("age") or str(stale.get("age_text") or "").removesuffix(" ago") or "a while"
+        line = f"Home SOC hasn't checked your network for {age}, so what you see may be out of date"
+        if crit or high:
+            parts = []
+            if crit:
+                parts.append(f"{number_words(crit)} {'thing' if crit == 1 else 'things'} needed fixing right away")
+            if high:
+                parts.append(f"{number_words(high)} more this week" if crit
+                             else f"{number_words(high)} {'thing' if high == 1 else 'things'} needed fixing this week")
+            line += "; at that check, " + " and ".join(parts)
+        line += "."
+        tone, link = "stale", "/telemetry"
+    elif crit or high:
+        line = attention()
+        # Account for the rest, so this sentence adds up to the "N to fix" chip beside it. Without
+        # it the banner said "Eight things need your attention" next to "33 to fix", two true numbers
+        # a non-technical reader can only see as disagreeing.
+        rest = sum(int(v or 0) for v in open_counts.values()) - (crit + high)
+        if rest > 0:
+            line += f"; {number_words(rest)} more can wait"
+        if unfinished:
+            line += f" — and {failed_clause}, so there may be more"
+        elif never_ran:
+            line += " — and Home SOC hasn't run every check yet, so there may be more"
+        line += "."
+        tone = "attention" if crit else "week"
+        link = "/findings?status=open" if crit and high else f"/findings?status=open&severity={'critical' if crit else 'high'}"
+    elif unfinished:
+        line = f"{_cap(failed_clause)}, so Home SOC can't confirm your network is healthy."
+        tone, link = "stale", "/scans"
+    elif never_ran:
+        if any(o["kind"] == "services" for o in never_ran):
+            line = f"Home SOC has only looked for devices so far; it hasn't {what} yet, so it can't say whether your network is healthy."
+        else:
+            line = f"Home SOC hasn't {what} yet, so it can't say whether your network is healthy."
+        tone, link = "stale", "/scans"
+    elif late:
+        line = ("Some checks are overdue — " + _join_words(
+            [f"the {o['word']} last finished {o['age_text']}" for o in late[:3]])
+            + " — so Home SOC can't confirm your network is healthy.")
+        tone, link = "stale", "/telemetry"
+    elif small:
+        verb = "is" if small == 1 else "are"
+        line = f"Your network looks healthy; {_things(small, 'small thing')} {verb} worth fixing when you have time."
+        tone, link = "healthy", "/findings?status=open"
+    else:
+        line, tone, link = "Your network looks healthy — nothing needs your attention right now.", "healthy", "/findings?status=open"
+    if dns_off and not stale.get("never"):
+        line += " Web blocking is not running."
+    return {"status_line": line, "status_tone": tone, "status_link": link, "unfinished": unfinished,
+            "overdue": overdue}
 
 
 #: An aggregate that took longer than this is served from memory for a while afterwards.
@@ -524,6 +1296,55 @@ def finding_counts(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
     return counts
 
 
+#: Findings raised by something that happened (a device joined, a lookup was made, a threat was
+#: detected, a new autostart entry appeared) rather than by a state a later check looks at again.
+#: No scan re-raises them, so "I've fixed it" can never be confirmed: they stay closed until the
+#: event happens again.
+NOT_RECHECKED_IDS: frozenset[str] = frozenset({
+    "NET-DEV-001", "NET-DEV-004", "NET-DNS-004", "NET-DEP-002",
+    "WIN-DEF-011", "WIN-PER-001", "WIN-PER-002", "WIN-PER-003",
+})
+
+
+def resolved_how(conn: sqlite3.Connection, row_ids: list[int]) -> dict[int, str]:
+    """row id -> ``auto`` when the newest lifecycle event is Home SOC's own check closing it (the
+    problem was gone at a later scan), else ``manual`` (someone pressed "I've fixed it")."""
+    out: dict[int, str] = {}
+    ids = [int(i) for i in row_ids]
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        marks = ",".join("?" for _ in chunk)
+        try:
+            data = rows(
+                conn,
+                f"SELECT finding_row_id, event FROM finding_events WHERE finding_row_id IN ({marks}) "
+                "AND id IN (SELECT max(id) FROM finding_events GROUP BY finding_row_id)",
+                chunk,
+            )
+        except sqlite3.Error:
+            return out
+        for r in data:
+            out[int(r["finding_row_id"])] = "auto" if str(r["event"]) == "auto_resolved" else "manual"
+    return out
+
+
+def resolved_split(conn: sqlite3.Connection) -> dict[str, int]:
+    """``{resolved, confirmed, marked}``: every fixed finding, how many a later check confirmed
+    were gone, and how many were only marked fixed by a person."""
+    try:
+        total = int(scalar(conn, "SELECT count(*) FROM findings WHERE status='resolved'", default=0) or 0)
+        confirmed = int(scalar(
+            conn,
+            "SELECT count(*) FROM findings f JOIN finding_events e ON e.finding_row_id=f.id "
+            "WHERE f.status='resolved' AND e.event='auto_resolved' AND e.id IN "
+            "(SELECT max(id) FROM finding_events GROUP BY finding_row_id)",
+            default=0,
+        ) or 0)
+    except sqlite3.Error:
+        return {"resolved": 0, "confirmed": 0, "marked": 0}
+    return {"resolved": total, "confirmed": confirmed, "marked": max(0, total - confirmed)}
+
+
 def _findings_score() -> Any | None:
     """``homesoc.findings.score`` when it is installed, else ``None``.
 
@@ -714,7 +1535,52 @@ def score_breakdown(conn: sqlite3.Connection, limit: int = SCORE_BREAKDOWN_LIMIT
             }
         )
     out.sort(key=lambda r: (-r["penalty"], -r["count"], r["finding_id"]))
-    return out[:limit]
+    out = out[:limit]
+    _breakdown_plain(conn, out)
+    return out
+
+
+def _breakdown_plain(conn: sqlite3.Connection, items: list[dict]) -> None:
+    """Plain words for "Fix these first": the action word, "+4 points", and where it is.
+
+    ``device_label``/``link_device_id`` are set when every open finding of that type is on one
+    device (or on this computer); ``where_text`` always says where, e.g. "Home router and
+    Kitchen TV" or "Home router, Kitchen TV and 3 more".
+    """
+    fids = [r["finding_id"] for r in items]
+    places: dict[str, list[dict]] = {}
+    if fids:
+        marks = ",".join("?" for _ in fids)
+        found = rows(
+            conn,
+            "SELECT f.finding_id, f.subject, f.evidence, f.device_id, d.ip AS device_ip, d.nickname AS device_nickname, "
+            "d.hostname AS device_hostname, d.kind AS device_kind FROM findings f "
+            f"LEFT JOIN devices d ON d.id=f.device_id WHERE f.status='open' AND f.finding_id IN ({marks}) "
+            "ORDER BY f.id LIMIT 5000",
+            fids,
+        )
+        for r in label_subject_rows(conn, found):
+            bucket = places.setdefault(str(r["finding_id"]), [])
+            if all(p["device_label"] != r["device_label"] for p in bucket):
+                bucket.append(r)
+    for item in items:
+        item["severity_word"] = sev_word(item.get("severity"))
+        gain = int(item.get("gain") or 0)
+        item["gain_text"] = f"+{gain} point{'' if gain == 1 else 's'}"
+        spots = places.get(item["finding_id"], [])
+        labels = [p["device_label"] for p in spots]
+        first = spots[0] if spots else {}
+        item["plain_title"] = catalog_plain_title(item["finding_id"], first.get("evidence"), str(first.get("subject") or ""))
+        if len(spots) == 1:
+            item["device_label"] = labels[0]
+            item["link_device_id"] = spots[0].get("link_device_id")
+        else:
+            item["device_label"] = None
+            item["link_device_id"] = None
+        if len(labels) <= 2:
+            item["where_text"] = " and ".join(labels) or None
+        else:
+            item["where_text"] = f"{labels[0]}, {labels[1]} and {len(labels) - 2} more"
 
 
 def category_for(finding_id: str) -> str:
@@ -756,6 +1622,25 @@ def catalog_remediation(finding_id: str, evidence: dict, subject: str = "") -> l
     return list(getattr(spec, "remediation", None) or [])
 
 
+def catalog_plain_title(finding_id: str, evidence: Any = None, subject: str = "") -> str:
+    """The catalog's plain-language headline for a stored finding, or "" (the caller then shows
+    the technical title). Never raises: a broken catalog must not break a page."""
+    try:
+        catalog = importlib.import_module("homesoc.findings.catalog")
+        return str(catalog.render_plain_title(str(finding_id or ""), evidence if isinstance(evidence, dict) else loads(evidence, {}), subject or "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def catalog_why(finding_id: str, evidence: Any = None, subject: str = "") -> str:
+    """"Why it matters" with the evidence interpolated, or "" when the catalog has none."""
+    try:
+        catalog = importlib.import_module("homesoc.findings.catalog")
+        return str(catalog.render_why(str(finding_id or ""), evidence if isinstance(evidence, dict) else loads(evidence, {}), subject or "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _decorate_finding(f: dict) -> dict:
     spec = catalog_spec(f["finding_id"])
     evidence = loads(f.get("evidence"), {})
@@ -764,7 +1649,13 @@ def _decorate_finding(f: dict) -> dict:
     f["category"] = category_for(f["finding_id"])
     f["remediation"] = catalog_remediation(f["finding_id"], evidence, str(f.get("subject") or ""))
     f["refs"] = list(getattr(spec, "refs", None) or [])
-    f["rationale"] = getattr(spec, "rationale", None) or ""
+    subject = str(f.get("subject") or "")
+    # "Why it matters" with this finding's evidence filled in (a few rationales carry
+    # {placeholders}); the plain headline sits beside the technical title, never instead of it.
+    f["rationale"] = catalog_why(f["finding_id"], evidence, subject) or getattr(spec, "rationale", None) or ""
+    f["plain_title"] = catalog_plain_title(f["finding_id"], evidence, subject)
+    f["severity_word"] = sev_word(f.get("severity"))
+    f["status_word"] = status_word(f.get("status"))
     return f
 
 
@@ -795,14 +1686,21 @@ def findings_list(
     order = "CASE f.severity " + " ".join(f"WHEN '{s}' THEN {i}" for i, s in enumerate(SEVERITIES)) + " ELSE 9 END"
     data = rows(
         conn,
-        "SELECT f.*, d.ip AS device_ip, COALESCE(d.nickname, d.hostname, d.ip) AS device_name "
+        "SELECT f.*, d.ip AS device_ip, COALESCE(d.nickname, d.hostname, d.ip) AS device_name, "
+        "d.nickname AS device_nickname, d.hostname AS device_hostname, d.kind AS device_kind "
         f"FROM findings f LEFT JOIN devices d ON d.id=f.device_id WHERE {' AND '.join(where)} "
         f"ORDER BY {order}, f.last_seen DESC LIMIT ?",
         params + [max(1, min(int(limit), 5000))],
     )
-    out = [_decorate_finding(f) for f in data]
+    out = label_subject_rows(conn, [_decorate_finding(f) for f in data])
     if category:
         out = [f for f in out if f["category"] == category]
+    # "Fixed" only when Home SOC's own check confirmed it; "Marked fixed" when a person said so.
+    how = resolved_how(conn, [int(f["id"]) for f in out if f.get("status") == "resolved" and f.get("id") is not None])
+    for f in out:
+        f["rechecks"] = str(f.get("finding_id") or "") not in NOT_RECHECKED_IDS
+        if f.get("status") == "resolved":
+            f["resolved_how"] = how.get(int(f["id"]), "manual") if f.get("id") is not None else None
     return out
 
 
@@ -837,8 +1735,33 @@ def _device_row(d: dict) -> dict:
     d["online"] = _bool(d.get("online"))
     d["trusted"] = _bool(d.get("trusted"))
     d["display_name"] = d.get("nickname") or d.get("hostname") or d.get("ip") or d.get("mac")
+    d["device_label"] = device_label(d)
     d["mdns_services"] = loads(d.get("mdns_services"), [])
     return d
+
+
+def _mark_host_device(conn: sqlite3.Connection, devices: list[dict]) -> None:
+    """Flag the computer Home SOC runs on and count the open ``host:`` findings that are about it.
+
+    Those findings carry no device_id (they are about the machine's own settings), so without this
+    the host's device page said "No findings" while twenty were open on the This computer page.
+    """
+    data = rows(conn, "SELECT subject, count(*) AS n FROM findings WHERE status='open' AND "
+                      "(subject='host' OR substr(subject,1,5)='host:') GROUP BY subject")
+    names = sorted({host_name_from_subject(r["subject"]) for r in data if host_name_from_subject(r["subject"])})
+    if not names:  # no open host finding names the machine: ask any finding that ever did
+        named = scalar(conn, "SELECT subject FROM findings WHERE substr(subject,1,5)='host:' ORDER BY id DESC LIMIT 1",
+                       default=None)
+        names = [host_name_from_subject(named)] if named and host_name_from_subject(named) else []
+    host = host_device(conn, names[0] if names else None)
+    host_id = int(host["id"]) if host else None
+    host_open = sum(int(r["n"] or 0) for r in data)
+    host_subject = f"host:{names[0]}" if names else "host"
+    for d in devices:
+        mine = host_id is not None and int(d["id"]) == host_id
+        d["is_this_computer"] = mine
+        d["host_findings_open"] = host_open if mine else 0
+        d["host_findings_link"] = ("/findings?status=open&q=" + quote(host_subject, safe="")) if mine else None
 
 
 def _device_ids_for_subject(subject: str, by_mac: dict[str, int]) -> set[int]:
@@ -888,7 +1811,9 @@ def devices_list(conn: sqlite3.Connection) -> list[dict]:
     for d in data:
         d["open_ports"] = ports.get(int(d["id"]), 0)
         d["open_findings"] = findings_open.get(int(d["id"]), 0)
-    return [_device_row(d) for d in data]
+    out = [_device_row(d) for d in data]
+    _mark_host_device(conn, out)
+    return out
 
 
 def device_counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -903,6 +1828,7 @@ def device_detail(conn: sqlite3.Connection, device_id: int) -> dict | None:
     if d is None:
         return None
     _device_row(d)
+    _mark_host_device(conn, [d])
     d["services"] = rows(
         conn,
         "SELECT * FROM services WHERE device_id=? ORDER BY CASE state WHEN 'open' THEN 0 ELSE 1 END, port",
@@ -1010,6 +1936,7 @@ def vulns_list(
         conn,
         "SELECT v.*, d.ip AS device_ip, d.mac AS device_mac, "
         "COALESCE(d.nickname, d.hostname, d.ip) AS device_name, "
+        "d.nickname AS device_nickname, d.hostname AS device_hostname, d.kind AS device_kind, "
         "s.port, s.proto, s.name AS service_name, s.product, s.version AS service_version "
         "FROM vulns v LEFT JOIN devices d ON d.id=v.device_id LEFT JOIN services s ON s.id=v.service_id "
         f"WHERE {' AND '.join(where)} ORDER BY v.kev DESC, COALESCE(v.cvss,0) DESC, v.first_seen DESC LIMIT ?",
@@ -1019,6 +1946,19 @@ def vulns_list(
         v["kev"] = _bool(v.get("kev"))
         v["nvd_url"] = f"https://nvd.nist.gov/vuln/detail/{v['cve']}"
         v["kev_url"] = "https://www.cisa.gov/known-exploited-vulnerabilities-catalog?search_api_fulltext=" + str(v["cve"])
+        if v.get("device_id") is not None:
+            v["device_label"] = device_label({
+                "nickname": v.get("device_nickname"), "hostname": v.get("device_hostname"),
+                "kind": v.get("device_kind"), "device_id": v.get("device_id"),
+            })
+            v["device_name"] = v["device_label"]  # was the IP for an unnamed device: shown twice
+        else:
+            v["device_label"] = "Unnamed device"
+        v["cvss_text"] = cvss_text(v.get("cvss"))
+        v["epss_pct"] = epss_pct(v.get("epss"))
+        v["epss_text"] = epss_text(v.get("epss"))
+        v["epss_note"] = EPSS_NOTE if v["epss_text"] else None
+        v["kev_text"] = kev_text(v.get("kev"))
     return data
 
 
@@ -1396,7 +2336,29 @@ def dns_series(conn: sqlite3.Connection, hours: int = 24) -> list[dict]:
     return out
 
 
+def label_clients(conn: sqlite3.Connection, items: list[dict], key: str = "client") -> list[dict]:
+    """Add ``device_id``/``device_label``/``device_ip`` to rows keyed on a DNS client address.
+
+    A client with no device row is an address Home SOC has never inventoried; it reads
+    "Unnamed device", and the address stays in ``client``/``device_ip`` for the page to show muted.
+    """
+    known = device_labels_by_ip(conn, [r.get(key) for r in items])
+    for r in items:
+        ip = str(r.get(key) or "")
+        hit = known.get(ip)
+        r["device_id"] = hit["device_id"] if hit else None
+        r["device_label"] = hit["device_label"] if hit else "Unnamed device"
+        r["device_ip"] = ip or None
+    return items
+
+
 def dns_top(conn: sqlite3.Connection, kind: str = "blocked", hours: int = 24, limit: int = 20) -> list[dict]:
+    if kind == "clients":
+        return label_clients(conn, _dns_top(conn, kind, hours, limit))
+    return _dns_top(conn, kind, hours, limit)
+
+
+def _dns_top(conn: sqlite3.Connection, kind: str = "blocked", hours: int = 24, limit: int = 20) -> list[dict]:
     hours = max(1, min(int(hours), 24 * 30))
     since = cutoff_iso(hours)
     limit = max(1, min(int(limit), 200))
@@ -1436,11 +2398,44 @@ def dns_log(conn: sqlite3.Connection, limit: int = 100, client: str | None = Non
         where.append("action=?")
         params.append(action)
     params.append(max(1, min(int(limit), 1000)))
-    return rows(
+    data = label_clients(conn, rows(
         conn,
         f"SELECT * FROM dns_queries WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
         params,
-    )
+    ))
+    _attach_verdicts(conn, data)
+    return data
+
+
+#: Threat-list names (mirrors homesoc.web.feed.THREAT_LISTS, which imports this module).
+_THREAT_LIST_NAMES: frozenset[str] = frozenset(
+    {"urlhaus", "threatfox", "openphish", "phishing_army", "feodo", "feodo_ips", "spamhaus_drop", "urlhaus_filter"}
+)
+
+
+def _attach_verdicts(conn: sqlite3.Connection, data: list[dict]) -> None:
+    """Give each log row a ``reputation`` word so a one-tap "allow" can warn loudly.
+
+    ``verdict`` is the cached reputation verdict for the name, if any. ``reputation`` is
+    "malicious" when the name was blocked by the reputation check or by a threat list, else the
+    verdict. Nothing here changes what was logged.
+    """
+    names = sorted({str(r.get("qname") or "").lower().rstrip(".") for r in data} - {""})
+    verdicts: dict[str, str] = {}
+    for start in range(0, len(names), 500):
+        chunk = names[start:start + 500]
+        marks = ",".join("?" for _ in chunk)
+        try:
+            for r in rows(conn, f"SELECT domain, verdict FROM reputation WHERE domain IN ({marks})", chunk):
+                verdicts[str(r["domain"]).lower()] = str(r.get("verdict") or "")
+        except sqlite3.Error:
+            break
+    for r in data:
+        verdict = verdicts.get(str(r.get("qname") or "").lower().rstrip("."), "") or None
+        reason = str(r.get("reason") or "")
+        on_threat_list = reason.startswith("list:") and reason[5:] in _THREAT_LIST_NAMES
+        r["verdict"] = verdict
+        r["reputation"] = "malicious" if (reason == "reputation" or on_threat_list) else verdict
 
 
 def dns_lists(c: WebContext) -> list[dict]:
@@ -1530,7 +2525,11 @@ def telemetry_metrics(conn: sqlite3.Connection, name: str | None = None, hours: 
     series: dict[str, list[list]] = {}
     for r in data:
         series.setdefault(_series_key(r["name"], r.get("tags")), []).append([r["ts"], float(r["value"])])
-    return {"hours": hours, "names": sorted(series), "series": series}
+    # The newest measurement of any age, so an empty window can say "none in the last 7 days —
+    # the last one was 8 days ago" instead of implying nothing has ever been recorded.
+    newest = scalar(conn, "SELECT max(ts) FROM metrics" + (" WHERE name=?" if name else ""),
+                    (name,) if name else (), default=None)
+    return {"hours": hours, "names": sorted(series), "series": series, "last_ts": newest}
 
 
 def telemetry_jobs(c: WebContext) -> list[dict]:
@@ -1593,6 +2592,129 @@ def last_scans(conn: sqlite3.Connection) -> dict[str, str]:
     return {r["kind"]: r["started_at"] for r in data}
 
 
+
+
+# --------------------------------------------------------------------------- events, in words
+#
+# The Home page's "Recent activity" used to print Home SOC's own log lines ("hourly rollup
+# written", "matched 38 services against KEV, NVD and EPSS: 7 CVEs, 1 KEV", "paired a new device:
+# Pixel in the hallway" — which reads as a stranger joining the network). Each event now carries a
+# plain sentence beside its raw message; the raw message stays in the row's tooltip and on System
+# health. Addresses are replaced by the device's name. A message no rule knows keeps its own words.
+
+_IPV4_IN_TEXT = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _n(text: str) -> int:
+    try:
+        return int(str(text).replace(",", ""))
+    except ValueError:
+        return 0
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return one if n == 1 else (many or one + "s")
+
+
+#: (source prefix, message pattern, sentence builder). First match wins.
+_EVENT_RULES: tuple[tuple[str, re.Pattern[str], Any], ...] = (
+    ("lens", re.compile(r"^paired a new device:\s*(?P<name>.+)$", re.I),
+     lambda m: f"A phone was paired with Lens, the camera app: {m['name']}. This is the app, not a new device on your network."),
+    ("scheduler", re.compile(r"^discovery finished.*\((?P<total>[\d,]+) devices?, (?P<online>[\d,]+) online\)", re.I),
+     lambda m: f"Home SOC checked your network: {m['online']} of {m['total']} known devices were there."),
+    ("scheduler", re.compile(r"^score recorded$", re.I), lambda m: "The safety score was updated."),
+    ("dnsfilter", re.compile(r"^hourly rollup written$", re.I), lambda m: "Web blocking saved its hourly summary."),
+    ("dnsfilter", re.compile(r"^blocked a known-malicious domain for (?P<who>.+)$", re.I),
+     lambda m: f"Web blocking stopped {m['who']} from reaching a known-dangerous website."),
+    ("vulns", re.compile(r"^matched (?P<svc>[\d,]+) services? against .*?: (?P<cves>[\d,]+) CVEs?, (?P<kev>[\d,]+) KEV", re.I),
+     lambda m: (f"Checked the software on your devices against lists of known flaws: {m['cves']} "
+                f"{_plural(_n(m['cves']), 'flaw')} matched, {m['kev']} on the list attackers are known to use.")),
+    ("scanners.ports", re.compile(r"^service scan of (?P<n>[\d,]+) hosts? finished", re.I),
+     lambda m: f"Checked the open doors (ports) on {m['n']} {_plural(_n(m['n']), 'device')}."),
+    ("scanners.ports", re.compile(r"^Telnet is open on (?P<who>.+?):(?P<port>\d+)$", re.I),
+     lambda m: f"Found Telnet (an old, unencrypted remote login) open on {m['who']}."),
+    ("feeds", re.compile(r"^updated (?P<what>.+)$", re.I),
+     lambda m: "Threat lists updated: " + ", ".join(p.split(" (")[0] for p in m["what"].split("), ")) + "."),
+    ("feeds", re.compile(r"^kev catalog(?:ue)? is current", re.I),
+     lambda m: "The list of flaws attackers are known to use is up to date."),
+    ("defender", re.compile(r"^Defender status read:\s*(?P<rest>.+)$", re.I),
+     lambda m: f"Checked Windows' antivirus (Defender): {m['rest']}."),
+    ("defender", re.compile(r"^quick scan finished, nothing found", re.I),
+     lambda m: "The antivirus quick scan finished and found nothing."),
+    ("defender", re.compile(r"^quarantined (?P<what>\S+)", re.I),
+     lambda m: f"The antivirus quarantined a threat ({m['what']})."),
+    ("defender", re.compile(r"^real-time protection is off", re.I),
+     lambda m: "The antivirus's real-time protection is off."),
+    ("scanners.host", re.compile(r"^posture scan: (?P<fail>[\d,]+) failing checks?, (?P<admin>[\d,]+) need administrator", re.I),
+     lambda m: (f"Checked this computer's safety settings: {m['fail']} need fixing, {m['admin']} "
+                "could not be checked without administrator rights.")),
+    ("scanners.exposure", re.compile(r"^UPnP mapping found: WAN (?P<ext>\d+) -> (?P<who>[^:]+):(?P<port>\d+)", re.I),
+     lambda m: f"Your router opened a door to the internet by itself (UPnP) for {m['who']}."),
+    ("scanners.exposure", re.compile(r"^InternetDB lookup failed", re.I),
+     lambda m: "Home SOC could not check how your network looks from the internet this time."),
+    ("scanners.files", re.compile(r"^hashed (?P<n>[\d,]+) files? in Downloads, nothing new", re.I),
+     lambda m: f"Checked {m['n']} {_plural(_n(m['n']), 'file')} in Downloads: nothing new to report."),
+    ("scanners.files", re.compile(r"^new download flagged by VirusTotal: (?P<hit>\d+)/(?P<of>\d+)", re.I),
+     lambda m: f"A new download was flagged as dangerous by {m['hit']} of {m['of']} virus scanners."),
+    ("scanners.discovery", re.compile(r"^new device on the network: (?P<who>.+)$", re.I),
+     lambda m: f"A device Home SOC had not seen before joined your network: {m['who']}."),
+    ("housekeeping", re.compile(r"^purged ", re.I), lambda m: "Home SOC tidied away old records."),
+    ("notify", re.compile(r"^digest sent to (?P<n>\d+) channel", re.I), lambda m: "The daily summary was sent."),
+    ("findings", re.compile(r"^(?P<n>[\d,]+) findings? auto-resolved after a rescan", re.I),
+     lambda m: f"A later check confirmed {m['n']} {_plural(_n(m['n']), 'problem')} fixed."),
+    ("findings", re.compile(r"^(?P<cve>CVE-\d{4}-\d+) matched the (?P<what>.+?) and is in the CISA KEV", re.I),
+     lambda m: f"A known software flaw on the {m['what']} is on the list attackers are known to use ({m['cve']})."),
+)
+
+
+def plain_events(conn: sqlite3.Connection, events: list[dict]) -> list[dict]:
+    """Add ``plain`` (a sentence for the Home page) to each event; ``message`` is left as it was.
+
+    Addresses inside a message are replaced by the device's name ("Ellie's iPhone (192.168.1.32)").
+    """
+    ips = sorted({ip for e in events for ip in _IPV4_IN_TEXT.findall(str(e.get("message") or ""))})
+    try:
+        names = device_labels_by_ip(conn, ips) if ips else {}
+    except sqlite3.Error:
+        names = {}
+
+    def named(text: str) -> str:
+        def swap(m: re.Match[str]) -> str:
+            hit = names.get(m.group(0))
+            label = hit.get("device_label") if hit else None
+            return f"{label} ({m.group(0)})" if label and label != m.group(0) else m.group(0)
+        return _IPV4_IN_TEXT.sub(swap, text)
+
+    for e in events:
+        source = str(e.get("source") or "").lower()
+        message = str(e.get("message") or "")
+        plain = None
+        for prefix, pattern, build in _EVENT_RULES:
+            if not source.startswith(prefix):
+                continue
+            m = pattern.search(message)
+            if m:
+                try:
+                    plain = build(m)
+                except (KeyError, IndexError, ValueError):
+                    plain = None
+                break
+        e["plain"] = named(plain or message)
+    return events
+
+
+def collapse_repeats(events: list[dict]) -> list[dict]:
+    """Fold a run of back-to-back events with the same sentence into one row carrying
+    ``repeats`` (the Home page showed "A phone was paired…" three times in a row)."""
+    out: list[dict] = []
+    for e in events:
+        if out and out[-1].get("plain") == e.get("plain") and out[-1].get("level") == e.get("level"):
+            out[-1]["repeats"] = int(out[-1].get("repeats") or 1) + 1
+            continue
+        out.append(e)
+    return out
+
+
 # --------------------------------------------------------------------------- summary
 
 
@@ -1600,7 +2722,22 @@ def summary(c: WebContext) -> dict:
     conn = c.conn
     score = security_score(conn)
     dns = dns_summary(c)
+    counts = finding_counts(conn)
+    stale = staleness(conn, c.cfg)
+    status = status_summary(conn, c.cfg, counts=counts, stale=stale,
+                            dns={"enabled": dns.get("enabled"), "running": dns.get("running")})
     return {
+        # Plain-language layer (additive): one sentence about the whole network, the banner tone,
+        # where it links, whether the picture is current, and the score's band word.
+        "status_line": status["status_line"],
+        "status_tone": status["status_tone"],
+        "status_link": status["status_link"],
+        "unfinished_checks": status["unfinished"],
+        "overdue_checks": status["overdue"],
+        "overdue_feeds": overdue_feeds(conn, c.cfg),
+        "staleness": stale,
+        "score_word": score_word(score),
+        "dns_note": dns_note(dns),
         "generated_at": now_iso(),
         "name": str(cfg_get(c.cfg, "general.name", "Home SOC")),
         "refresh_seconds": int(cfg_get(c.cfg, "web.refresh_seconds", 15) or 15),
@@ -1608,15 +2745,22 @@ def summary(c: WebContext) -> dict:
         "grade": grade(score),
         "trend": score_trend(conn),
         "score_breakdown": score_breakdown(conn),
-        "counts": finding_counts(conn),
+        "counts": counts,
         "devices": device_counts(conn),
         "dns": {k: dns[k] for k in ("total24h", "blocked24h", "clients24h", "running", "blocked_pct", "enabled")},
         "jobs": telemetry_jobs(c),
         "feeds": feeds_list(conn),
         "last_scans": last_scans(conn),
-        "events": telemetry_events(conn, limit=20),
+        "events": collapse_repeats(plain_events(conn, telemetry_events(conn, limit=20))),
         "scheduler": c.scheduler is not None,
     }
+
+
+def dns_note(dns: dict) -> str | None:
+    """The sentence the overview shows when web blocking is switched on but not working."""
+    if dns.get("enabled") and not dns.get("running"):
+        return "Web blocking is switched on but not running, so nothing is being filtered right now."
+    return None
 
 
 # --------------------------------------------------------------------------- scans
@@ -2292,6 +3436,7 @@ def _map_graph_build(conn: sqlite3.Connection, *, hours: int = DEFAULT_MAP_HOURS
     for node in nodes:
         node["depends_on"] = outgoing.get(node["id"], 0)
         node["depended_on_by"] = incoming.get(node["id"], 0)
+    attach_device_labels(conn, nodes)
 
     return {
         "ok": True,
@@ -2315,6 +3460,22 @@ def _map_graph_build(conn: sqlite3.Connection, *, hours: int = DEFAULT_MAP_HOURS
             ),
         },
     }
+
+
+def attach_device_labels(conn: sqlite3.Connection, items: list[dict], id_key: str = "device_id",
+                         out_key: str = "device_label") -> list[dict]:
+    """Set ``out_key`` (and ``device_ip``) on every row whose ``id_key`` names a known device.
+
+    Rows without a device (the internet node, a resolver, a cloud service) get ``None``: the map
+    labels those itself, and this field is only ever a device's name.
+    """
+    known = device_labels_by_id(conn, [r.get(id_key) for r in items])
+    for r in items:
+        hit = known.get(_int_or_none(r.get(id_key)))  # type: ignore[arg-type]
+        r[out_key] = hit["device_label"] if hit else None
+        if out_key == "device_label":
+            r.setdefault("device_ip", hit["ip"] if hit else None)
+    return items
 
 
 def _blast_members(raw: Any) -> list[dict]:
@@ -2384,15 +3545,18 @@ def map_blast(conn: sqlite3.Connection, device_id: int, *, cfg: Any = None, engi
     if not isinstance(raw, dict):
         raise TopologyUnavailable("blast_radius did not return a mapping")
 
-    offline = _blast_members(raw.get("offline"))
-    degraded = _blast_members(raw.get("degraded"))
-    unaffected = _blast_members(raw.get("unaffected"))
+    offline = attach_device_labels(conn, _blast_members(raw.get("offline")))
+    degraded = attach_device_labels(conn, _blast_members(raw.get("degraded")))
+    unaffected = attach_device_labels(conn, _blast_members(raw.get("unaffected")))
     confidence = _text(raw.get("confidence"), 20).lower()
     evidence = _text(raw.get("evidence"), 600)
     device = raw.get("device")
     if not isinstance(device, dict):
         device = one(conn, "SELECT id, mac, ip, hostname, nickname, kind, vendor, online FROM devices WHERE id=?", (int(device_id),)) or {}
         device = _device_row(dict(device)) if device else {}
+    elif "device_label" not in device:
+        device = dict(device)
+        device["device_label"] = device_label(device)
     return {
         "ok": True,
         "generated_at": now_iso(),
@@ -2488,7 +3652,7 @@ def map_criticality(conn: sqlite3.Connection, limit: int = 50, *, engine_edges: 
         )
     # The engine returns this descending; sorting again keeps the API's order stable whatever it does.
     out.sort(key=lambda r: (-r["weight"], -r["dependents"], str(r["label"]).lower()))
-    return out[: max(1, min(int(limit or 1), 500))]
+    return attach_device_labels(conn, out[: max(1, min(int(limit or 1), 500))])
 
 
 def map_outages(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
@@ -2550,6 +3714,8 @@ def map_outages(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
                 "members": listed,
             }
         )
+    attach_device_labels(conn, out, id_key="trigger_device_id", out_key="trigger_device_label")
+    attach_device_labels(conn, [m for outage in out for m in outage["members"]])
     return out
 
 

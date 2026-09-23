@@ -23,6 +23,27 @@
   var REPEAT_MS = 3500;         /* ignore the same code again for this long */
   var SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
 
+  /* The dashboard's plain words (DESIGN.md 8.2). They sit BESIDE the technical label, never in
+     place of it: "Critical" stays on the badge and "Fix now" goes next to it. */
+  var SEV_LABEL = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low', info: 'Info' };
+  var SEV_WORD = {
+    critical: 'Fix now', high: 'Fix this week', medium: 'Worth fixing',
+    low: 'When you have time', info: 'Good to know'
+  };
+  var STATUS_WORD = {
+    open: 'Needs attention', acknowledged: 'Seen, not fixed yet',
+    resolved: 'Fixed', suppressed: 'Ignored (your choice)'
+  };
+  /* What an unnamed device is called: "Unnamed camera", never its address twice. Mirrors the
+     server's KIND_NOUN (homesoc/web/lens.py). */
+  var KIND_NOUN = {
+    router: 'router', gateway: 'router', ap: 'access point', camera: 'camera', printer: 'printer',
+    nas: 'NAS', storage: 'storage box', tv: 'TV', media: 'media player', phone: 'phone', mobile: 'phone',
+    tablet: 'tablet', laptop: 'laptop', computer: 'computer', desktop: 'PC', pc: 'PC', server: 'server',
+    speaker: 'speaker', audio: 'speaker', thermostat: 'thermostat', plug: 'smart plug', bulb: 'smart bulb',
+    light: 'smart light', console: 'games console', iot: 'gadget'
+  };
+
   /* Plain-English gloss for the ports people actually find at home. The API may supply its own
      (`gloss`), which always wins; this table is the floor, so a port is never bare digits. */
   var PORT_GLOSS = {
@@ -100,7 +121,10 @@
     var s = Math.round((Date.now() - d.getTime()) / 1000);
     var back = s >= 0;
     s = Math.abs(s);
-    var out = s >= 86400 ? Math.floor(s / 86400) + 'd' : s >= 3600 ? Math.floor(s / 3600) + 'h' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's';
+    if (s < 60) { return back ? 'just now' : 'in under a minute'; }
+    var n = s >= 86400 ? Math.floor(s / 86400) : s >= 3600 ? Math.floor(s / 3600) : Math.floor(s / 60);
+    var unit = s >= 86400 ? 'day' : s >= 3600 ? 'hour' : 'min';
+    var out = n + ' ' + (unit === 'min' || n === 1 ? unit : unit + 's');
     return back ? out + ' ago' : 'in ' + out;
   }
   function severity(value) {
@@ -110,6 +134,46 @@
   function sevRank(value) { return SEVERITIES.indexOf(severity(value)); }
   function badge(kind, label) {
     return el('span', { className: 'badge badge-' + String(kind || 'info').toLowerCase(), text: label === undefined ? kind : label });
+  }
+  /* The severity badge (technical label, solid fill) and its plain action word beside it. */
+  function sevBadge(value, done) {
+    var sev = severity(value);
+    /* A finding that is already fixed (or ignored) keeps its severity label but loses the
+       "Fix now" urge: telling someone to fix a thing they fixed is the kind of noise that
+       teaches them to stop reading. */
+    if (done) { return [badge(sev, SEV_LABEL[sev])]; }
+    return [badge(sev, SEV_LABEL[sev]), el('span', { className: 'sev-word sev-word-' + sev, text: SEV_WORD[sev] })];
+  }
+  function isDone(status) {
+    var st = String(status || '').toLowerCase();
+    return st === 'resolved' || st === 'suppressed';
+  }
+  /* A finding's status as the dashboard's quiet pill, in words; the raw status stays in the
+     row's technical details. */
+  function statusBadge(value) {
+    var st = String(value || '').toLowerCase();
+    if (!STATUS_WORD[st]) { return null; }
+    return el('span', { className: 'badge badge-status badge-' + st, text: STATUS_WORD[st] });
+  }
+  function looksLikeAddress(value) {
+    var v = String(value || '');
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(v) || /^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$/i.test(v) || /^device \d+$/.test(v);
+  }
+  /* Devices are named, not numbered (DESIGN.md 8.1 #4): the server's device_label when it sends
+     one, then the owner's nickname, then the hostname; an unnamed device reads "Unnamed camera"
+     and its IP is shown second, muted, by the caller. */
+  function deviceName(d) {
+    d = d || {};
+    var ids = [d.ip, d.mac].filter(Boolean).map(String);
+    var picks = [d.device_label, d.nickname, d.display_name, d.hostname, d.name];
+    for (var i = 0; i < picks.length; i++) {
+      var v = picks[i];
+      /* A label that embeds the address ("Unnamed camera (192.168.1.142)") is skipped too: the
+         IP is printed on its own line, and the offline snapshot must never keep it. */
+      var carriesId = ids.some(function (id) { return String(v).indexOf(id) >= 0; });
+      if (v && !carriesId && !looksLikeAddress(v)) { return String(v); }
+    }
+    return 'Unnamed ' + (KIND_NOUN[String(d.kind || '').toLowerCase()] || 'device');
   }
   function kindIcon(kind) {
     var key = String(kind || '').toLowerCase();
@@ -173,7 +237,7 @@
       device: {
         id: d.id,
         /* The one name the card was headed with, in place of the identifiers behind it. */
-        name: String(d.nickname || d.hostname || d.ip || d.mac || 'Unknown device'),
+        name: deviceName(d),
         kind: d.kind ? String(d.kind) : '',
         online: Boolean(d.online),
         trusted: Boolean(d.trusted),
@@ -342,12 +406,17 @@
 
     /* A permanent, non-dismissible panel in the middle of the viewfinder. Unlike #notice it is
        never cleared by hideNotice(), and it always carries a way back to the camera. */
-    function setDegraded(why, title, body) {
+    function setDegraded(why, title, body, steps) {
       degraded = why || null;
       clear(fallbackBody);
       if (!why) { show(fallback, false); return; }
       fallbackBody.appendChild(el('h2', { className: 'fallback-title', text: title }));
       fallbackBody.appendChild(el('p', { className: 'fallback-body', text: body }));
+      if (steps && steps.length) {
+        var how = el('ol', { className: 'steps' });
+        steps.forEach(function (step) { how.appendChild(el('li', { text: step })); });
+        fallbackBody.appendChild(how);
+      }
       var row = el('div', { className: 'fallback-row' });
       var pick = el('button', { className: 'btn btn-primary', text: 'Pick a device', attrs: { type: 'button' } });
       pick.addEventListener('click', function () { openPicker('pick'); });
@@ -398,21 +467,20 @@
         noVideo(true);
         var name = (err && err.name) || '';
         state('camera off', 'bad');
-        setDegraded('camera', 'The camera is not running',
-          name === 'NotAllowedError' || name === 'SecurityError'
-            ? 'Camera permission was declined, so Lens cannot read codes. Pick the device from the list, or grant the camera and try again.'
-            : (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError'
-                ? 'This device has no camera Lens can use. The device list below is the same information, one tap away.'
-                : 'The camera could not be started' + (name ? ' (' + name + ')' : '') + '. Another app may be holding it.'));
         if (name === 'NotAllowedError' || name === 'SecurityError') {
-          showNotice(
-            'Camera permission was declined',
-            'Lens needs the rear camera to read barcodes and stickers. You can grant it from the padlock in the address bar, or carry on without it.',
-            ['Tap the padlock (or ⓘ) next to the address.', 'Set Camera to Allow.', 'Reload this page.'],
-            { label: 'Pick a device instead', name: 'pick' },
-            'camera'
-          );
-        } else if (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError') {
+          /* Said once, in the permanent panel, which carries the steps and both ways forward.
+             A dismissible notice repeating the same sentence above it was the message twice. */
+          hideNoticeIf('camera');
+          setDegraded('camera', 'Camera permission was declined',
+            'Lens needs the rear camera to read barcodes and stickers. You can allow it and try again, or pick the device from the list.',
+            ['Tap the padlock (or ⓘ) next to the address.', 'Set Camera to Allow.', 'Tap “Try the camera again”.']);
+          return;
+        }
+        setDegraded('camera', 'The camera is not running',
+          name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError'
+            ? 'This device has no camera Lens can use. The device list below is the same information, one tap away.'
+            : 'The camera could not be started' + (name ? ' (' + name + ')' : '') + '. Another app may be holding it.');
+        if (name === 'NotFoundError' || name === 'OverconstrainedError' || name === 'DevicesNotFoundError') {
           showNotice(
             'No camera on this device',
             'Lens works without one: the device list below is the same information, one tap away.',
@@ -587,7 +655,7 @@
         state('not paired', 'bad');
         showNotice(
           'This phone is no longer paired',
-          'The token was revoked or has expired, so Lens cannot read anything until it is paired again.',
+          'Its access was withdrawn from the Home SOC computer, or it expired, so Lens cannot show anything until it is paired again.',
           ['Open Home SOC on your computer.', 'Go to Lens → Pair a phone.', 'Scan the QR code it shows with this phone.'],
           { label: 'Reload', name: 'reload', bad: true },
           'unpaired'
@@ -716,26 +784,35 @@
       var d = payload.device || {};
       var posture = payload.posture || {};
       var counts = posture.severity_counts || {};
-      var name = d.nickname || d.hostname || d.ip || d.mac || d.name || 'Unknown device';
+      var name = deviceName(d);
 
       if (opts.stale) {
         cardBody.appendChild(el('p', {
           className: 'stale-strip',
           text: 'Offline — this is the last card Lens saw' + (d.last_seen ? ', ' + ago(d.last_seen) : '') + '. The numbers may have moved on.'
         }));
+      } else if (payload.staleness && payload.staleness.stale) {
+        /* The same honesty line the dashboard puts at the top of every page: the card is only as
+           fresh as Home SOC's last look at the network. */
+        var age = String(payload.staleness.age_text || '').trim();
+        cardBody.appendChild(el('p', {
+          className: 'stale-strip',
+          text: 'Home SOC last checked your network ' + (age ? (/ago$/.test(age) ? age : age + ' ago') : 'a while ago') +
+            ' — what you see may be out of date.'
+        }));
       }
 
       /* header */
-      /* A device with no nickname or hostname is titled by its IP, so repeating the IP
-         underneath it costs a line of a 390px card and tells the reader nothing. */
+      /* Named, not numbered: the name leads and the address follows, muted. An unnamed device
+         reads "Unnamed camera", so the IP line underneath is never a repeat of the title. */
       var meta = [d.ip, d.vendor, d.mac].filter(function (part) {
         return part && String(part) !== name;
       }).join(' · ');
       var flags = el('div', { className: 'dev-flags' },
-        el('span', { className: 'flag ' + (d.online ? 'on' : 'off') }, el('span', { className: 'dot' }), el('span', { text: d.online ? 'online' : 'offline' })),
-        el('span', { className: 'flag' + (d.trusted ? '' : ' untrusted') }, el('span', { text: d.trusted ? 'trusted' : 'not trusted' })),
+        el('span', { className: 'flag ' + (d.online ? 'on' : 'off') }, el('span', { className: 'dot' }), el('span', { text: d.online ? 'Online' : 'Offline' })),
+        el('span', { className: 'flag ' + (d.trusted ? 'trusted' : 'untrusted') }, el('span', { text: d.trusted ? 'Trusted' : 'Not trusted' })),
         d.kind ? el('span', { className: 'flag', text: String(d.kind) }) : null,
-        d.last_seen ? el('span', { className: 'flag', text: 'seen ' + ago(d.last_seen) }) : null
+        d.last_seen ? el('span', { className: 'flag', text: 'Last seen ' + ago(d.last_seen) }) : null
       );
       cardBody.appendChild(el('div', { className: 'dev-head' },
         el('span', { className: 'dev-icon', text: kindIcon(d.kind), attrs: { 'aria-hidden': 'true' } }),
@@ -756,7 +833,7 @@
         cardBody.appendChild(exposedSection(payload.services || []));
         cardBody.appendChild(el('p', {
           className: 'sec-empty',
-          text: 'Problems, vulnerabilities, DNS and history are shown only while Home SOC is reachable.'
+          text: 'Things to fix, software flaws, websites looked up and history are shown only while Home SOC is reachable.'
         }));
         cardBody.appendChild(footer(payload, d, true));
         BODY.classList.add('card-open');
@@ -801,13 +878,14 @@
         if (!n) { return; }
         any = true;
         strip.appendChild(el('span', { className: 'sev-chip sev-' + sev },
-          el('b', { text: num(n) }), el('span', { text: sev })));
+          el('b', { text: num(n) }), el('span', { text: sev }),
+          el('span', { className: 'chip-word', text: SEV_WORD[sev] })));
       });
       if (!any) {
-        strip.appendChild(el('span', { className: 'sev-chip is-clean', text: 'No open problems' }));
+        strip.appendChild(el('span', { className: 'sev-chip is-clean', text: 'Nothing to fix' }));
       }
       if (posture && posture.score_contribution) {
-        strip.appendChild(el('span', { className: 'sev-chip', text: '−' + num(posture.score_contribution) + ' points' }));
+        strip.appendChild(el('span', { className: 'sev-chip is-points', text: '−' + num(posture.score_contribution) + ' safety points' }));
       }
       return strip;
     }
@@ -956,39 +1034,55 @@
 
     function problemsSection(findings, actions, device) {
       var sorted = findings.slice().sort(function (a, b) { return sevRank(a.severity) - sevRank(b.severity); });
-      var sec = section('Problems', sorted.length, sorted.length > 0);
+      /* The count is what still needs doing; fixed and ignored rows stay listed, marked as such. */
+      var live = sorted.filter(function (f) { return !isDone(f.status); });
+      var sec = section('Things to fix', live.length, live.length > 0);
       if (!sorted.length) {
         sec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing open against this device.' }));
         return sec;
       }
+      if (!live.length) {
+        sec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing open against this device. Earlier problems are listed below.' }));
+      }
       sorted.forEach(function (f) {
-        var sev = severity(f.severity);
-        var row = el('div', { className: 'row' },
-          badge(sev, sev),
+        var row = el('div', { className: 'row is-stacked' },
+          el('div', { className: 'row-head' }, sevBadge(f.severity, isDone(f.status)), statusBadge(f.status)),
           el('div', { className: 'row-main' },
             el('div', { className: 'row-title', text: f.title || f.finding_id || 'Finding' }),
-            el('p', { className: 'row-sub', text: [f.detail, f.status ? 'status: ' + f.status : '', f.first_seen ? 'since ' + ago(f.first_seen) : ''].filter(Boolean).join(' · ') })));
+            el('p', { className: 'row-sub', text: [f.detail, f.first_seen ? 'found ' + ago(f.first_seen) : ''].filter(Boolean).join(' · ') })));
         sec.appendChild(row);
         var steps = (f.remediation || []).filter(Boolean);
         if (steps.length) {
           var fix = el('details', { className: 'fix' },
-            el('summary', { text: 'Fix it — ' + steps.length + ' step' + (steps.length === 1 ? '' : 's') }));
+            el('summary', { text: 'How to fix this — ' + steps.length + ' step' + (steps.length === 1 ? '' : 's') }));
           var list = el('ol', { className: 'fix-steps' });
           steps.forEach(function (step) { list.appendChild(el('li', { text: String(step) })); });
           fix.appendChild(list);
-          (f.refs || []).forEach(function (ref) { fix.appendChild(el('p', { className: 'refs', text: String(ref) })); });
           sec.appendChild(fix);
         }
+        /* Technical detail is one tap away, not deleted: the check's ID, the raw status and the
+           references the fix steps came from. */
+        var techBits = [
+          f.finding_id ? 'Check: ' + f.finding_id : '',
+          f.status ? 'Status: ' + f.status : '',
+          'Severity: ' + severity(f.severity)
+        ].filter(Boolean);
+        var tech = el('details', { className: 'fix tech-details' },
+          el('summary', { text: 'Technical details' }),
+          el('p', { className: 'refs', text: techBits.join(' · ') }));
+        (f.refs || []).forEach(function (ref) { tech.appendChild(el('p', { className: 'refs', text: String(ref) })); });
+        sec.appendChild(tech);
         /* Outside the steps block on purpose: a finding with no remediation array is still an
            open finding the API will happily acknowledge, and burying the button inside "Fix it"
            meant the phone never offered it. Whether it can be acknowledged is a question about
            scope and status, not about whether anyone wrote fix steps for it. */
         if (actions.can_acknowledge && f.row_id && String(f.status) === 'open') {
-          var ack = el('button', { className: 'btn btn-small', text: 'Acknowledge', attrs: { type: 'button' } });
+          /* "Acknowledge" in the API; "I've seen this" on screen, as on the dashboard. */
+          var ack = el('button', { className: 'btn btn-small', text: 'I’ve seen this', attrs: { type: 'button' } });
           ack.addEventListener('click', function () {
             ack.disabled = true;
             request('/api/lens/action', { body: { device_id: device.id, action: 'acknowledge', payload: { row_id: f.row_id } } })
-              .then(function () { text(ack, 'acknowledged'); })
+              .then(function () { text(ack, 'Seen, not fixed yet'); })
               .catch(function (err) { ack.disabled = false; onError(err, 'action'); });
           });
           sec.appendChild(el('div', { className: 'row-actions' }, ack));
@@ -999,7 +1093,7 @@
 
     function exposedSection(services) {
       var open = services.filter(function (s) { return !s.state || String(s.state) === 'open'; });
-      var sec = section('Exposed', open.length, open.length > 0);
+      var sec = section('Open doors (ports)', open.length, open.length > 0);
       if (!open.length) {
         sec.appendChild(el('p', { className: 'sec-empty', text: 'No open ports were found on the last scan.' }));
         return sec;
@@ -1009,9 +1103,8 @@
         /* The API glosses every port in plain English; PORT_GLOSS is the offline floor. */
         var gloss = s.gloss || PORT_GLOSS[port] || (s.name ? String(s.name) + ' — service on this port' : 'an unrecognised service');
         var label = s.label || s.name || '';
-        var risk = s.risk ? severity(s.risk) : null;
-        sec.appendChild(el('div', { className: 'row' },
-          risk ? badge(risk, risk) : null,
+        sec.appendChild(el('div', { className: 'row is-stacked' },
+          s.risk ? el('div', { className: 'row-head' }, sevBadge(s.risk)) : null,
           el('div', { className: 'row-main' },
             el('div', { className: 'row-title', text: port + '/' + (s.proto || 'tcp') + (label ? ' ' + label : '') }),
             el('p', { className: 'row-sub', text: gloss }))));
@@ -1019,26 +1112,34 @@
       return sec;
     }
 
-    function epssText(value) {
-      var n = Number(value);
-      if (!isFinite(n) || n <= 0) { return ''; }
-      var pct = n <= 1 ? n * 100 : n;
-      var shown = pct < 1 ? 'less than 1%' : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + '%';
-      return shown + ' chance of exploitation in the next 30 days';
+    /* EPSS is a worldwide forecast for the flaw, not a forecast for this home: it estimates the
+       chance the flaw is exploited anywhere in the next 30 days and says nothing about whether
+       this household is targeted. So the wording is built here from the number, and never
+       borrowed from a server string that might say "attack". */
+    function epssText(v) {
+      var raw = v && v.epss !== null && v.epss !== undefined && v.epss !== '' ? Number(v.epss) : NaN;
+      var pct = isFinite(raw) && raw >= 0 && raw <= 1 ? raw * 100
+        : (v && v.epss_pct !== null && v.epss_pct !== undefined && v.epss_pct !== '' ? Number(v.epss_pct) : NaN);
+      if (!isFinite(pct) || pct < 0) { return ''; }
+      var shown = pct < 1 ? 'Less than 1%' : (pct < 10 ? pct.toFixed(1) : String(Math.round(pct))) + '%';
+      return shown + ' chance this flaw is exploited somewhere in the next 30 days (EPSS)';
     }
 
     function vulnSection(vulns) {
-      var sec = section('Vulnerabilities', vulns.length, false);
+      var sec = section('Known software flaws (CVEs)', vulns.length, false);
       if (!vulns.length) {
         sec.appendChild(el('p', { className: 'sec-empty', text: 'No CVEs matched the software this device is running.' }));
         return sec;
       }
+      var anyEpss = false;
       vulns.slice().sort(function (a, b) {
         return (b.kev ? 1 : 0) - (a.kev ? 1 : 0) || (Number(b.cvss) || 0) - (Number(a.cvss) || 0);
       }).forEach(function (v) {
+        var epss = epssText(v);
+        if (epss) { anyEpss = true; }
         var sub = [
-          v.cvss ? 'CVSS ' + v.cvss : '',
-          v.epss_text || epssText(v.epss),
+          v.cvss ? 'CVSS ' + v.cvss + ' of 10' : '',
+          epss,
           v.service ? 'via ' + v.service : ''
         ].filter(Boolean).join(' · ');
         var head = el('div', { className: 'row-main' },
@@ -1046,10 +1147,19 @@
           el('p', { className: 'row-sub', text: sub }));
         if (v.kev_note) { head.appendChild(el('p', { className: 'row-sub', text: String(v.kev_note) })); }
         if (v.remediation) { head.appendChild(el('p', { className: 'row-sub', text: String(v.remediation) })); }
-        sec.appendChild(el('div', { className: 'row' },
-          v.kev ? badge('kev', 'KEV — exploited') : (v.severity ? badge(severity(v.severity), severity(v.severity)) : null),
-          head));
+        /* KEV means CISA has seen the flaw exploited somewhere, which outranks every score, so it
+           reads "Fix now" whatever the CVSS says. */
+        var tag = v.kev
+          ? el('div', { className: 'row-head' }, badge('kev', 'KEV · exploited'), el('span', { className: 'sev-word sev-word-critical', text: SEV_WORD.critical }))
+          : (v.severity ? el('div', { className: 'row-head' }, sevBadge(v.severity)) : null);
+        sec.appendChild(el('div', { className: 'row is-stacked' }, tag, head));
       });
+      if (anyEpss) {
+        sec.appendChild(el('p', {
+          className: 'sec-note',
+          text: 'EPSS is a worldwide forecast for the flaw itself. It does not say whether this home is being targeted.'
+        }));
+      }
       return sec;
     }
 
@@ -1075,7 +1185,9 @@
         ? Number(dns.block_rate) : (total ? blocked / total : 0);
       var pct = Math.round((rate <= 1 ? rate * 100 : rate));
       var threats = dns.threats || [];
-      var sec = section('Talking to', total ? num(total) : null, true);
+      /* DNS lookups, not traffic: Home SOC sees which names a device asks its resolver for, not
+         what it then sends or to whom, so the section says "looked up", never "talking to". */
+      var sec = section('Websites it looked up (DNS)', total ? num(total) : null, true);
 
       /* Strictly false, not falsy: the API reports null when it cannot tell whether the
          resolver is on, and "unknown" must not be rendered as "off". In that case the note
@@ -1083,7 +1195,7 @@
       if (dns.enabled === false) {
         sec.appendChild(el('p', {
           className: 'sec-empty',
-          text: dns.note || 'The Home SOC resolver is off, so Lens cannot see what this device is talking to. Turn the DNS filter on to find out.'
+          text: dns.note || 'Web blocking (the Home SOC DNS resolver) is off, so Lens cannot see which websites this device looks up. Turn it on to find out.'
         }));
         return sec;
       }
@@ -1091,26 +1203,26 @@
         el('span', { className: 'dns-num' + (threats.length ? ' is-hot' : ''), text: pct + '%' }),
         el('span', { className: 'dns-hero-text' },
           el('b', { text: num(blocked) + ' of ' + num(total) + ' lookups blocked' }),
-          el('span', { text: 'in the last ' + (dns.window_hours || 24) + ' hours' + (threats.length ? ' · ' + num(threats.length) + ' known-bad destination' + (threats.length === 1 ? '' : 's') : '') }))));
+          el('span', { text: 'in the last ' + (dns.window_hours || 24) + ' hours' + (threats.length ? ' · ' + num(threats.length) + ' known-bad website' + (threats.length === 1 ? '' : 's') : '') }))));
 
       if (dns.note) { sec.appendChild(el('p', { className: 'dns-note', text: String(dns.note) })); }
 
       if (threats.length) {
         var maxT = Math.max.apply(null, threats.map(function (t) { return Number(t.count) || 0; }).concat([1]));
         sec.appendChild(el('div', { className: 'dns-group' },
-          el('h4', { text: 'Known-bad destinations' }), bars(threats, 'threat', maxT)));
+          el('h4', { text: 'Known-bad websites' }), bars(threats, 'threat', maxT)));
       }
       var allowed = dns.top_allowed || [];
       if (allowed.length) {
         var maxA = Math.max.apply(null, allowed.map(function (a) { return Number(a.count) || 0; }).concat([1]));
         sec.appendChild(el('div', { className: 'dns-group' },
-          el('h4', { text: 'Most contacted' }), bars(allowed.slice(0, 8), 'allowed', maxA)));
+          el('h4', { text: 'Most looked up' }), bars(allowed.slice(0, 8), 'allowed', maxA)));
       }
       var blockedRows = dns.top_blocked || [];
       if (blockedRows.length) {
         var maxB = Math.max.apply(null, blockedRows.map(function (b) { return Number(b.count) || 0; }).concat([1]));
         sec.appendChild(el('div', { className: 'dns-group' },
-          el('h4', { text: 'Blocked' }), bars(blockedRows.slice(0, 8), 'blocked', maxB)));
+          el('h4', { text: 'Blocked by web blocking' }), bars(blockedRows.slice(0, 8), 'blocked', maxB)));
       }
       if (!allowed.length && !blockedRows.length && !threats.length && !dns.note) {
         /* With a note the API has already explained the silence; two sentences saying the
@@ -1121,7 +1233,7 @@
     }
 
     function historySection(timeline) {
-      var sec = section('History', timeline.length, false);
+      var sec = section('What happened', timeline.length, false);
       if (!timeline.length) {
         sec.appendChild(el('p', { className: 'sec-empty', text: 'Nothing recorded for this device yet.' }));
         return sec;
@@ -1152,15 +1264,16 @@
           button.disabled = true;
           text(button, label + '…');
           request('/api/lens/action', { body: Object.assign({ device_id: device.id, action: name }, body || {}) })
-            .then(function () { text(button, 'done'); openDevice(device.id); })
+            .then(function () { text(button, 'Done'); openDevice(device.id); })
             .catch(function (err) { button.disabled = false; text(button, label); onError(err, 'action'); });
         });
         foot.appendChild(button);
       }
-      if (actions.can_rescan) { action('Rescan now', 'rescan'); }
-      if (actions.can_set_trusted) { action(device.trusted ? 'Mark untrusted' : 'Mark trusted', 'set_trusted', { payload: { trusted: !device.trusted } }); }
+      if (actions.can_rescan) { action('Check it again now', 'rescan'); }
+      /* "Do you know it?" in the dashboard's words; the API action is still set_trusted. */
+      if (actions.can_set_trusted) { action(device.trusted ? 'Not sure it’s ours' : 'Yes, it’s ours', 'set_trusted', { payload: { trusted: !device.trusted } }); }
       if (!stale && !actions.can_rescan && !actions.can_acknowledge && !actions.can_set_trusted) {
-        foot.appendChild(el('p', { className: 'foot-note', text: 'This phone is paired read-only. Turn on [lens] allow_actions to rescan or acknowledge from here.' }));
+        foot.appendChild(el('p', { className: 'foot-note', text: 'This phone can look but not change anything (paired read-only). To recheck a device or mark things as seen from here, turn on [lens] allow_actions.' }));
       }
       return foot;
     }
@@ -1181,9 +1294,8 @@
     /* ---------------------------------------------------------- picker + unknown sheet */
 
     function deviceRow(item, onPick) {
-      var name = item.name || item.nickname || item.hostname || item.ip || item.mac || 'device';
-      /* Same rule as the card header: an unnamed device is titled by its IP, so do not
-         print the IP again as its own subtitle. */
+      var name = deviceName(item);
+      /* Same rule as the card header: the name leads, the address follows it, muted. */
       var why = [item.ip, item.why || item.vendor].filter(function (part) {
         return part && String(part) !== name;
       }).join(' · ');
@@ -1193,7 +1305,7 @@
           el('span', { className: 'device-name', text: name }),
           el('span', { className: 'device-why', text: why })));
       if (item.online) {
-        button.appendChild(el('span', { className: 'device-badges' }, el('span', { className: 'flag on' }, el('span', { className: 'dot' }), el('span', { text: 'online' }))));
+        button.appendChild(el('span', { className: 'device-badges' }, el('span', { className: 'flag on' }, el('span', { className: 'dot' }), el('span', { text: 'Online' }))));
       }
       button.addEventListener('click', function () { onPick(item); });
       return el('li', { className: 'device-item' }, button);
@@ -1213,7 +1325,7 @@
       var needle = String(filterValue || '').toLowerCase();
       var shown = list.filter(function (item) {
         if (!needle) { return true; }
-        return [item.name, item.ip, item.vendor, item.kind, item.hostname].filter(Boolean).join(' ').toLowerCase().indexOf(needle) >= 0;
+        return [deviceName(item), item.name, item.ip, item.vendor, item.kind, item.hostname].filter(Boolean).join(' ').toLowerCase().indexOf(needle) >= 0;
       });
       shown.forEach(function (item) {
         pickerList.appendChild(deviceRow(item, function (picked) {
@@ -1389,7 +1501,7 @@
       state('not paired', 'bad');
       showNotice(
         'This phone is not paired yet',
-        'Lens needs a token before it can read anything from Home SOC.',
+        'Lens has to be paired with Home SOC once before it can show anything.',
         ['Open Home SOC on your computer.', 'Go to Lens → Pair a phone.', 'Scan the QR code with this phone.'],
         null,
         'unpaired'
@@ -1443,7 +1555,7 @@
       var until = String(data.expires_at || '').slice(0, 10);
       text(body, 'Paired as “' + String(data.label || 'phone') + '”'
         + (until ? ', valid until ' + until : '')
-        + '. Opening Lens…');
+        + '. You can un-pair this phone any time from the Home SOC computer. Opening Lens…');
       show(go, true);
       setTimeout(function () { location.replace('/lens'); }, 900);
     }).catch(function (err) {
@@ -1453,7 +1565,7 @@
       } else if (status === 400 || status === 401 || status === 404) {
         fail('That pairing code did not work',
           String((err && err.message) || 'It was already used, or it expired.'),
-          ['Reload the pairing page on your computer to mint a fresh code.', 'Scan the new QR code within five minutes.']);
+          ['Reload the pairing page on your computer to get a fresh code.', 'Scan the new QR code within five minutes.']);
       } else if (status) {
         fail('Home SOC refused the pairing',
           'It answered HTTP ' + status + ': ' + String((err && err.message) || 'no detail given') + '.',

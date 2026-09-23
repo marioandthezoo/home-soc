@@ -1,31 +1,87 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- "Checks" (scans). Plain names on the buttons; each button keeps its technical kind in the
+    tooltip and in data-kind (app.js posts it to /api/scan unchanged). The history table keeps
+    id="scans-body": app.js refreshes it in place. -#}
 {% block content %}
+{%- set kind_word = {
+  'quick': ('Quick check', 'Looks for devices, then checks their most common open doors (ports).'),
+  'full': ('Full check', "Looks for devices, checks each device's open doors (ports) in more depth, and matches their software against known flaws."),
+  'host': ('Check this computer', 'Checks the protection settings of the computer Home SOC runs on: antivirus, firewall, updates.'),
+  'exposure': ('Check internet exposure', 'Asks what an internet-wide scanner has already seen of your home connection, and which doors your router opened by itself (UPnP). Home SOC never scans your internet address itself.'),
+  'feeds': ('Update threat lists', 'Downloads fresh lists of known flaws and dangerous websites.'),
+  'files': ('Check downloads', 'Looks up files downloaded in the last day on VirusTotal, when a VirusTotal key is set. Files are never uploaded.'),
+} -%}
+{%- set scan_word = {
+  'discovery': 'Device check', 'services': 'Open-door (port) check', 'vulns': 'Software-flaw check',
+  'host': 'Check of this computer', 'exposure': 'Internet-exposure check', 'feeds': 'Threat-list update',
+  'files': 'Downloads check', 'wifi': 'Wi-Fi check', 'quick': 'Quick check', 'full': 'Full check',
+  'topology': 'Dependency check',
+} -%}
+<p class="lede">Home SOC checks your network on a timetable. You can also start a check yourself here.</p>
 <div class="toolbar">
-  {% for k in kinds %}<button class="btn{% if k == 'quick' %} btn-primary{% endif %}" data-action="scan" data-kind="{{ k }}">Run {{ k }}</button>{% endfor %}
-  <span class="muted small">{{ 'via scheduler' if has_scheduler else 'background thread (no scheduler attached)' }}</span>
-</div>
-<div class="chips">
-  {% for kind, ts in last.items() %}<span class="chip"><b>{{ kind }}</b> {{ ts|ago }}</span>{% else %}<span class="muted small">No scans recorded yet.</span>{% endfor %}
+  {% for k in kinds %}
+  {%- set w = kind_word.get(k) -%}
+  <button class="btn{% if k == 'quick' %} btn-primary{% endif %}" data-action="scan" data-kind="{{ k }}"
+          title="{{ w[1] if w else '' }} (technical name: {{ k }} scan)">{{ w[0] if w else 'Run ' ~ k }}</button>
+  {%- endfor %}
+  <span class="muted small">{{ 'Runs through the scheduler, like the timetabled checks.' if has_scheduler else 'Runs in the background (no scheduler attached).' }}</span>
 </div>
 
+{#- The newest run of each kind, worked out from the history the page already has (newest
+    first), so each row can say whether that run finished. Kinds with no run in the fetched
+    history fall back to the start time from last_scans. -#}
+{%- set latest = {} -%}
+{%- for s in scans if s.kind not in latest %}{% set _ = latest.update({s.kind: s}) %}{% endfor -%}
+{%- set result_word = {'ok': 'Finished', 'error': 'Failed', 'partial': 'Partly finished', 'aborted': 'Stopped', 'running': 'Running now'} -%}
 <section class="card">
-  <h2>History</h2>
+  <div class="card-head"><h2>When each check last ran</h2></div>
+  {% if last %}
+  <div class="tbl-wrap">
+  <table class="tbl scan-latest">
+    <thead><tr><th>Check</th><th>Last started</th><th>Result</th><th class="num">Took</th></tr></thead>
+    <tbody>
+      {% for kind, ts in last.items() %}
+      {%- set r = latest.get(kind) -%}
+      <tr>
+        <td>{{ scan_word.get(kind, kind) }} <span class="tech-word">{{ kind }}</span></td>
+        <td title="{{ ts|ts }}">{{ ts|ago }}</td>
+        <td>{% if r %}{% set st = (r.status or '')|string|lower %}<span class="badge badge-{{ st|css_token }}">{{ result_word.get(st, st or 'unknown') }}</span>{% if st in result_word %} <span class="tech-word">{{ st }}</span>{% endif %}{% if r.error %} <span class="muted small">{{ r.error }}</span>{% endif %}{% else %}<span class="muted small">see the full history</span>{% endif %}</td>
+        <td class="num">{% if r and r.duration_sec is not none %}{{ r.duration_sec }}s{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No checks have run yet. Press <b>Quick check</b> above to start.</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>Every check, newest first <span class="page-tech">History</span></h2></div>
+  {%- set n_disc = scans|selectattr('kind', 'equalto', 'discovery')|list|length %}
+  {% if scans %}<p class="muted small">{{ scans|length }} check{{ '' if scans|length == 1 else 's' }} on record{% if scans|length >= 200 %} (the newest 200 are shown){% endif %}{% if n_disc * 2 > scans|length %}. Most are the automatic device check, which is set to run every {{ staleness.schedule_minutes }} minutes{% endif %}.</p>{% endif %}
+  {% call ui.tech_details('Show the full history (updates by itself)') %}
   <div class="tbl-wrap">
   <table class="tbl">
-    <thead><tr><th>Kind</th><th>Status</th><th>Started</th><th class="num">Duration</th><th>Summary</th><th>Error</th></tr></thead>
+    <thead><tr><th>Check</th><th>Result</th><th>Started</th><th class="num">Took</th><th>Summary</th><th>Error</th></tr></thead>
     <tbody id="scans-body">
       {% for s in scans %}
       <tr>
-        <td class="mono">{{ s.kind }}</td>
-        <td>{{ badge(s.status) }}</td>
+        <td class="mono" title="{{ scan_word.get(s.kind, s.kind) }}">{{ s.kind }}</td>
+        <td>{{ ui.run_result(s.status) }}</td>
         <td title="{{ s.started_at }}">{{ s.started_at|ts }}</td>
         <td class="num">{% if s.duration_sec is not none %}{{ s.duration_sec }}s{% endif %}</td>
         <td class="muted small wrap">{% if s.summary is mapping %}{% for k, v in s.summary.items() %}{{ k }}={{ v }} {% endfor %}{% else %}{{ s.summary or '' }}{% endif %}</td>
         <td class="small wrap error">{{ s.error or '' }}</td>
       </tr>
-      {% else %}<tr><td colspan="6" class="empty">No scans yet — use the buttons above.</td></tr>{% endfor %}
+      {% else %}<tr><td colspan="6" class="empty">No checks yet. Use the buttons above.</td></tr>{% endfor %}
     </tbody>
   </table>
   </div>
+  <p class="muted small">What the names mean:
+    {% for kind, word in scan_word.items() %}<span class="mono">{{ kind }}</span> {{ word|lower }}{{ '; ' if not loop.last else '.' }}{% endfor %}</p>
+  {% endcall %}
 </section>
 {% endblock %}

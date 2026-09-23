@@ -56,6 +56,24 @@
     }
     return e;
   }
+  /* Plain words BESIDE the technical ones (the same lists as app.py SEV_WORDS / STATUS_WORDS). */
+  var SEV_WORDS = { critical: 'Fix now', high: 'Fix this week', medium: 'Worth fixing', low: 'When you have time', info: 'Good to know' };
+  var STATUS_WORDS = { open: 'Needs attention', acknowledged: 'Seen, not fixed yet', resolved: 'Fixed', suppressed: 'Ignored (your choice)' };
+  function scoreWord(score) {
+    var v = Number(score);
+    if (score === null || score === undefined || isNaN(v)) return '';
+    return v >= 80 ? 'Good' : v >= 50 ? 'Fair' : 'Needs work';
+  }
+  function plural(n, one, many) { return n === 1 ? one : many; }
+  function humanAge(seconds) {
+    var s = Math.max(0, Math.floor(seconds));
+    if (s < 60) return 'just now';
+    var units = [[86400, 'day'], [3600, 'hour'], [60, 'minute']];
+    for (var i = 0; i < units.length; i++) {
+      if (s >= units[i][0]) { var n = Math.floor(s / units[i][0]); return n + ' ' + units[i][1] + (n === 1 ? '' : 's') + ' ago'; }
+    }
+    return 'just now';
+  }
   function badge(kind, text) { return el('span', { className: 'badge badge-' + String(kind || '').toLowerCase().replace(/_/g, '-'), text: text === undefined ? kind : text }); }
   function clear(node) { if (node) node.textContent = ''; }
   function fmtNum(n) { return (n === null || n === undefined) ? '0' : Number(n).toLocaleString(); }
@@ -70,9 +88,9 @@
     var d = new Date(iso);
     if (isNaN(d.getTime())) return String(iso);
     var s = Math.round((Date.now() - d.getTime()) / 1000);
-    var neg = s < 0; s = Math.abs(s);
-    var out = s >= 86400 ? Math.floor(s / 86400) + 'd' : s >= 3600 ? Math.floor(s / 3600) + 'h' : s >= 60 ? Math.floor(s / 60) + 'm' : s + 's';
-    return neg ? 'in ' + out : out + ' ago';
+    if (s >= 0) return humanAge(s);
+    var ahead = humanAge(-s);   /* words, like the server's |ago: "in 3 hours" */
+    return ahead === 'just now' ? 'in a moment' : 'in ' + ahead.replace(/ ago$/, '');
   }
   function hourLabel(key) { return key && key.length >= 13 ? key.slice(11, 13) + 'h' : String(key || ''); }
 
@@ -102,7 +120,7 @@
       Object.keys(keys).forEach(function (k) { if (String(tr.dataset[k] || '').toLowerCase() !== keys[k]) ok = false; });
       if (ok && text) ok = tr.textContent.toLowerCase().indexOf(text) !== -1;
       tr.hidden = !ok;
-      if (!ok && tr.nextElementSibling && tr.nextElementSibling.classList.contains('detail-row')) tr.nextElementSibling.hidden = true;
+      if (!ok && tr.nextElementSibling && tr.nextElementSibling.classList.contains('detail-row')) setRowOpen(tr, false);
       if (ok) shown++;
     });
     var counter = $('[data-filter-count="' + (table.id || '') + '"]');
@@ -115,16 +133,44 @@
       c.addEventListener('input', function () { applyFilters(table); });
       c.addEventListener('change', function () { applyFilters(table); });
     });
-    $$('form[data-submit-on-change]').forEach(function (f) {
-      $$('select', f).forEach(function (s) { s.addEventListener('change', function () { f.submit(); }); });
-    });
+    /* Filter forms no longer submit on "change": in a select, every arrow key fires it, so a
+       keyboard user could only ever pick the next option and lost the page and their focus each
+       time (WCAG 3.2.2). The forms' own Search / Apply buttons submit them. */
+  }
+  /* Expandable rows (findings, devices, flaws, startup programs). Each carries a real
+     <button class="row-toggle" aria-expanded aria-controls> so the keyboard can open it; a mouse
+     click anywhere else on the row still works. A row a template did not give a button gets one
+     here, so no expandable row is ever mouse-only. */
+  function setRowOpen(tr, open) {
+    var next = tr.nextElementSibling;
+    if (!next || !next.classList.contains('detail-row')) return;
+    next.hidden = !open;
+    $$('.row-toggle', tr).forEach(function (b) { b.setAttribute('aria-expanded', open ? 'true' : 'false'); });
   }
   function initRowExpand() {
+    $$('tr.expandable').forEach(function (tr, i) {
+      var next = tr.nextElementSibling;
+      if (!next || !next.classList.contains('detail-row')) return;
+      if (!next.id) next.id = 'row-detail-' + i;
+      if (!$('.row-toggle', tr)) {
+        var cell = tr.cells[0];
+        if (!cell) return;
+        var b = el('button', { className: 'row-toggle row-toggle-icon', attrs: { type: 'button' } },
+          el('span', { className: 'visually-hidden', text: 'Details: ' + (cell.textContent || '').trim().slice(0, 80) }));
+        cell.insertBefore(b, cell.firstChild);
+      }
+      $$('.row-toggle', tr).forEach(function (b) {
+        b.setAttribute('aria-controls', next.id);
+        b.setAttribute('aria-expanded', next.hidden ? 'false' : 'true');
+      });
+    });
     document.addEventListener('click', function (ev) {
       var tr = ev.target.closest('tr.expandable');
-      if (!tr || ev.target.closest('a, button, input, select, textarea')) return;
+      if (!tr) return;
+      var own = ev.target.closest('.row-toggle');
+      if (!own && ev.target.closest('a, button, input, select, textarea, summary, abbr.term')) return;
       var next = tr.nextElementSibling;
-      if (next && next.classList.contains('detail-row')) next.hidden = !next.hidden;
+      if (next && next.classList.contains('detail-row')) setRowOpen(tr, next.hidden);
     });
   }
   function initForms() {
@@ -162,9 +208,18 @@
         if (row) {
           row.dataset.status = status;
           var sb = $('.status-badge', row);
-          if (sb) { sb.className = 'badge status-badge badge-' + status; sb.textContent = status; }
+          if (sb) {
+            sb.className = 'badge status-badge badge-' + status;
+            /* A person pressed "I've fixed it": that is "Marked fixed" until a later check
+               confirms it. Only Home SOC's own check earns the plain "Fixed". */
+            sb.textContent = status === 'resolved' ? 'Marked fixed' : (STATUS_WORDS[status] || status);
+            sb.dataset.status = status;
+            sb.title = 'Status: ' + status + (status === 'resolved' ? '. You marked this fixed; Home SOC has not confirmed it.' : '');
+            var tw = sb.parentNode && $('.tech-word', sb.parentNode);
+            if (tw) tw.textContent = status;
+          }
         }
-        toast('Finding marked ' + status, 'ok');
+        toast(status === 'resolved' ? 'Marked fixed (resolved)' : 'Marked "' + (STATUS_WORDS[status] || status) + '" (' + status + ')', 'ok');
         refreshSummary();
       });
     },
@@ -172,13 +227,13 @@
       var table = $('#findings-table');
       if (!table) return Promise.resolve();
       var ids = $$('tbody > tr.expandable', table).filter(function (tr) { return !tr.hidden && tr.dataset.status === 'open'; }).map(function (tr) { return tr.dataset.id; });
-      if (!ids.length) { toast('No open findings shown', 'ok'); return Promise.resolve(); }
-      if (!window.confirm('Acknowledge ' + ids.length + ' open finding(s) currently shown?')) return Promise.resolve();
+      if (!ids.length) { toast('Nothing shown needs attention', 'ok'); return Promise.resolve(); }
+      if (!window.confirm('Mark all ' + ids.length + ' shown ' + plural(ids.length, 'item', 'items') + ' as "Seen, not fixed yet" (acknowledged)? They stay on the list until they are fixed.')) return Promise.resolve();
       var done = 0;
       return ids.reduce(function (p, id) {
         return p.then(function () { return postJSON('/api/findings/' + id + '/status', { status: 'acknowledged' }).then(function () { done++; }); });
       }, Promise.resolve()).then(function () {
-        toast('Acknowledged ' + done + ' finding(s)', 'ok');
+        toast('Marked ' + done + ' as seen (acknowledged)', 'ok');
         setTimeout(function () { location.reload(); }, 400);
       });
     },
@@ -186,9 +241,11 @@
       var id = b.dataset.id, next = b.dataset.trusted !== '1';
       return postJSON('/api/devices/' + id, { trusted: next }).then(function () {
         b.dataset.trusted = next ? '1' : '0';
-        b.textContent = next ? 'Trusted' : 'Untrusted';
+        /* The template may give plain labels ("Yes, it's ours" / "Not sure"); the technical
+           word stays in the tooltip. */
+        b.textContent = next ? (b.dataset.labelOn || 'Trusted') : (b.dataset.labelOff || 'Untrusted');
         b.classList.toggle('btn-ok', next);
-        toast('Device ' + (next ? 'trusted' : 'untrusted'), 'ok');
+        toast(next ? "Marked as yours (trusted)" : "Marked as not sure (untrusted)", 'ok');
       });
     },
     'device-scan': function (b) {
@@ -204,8 +261,15 @@
     },
     print: function () { window.print(); return Promise.resolve(); },
     'dns-override': function (b) {
+      if (b.dataset.op === 'allow') {
+        var bad = /^(malicious|suspicious)$/i.test(b.dataset.reputation || '');
+        var q = bad
+          ? 'Security services have flagged ' + b.dataset.domain + ' as ' + b.dataset.reputation.toLowerCase() + '.\n\nAlways allow it anyway? Every device on your network will be able to reach it.'
+          : 'Always allow ' + b.dataset.domain + '? Web blocking will stop blocking it for every device.';
+        if (!window.confirm(q)) return Promise.resolve();
+      }
       return postJSON('/api/dns/override', { domain: b.dataset.domain, action: b.dataset.op, note: b.dataset.note || 'from dashboard' }).then(function (r) {
-        toast(r.domain + ' → ' + r.action, 'ok');
+        toast(r.domain + ' → ' + (r.action === 'allow' ? 'always allowed' : r.action === 'deny' ? 'always blocked' : r.action), 'ok');
         if (b.dataset.reload !== undefined) setTimeout(function () { location.reload(); }, 400);
       });
     },
@@ -262,26 +326,114 @@
     var o = (counts && counts.open) || {};
     return Object.keys(o).reduce(function (a, k) { return a + (o[k] || 0); }, 0);
   }
+  function setText(sel, text) { var n = $(sel); if (n) n.textContent = text; }
+  function scoreIsPartial(s) {
+    return (s.overdue_checks || []).some(function (o) { return o && o.never; });
+  }
   function renderHeader(s) {
-    bind('score', s.score); bind('grade', s.grade);
+    /* Never checked: no score to show. "100/100 · Good" on an empty database would read as a
+       clean bill of health when Home SOC has not looked at anything yet. */
+    var never = !!(s.staleness && s.staleness.never);
+    bind('score', never ? '–' : s.score); bind('grade', never ? '–' : s.grade);
+    /* "Safety 10/100 · Needs work"; the letter grade lives in the tooltip. */
     var chip = $('#chip-score');
-    if (chip) chip.className = 'chip grade-' + s.grade;
-    bind('open-total', openTotal(s.counts));
+    if (chip) {
+      chip.className = never ? 'chip' : 'chip grade-' + s.grade;
+      chip.title = never
+        ? "No safety score yet: Home SOC hasn't checked your network."
+        : 'Safety score ' + s.score + ' out of 100 (grade ' + s.grade + '). Higher is safer.';
+    }
+    /* A score from a device check alone is not "Good": nothing has looked at the devices' open
+       doors, their software or this computer yet, so there was nothing to lose points on. */
+    var partial = !never && scoreIsPartial(s);
+    var word = never ? 'not checked yet' : (partial ? 'not fully checked yet' : scoreWord(s.score));
+    setText('#chip-score-word', word ? '· ' + word : '');
+    if (chip && partial) chip.title = 'Safety score ' + s.score + ' out of 100 — but some of Home SOC\'s checks have not run yet, so it only counts what has been looked at.';
+    /* "33 to fix · 2 urgent": everything still open, and how many of those are critical. */
+    var open = (s.counts && s.counts.open) || {};
+    var total = openTotal(s.counts), urgent = open.critical || 0;
+    var oc = $('#chip-open');
+    if (oc) {
+      oc.classList.toggle('is-urgent', urgent > 0);
+      oc.title = total + ' ' + plural(total, 'finding needs', 'findings need') + ' attention; ' +
+        urgent + ' ' + plural(urgent, 'is', 'are') + ' critical ("Fix now").';
+    }
+    setText('#chip-open-total', total ? fmtNum(total) : 'Nothing');
+    setText('#chip-open-text', (!total && never) ? 'found yet' : 'to fix');
+    setText('#chip-urgent', total ? (urgent ? ' · ' + fmtNum(urgent) + ' urgent' : ' · none urgent') : '');
+    bind('open-total', total);
     bind('devices-online', s.devices.online); bind('devices-total', s.devices.total);
     bind('dns-total', fmtNum(s.dns.total24h)); bind('dns-blocked', fmtNum(s.dns.blocked24h));
     bind('dns-pct', s.dns.blocked_pct); bind('dns-clients', s.dns.clients24h);
     var dot = $('#dot-dns');
     if (dot) dot.className = 'dot ' + (s.dns.running ? 'on' : (s.dns.enabled ? 'off' : ''));
-    var st = $('#chip-dns-state');
-    if (st) st.textContent = s.dns.running ? 'running' : (s.dns.enabled ? 'enabled, not running' : 'off');
+    setText('#chip-dns-state', s.dns.running ? 'running' : (s.dns.enabled ? 'not running' : 'off'));
+    /* "Blocked 1,204 · last 24 h": a rolling 24 hours, so never "today". */
+    var dc = $('#chip-dns');
+    if (dc) {
+      dc.classList.toggle('is-off', !s.dns.running);
+      clear(dc);
+      if (s.dns.running) {
+        dc.appendChild(document.createTextNode('Blocked '));
+        dc.appendChild(el('b', { text: fmtNum(s.dns.blocked24h) }));
+        dc.appendChild(document.createTextNode(' · last 24 h'));
+        dc.title = fmtNum(s.dns.blocked24h) + ' look-ups blocked in the last 24 hours, out of ' + fmtNum(s.dns.total24h) + ' (web blocking, the DNS filter)';
+      } else {
+        dc.appendChild(document.createTextNode('Blocking: '));
+        dc.appendChild(el('span', { className: 'chip-word', text: s.dns.enabled ? 'not running' : 'off' }));
+        dc.title = s.dns.enabled
+          ? 'Web blocking is switched on but not running, so nothing is being filtered right now'
+          : 'Web blocking (the DNS filter) is switched off';
+      }
+    }
+    /* The time this SCREEN refreshed. The network check time is a separate line. */
     var lr = $('#last-refresh');
-    if (lr) lr.textContent = 'updated ' + new Date().toLocaleTimeString();
-    renderScoreBreakdown(s.score_breakdown);
+    if (lr) lr.textContent = 'Screen refreshed ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    renderStaleness(s);
+    renderScoreBreakdown(s.score_breakdown, !!(s.staleness && s.staleness.never));
+  }
+  /* The honesty banner and the sidebar "Network last checked" line, kept current while a wall
+     screen stays up for days. Prefers the server's own verdict (summary.staleness); without one
+     it works it out from the newest discovery start and the schedule the page was rendered
+     with, by the same rule: older than 3 schedules, or 24 hours. */
+  function renderStaleness(s) {
+    var line = $('#network-check'), banner = $('#stale-banner');
+    if (!line && !banner) return;
+    var st = s && s.staleness, stale = false, text = '', never = false;
+    if (st && typeof st === 'object') {
+      stale = !!st.stale; never = !!st.never;
+      var t0 = st.last_check ? new Date(st.last_check).getTime() : NaN;
+      text = isNaN(t0) ? (st.age_text || '') : humanAge((Date.now() - t0) / 1000);
+    } else {
+      var last = s && s.last_scans && s.last_scans.discovery;
+      var minutes = parseInt((line && line.dataset.scheduleMinutes) || '10', 10) || 10;
+      if (!last) { never = true; }
+      else {
+        var age = (Date.now() - new Date(last).getTime()) / 1000;
+        if (isNaN(age)) return;
+        text = humanAge(age);
+        stale = age > Math.min(3 * minutes, 24 * 60) * 60;
+      }
+    }
+    if (line) {
+      line.textContent = never ? 'Network not checked yet' : (text ? 'Network last checked ' + text : 'Network check time unknown');
+      line.classList.toggle('is-stale', stale);
+    }
+    if (banner) {
+      banner.hidden = !stale;
+      var bt = $('#stale-text', banner);
+      if (bt && stale) {
+        clear(bt);
+        bt.appendChild(document.createTextNode('Home SOC last checked your network '));
+        bt.appendChild(el('b', { text: text || 'a while ago' }));
+        bt.appendChild(document.createTextNode(' — what you see may be out of date.'));
+      }
+    }
   }
   /* "Fix these first": the open findings costing the score the most, from
      findings.score.score_breakdown via /api/summary. Rendered on the Overview (where the
      server also renders it, so it survives a broken poll) and on the Summary page. */
-  function renderScoreBreakdown(items) {
+  function renderScoreBreakdown(items, never) {
     var list = $('#score-breakdown');
     if (!list) return;
     items = Array.isArray(items) ? items : [];
@@ -291,27 +443,41 @@
     if (!items.length) {
       list.appendChild(el('li', {
         className: 'empty',
-        text: 'Nothing is costing you points. Either everything found is fixed, acknowledged or suppressed, or no scan has run yet.'
+        text: never
+          ? "Nothing yet: Home SOC hasn't checked your network."
+          : 'Nothing is costing you points. Everything found is fixed, marked as seen, or ignored.'
       }));
       return;
     }
+    /* Same shape as the server-rendered list: plain headline (technical title in the tooltip),
+       then where it is and the action word, then "×N" and "+N points". */
     items.forEach(function (b) {
       var sev = String(b.severity || 'info');
-      var row = el('li', { className: 'cost' },
-        el('span', { className: 'tl-dot sev-dot-' + sev, title: sev }),
+      var word = b.severity_word || SEV_WORDS[sev] || '';
+      var meta = el('span', { className: 'muted small' });
+      var hasLink = b.link_device_id !== undefined && b.link_device_id !== null && b.device_label;
+      if (hasLink) meta.appendChild(el('a', { text: b.device_label, href: '/devices/' + encodeURIComponent(b.link_device_id) }));
+      else if (b.where_text) meta.appendChild(document.createTextNode(b.where_text));
+      if (hasLink || b.where_text) meta.appendChild(document.createTextNode(' · '));
+      meta.appendChild(document.createTextNode(word));
+      var title = el('span', { className: 'cost-title' },
         el('a', {
-          className: 'cost-title',
-          text: b.title || b.finding_id,
+          text: b.plain_title || b.title || b.finding_id,
           title: (b.finding_id || '') + ' — ' + (b.title || ''),
           href: '/findings?status=open&q=' + encodeURIComponent(b.finding_id || '')
-        }));
+        }),
+        el('br', {}), meta);
+      var row = el('li', { className: 'cost' },
+        el('span', { className: 'tl-dot sev-dot-' + sev, title: sev + (word ? ' · ' + word : '') }),
+        title);
       row.appendChild(b.count > 1
-        ? el('span', { className: 'cost-count', text: '×' + b.count, title: b.count + ' findings of this type are open' })
+        ? el('span', { className: 'cost-count', text: '×' + b.count, title: b.count + ' problems of this type are open' })
         : el('span', {}));
+      var gain = (b.gain === undefined || b.gain === null ? b.penalty : b.gain);
       row.appendChild(el('span', {
         className: 'cost-gain',
-        text: '+' + (b.gain === undefined || b.gain === null ? b.penalty : b.gain),
-        title: 'the score would rise by about this much once every finding of this type is cleared'
+        text: b.gain_text || ('+' + gain + ' ' + plural(Number(gain), 'point', 'points')),
+        title: 'The safety score would rise by about this much once every problem of this type is fixed'
       }));
       list.appendChild(row);
     });
@@ -320,14 +486,19 @@
     var C = window.Charts;
     if (!C) return;
     var g = $('#chart-gauge');
-    if (g) C.gauge(g, s.score, { label: 'grade ' + s.grade, title: 'Security score ' + s.score });
+    var neverChecked = !!(s.staleness && s.staleness.never);
+    var partialScore = !neverChecked && scoreIsPartial(s);
+    if (g) C.gauge(g, s.score, neverChecked
+      ? { unknown: true, label: 'not checked yet', title: "No safety score yet: Home SOC hasn't checked your network" }
+      : { label: partialScore ? 'not fully checked' : (scoreWord(s.score) || ('grade ' + s.grade)),
+          title: 'Safety score ' + s.score + ' out of 100, grade ' + s.grade + (partialScore ? ' — some checks have not run yet' : '') });
     var tr = $('#chart-trend');
     if (tr) C.sparkline(tr, (s.trend || []).map(function (p) { return p[1]; }), { title: '30-day score trend', emptyText: 'Trend appears after the first hourly score sample' });
     var d = $('#chart-severity');
     if (d) {
       var open = (s.counts && s.counts.open) || {};
-      var slices = ['critical', 'high', 'medium', 'low', 'info'].map(function (k) { return { label: k, value: open[k] || 0 }; });
-      C.donut(d, slices, { centerText: openTotal(s.counts), centerSub: 'open', legendAll: slices, title: 'Open findings by severity' });
+      var slices = ['critical', 'high', 'medium', 'low', 'info'].map(function (k) { return { label: k, value: open[k] || 0, word: SEV_WORDS[k] }; });
+      C.donut(d, slices, { centerText: openTotal(s.counts), centerSub: 'to fix', legendAll: slices, title: 'Open findings by severity' });
     }
     var jc = $('#jobs-chips');
     if (jc) {
@@ -354,13 +525,23 @@
       });
     }
     var ev = $('#events-list');
-    if (ev) { clear(ev); s.events.forEach(function (e) { ev.appendChild(eventItem(e)); }); if (!s.events.length) ev.appendChild(el('li', { className: 'muted', text: 'No events yet.' })); }
+    if (ev) { clear(ev); s.events.slice(0, parseInt(ev.dataset.limit || '20', 10) || 20).forEach(function (e) { ev.appendChild(eventItem(e, ev.classList.contains('events-plain'))); }); if (!s.events.length) ev.appendChild(el('li', { className: 'empty events-empty', text: 'Nothing yet. Anything Home SOC does — a check, a threat-list download, a problem changing state — shows up here.' })); }
     getJSON('/api/dns/series?hours=24').then(function (series) {
       var c = $('#chart-dns');
-      if (c) C.bar(c, { values: series.map(function (p) { return p.total; }), overlay: series.map(function (p) { return p.blocked; }), labels: series.map(function (p) { return hourLabel(p.hour); }), title: 'DNS queries per hour (blocked in red)', height: 130, emptyText: 'No DNS queries yet' });
+      if (c) C.bar(c, { values: series.map(function (p) { return p.total; }), overlay: series.map(function (p) { return p.blocked; }), labels: series.map(function (p) { return hourLabel(p.hour); }), title: 'Look-ups per hour, with the blocked share drawn over each bar', height: 130, emptyText: 'No website look-ups in the last 24 hours' });
     }).catch(function () {});
   }
-  function eventItem(e) {
+  /* plain: the Home page's calm version. The source moves to the tooltip, and only warnings and
+     errors carry a badge; the full technical list (source, level, data) is on System health. */
+  function eventItem(e, plain) {
+    if (plain) {
+      var lvl = (e.level || 'info').toLowerCase();
+      var msg = el('span', { className: 'e-msg', title: (e.source || 'Home SOC') + ': ' + (e.message || '') });
+      if (lvl !== 'info' && lvl !== 'debug') { msg.appendChild(badge('level-' + lvl, e.level)); msg.appendChild(document.createTextNode(' ')); }
+      msg.appendChild(document.createTextNode(e.plain || e.message || ''));
+      if (e.repeats > 1) { msg.appendChild(document.createTextNode(' ')); msg.appendChild(el('span', { className: 'muted small', text: '×' + e.repeats, title: 'Happened ' + e.repeats + ' times in a row' })); }
+      return el('li', {}, el('span', { className: 'e-ts', text: ago(e.ts), title: fmtTs(e.ts) }), msg);
+    }
     var li = el('li', {},
       el('span', { className: 'e-ts', text: fmtTs(e.ts), title: e.ts }),
       el('span', { className: 'e-src', text: e.source }),
@@ -386,33 +567,86 @@
   }
 
   /* ---------- DNS page ---------- */
+  /* Why a look-up was allowed or blocked, in words (the same words as dns.html's reason_words);
+     the stored reason stays beside it as the technical word. */
+  var DNS_WORDS = null;
+  function dnsWords() {
+    if (DNS_WORDS) return DNS_WORDS;
+    DNS_WORDS = { lists: {}, threat: [] };
+    var seed = $('#dns-words');
+    if (seed) { try { DNS_WORDS = JSON.parse(seed.textContent) || DNS_WORDS; } catch (e) { /* keep the empty words */ } }
+    return DNS_WORDS;
+  }
+  function reasonWords(reason) {
+    var r = String(reason || ''), w = dnsWords();
+    if (r.indexOf('list:') === 0) {
+      var name = r.slice(5), what = (w.lists && w.lists[name]) || '';
+      return (w.threat || []).indexOf(name) >= 0
+        ? 'On a threat list: ' + (what || 'dangerous sites').toLowerCase()
+        : 'On a blocklist: ' + (what || 'blocked sites').toLowerCase();
+    }
+    if (r === 'override:deny') return 'You chose to always block it';
+    if (r === 'override:allow') return 'You chose to always allow it';
+    if (r === 'reputation') return 'Security services flagged it as dangerous';
+    if (r === 'default') return 'Allowed (not on any list)';
+    if (r === 'cache') return 'Answered from memory';
+    return r || '';
+  }
+  var QTYPE_WORDS = { A: 'Address', AAAA: 'Address', HTTPS: 'Service details', SVCB: 'Service details', PTR: 'Name for an address',
+                      CNAME: 'Alias', MX: 'Mail server', TXT: 'Text record', SRV: 'Service location', NS: 'Name server', SOA: 'Zone details' };
+  var RESULT_WORDS = { allow: 'Allowed', block: 'Blocked', cache: 'From memory', error: 'Failed' };
+  /* "live" only while the resolver runs and the newest row is recent. */
+  function logFreshness(rowsData) {
+    var n = $('#log-freshness');
+    if (!n) return;
+    var running = n.dataset.running === '1';
+    var newest = rowsData.length ? new Date(rowsData[0].ts).getTime() : NaN;
+    var age = isNaN(newest) ? null : (Date.now() - newest) / 1000;
+    var text;
+    if (running && age !== null && age < 15 * 60) text = '(live, newest first)';
+    else {
+      text = '(newest first' + (running ? '' : ' — web blocking is not running');
+      if (age !== null && age >= 15 * 60) text += '; last look-up ' + humanAge(age);
+      text += ')';
+    }
+    n.textContent = text;
+  }
   function refreshDnsLog() {
     var tb = $('#log-body');
     if (!tb) return;
     var client = ($('#log-client') || {}).value || '', action = ($('#log-action') || {}).value || '';
     getJSON('/api/dns/log?limit=60&client=' + encodeURIComponent(client) + '&action=' + encodeURIComponent(action)).then(function (rowsData) {
       clear(tb);
-      if (!rowsData.length) tb.appendChild(el('tr', {}, el('td', { className: 'empty', text: 'No queries logged yet.', attrs: { colspan: 8 } })));
+      logFreshness(rowsData);
+      if (!rowsData.length) tb.appendChild(el('tr', {}, el('td', { className: 'empty', text: 'No look-ups logged yet.', attrs: { colspan: 8 } })));
       rowsData.forEach(function (q) {
+        var qt = String(q.qtype || ''), act = String(q.action || '');
+        var why = reasonWords(q.reason);
         tb.appendChild(el('tr', {},
-          el('td', { text: fmtTs(q.ts), title: q.ts }),
-          el('td', { text: q.client }),
+          el('td', { text: ago(q.ts), title: fmtTs(q.ts) }),
+          clientCell(q),
           el('td', { className: 'wrap', text: q.qname }),
-          el('td', { text: q.qtype }),
-          el('td', {}, badge(q.action)),
-          el('td', { className: 'muted', text: q.reason || '' }),
-          el('td', { className: 'num', text: q.ms === null || q.ms === undefined ? '' : Number(q.ms).toFixed(1) }),
+          el('td', { title: 'Record type ' + qt }, QTYPE_WORDS[qt] ? QTYPE_WORDS[qt] + ' ' : '', el('span', { className: 'tech-word', text: qt })),
+          el('td', {}, badge(act, RESULT_WORDS[act] || act)),
+          el('td', { className: 'wrap small' }, why && why !== q.reason ? why + ' ' : '', q.reason ? el('span', { className: 'tech-word', text: q.reason }) : null),
+          el('td', { className: 'num', text: q.ms === null || q.ms === undefined ? '' : Number(q.ms).toFixed(1) + ' ms' }),
           el('td', {},
-            el('button', { className: 'btn btn-sm btn-ok', text: 'allow', data: { action: 'dns-override', domain: q.qname, op: 'allow', note: 'quick action' } }), ' ',
-            el('button', { className: 'btn btn-sm btn-danger', text: 'block', data: { action: 'dns-override', domain: q.qname, op: 'deny', note: 'quick action' } }))));
+            el('button', { className: 'btn btn-sm btn-ok', text: 'Allow…', title: 'Always allow this site for every device (asks you to confirm)', data: { action: 'dns-override', domain: q.qname, op: 'allow', note: 'quick action', reputation: q.reputation || q.verdict || '' } }), ' ',
+            el('button', { className: 'btn btn-sm btn-danger', text: 'Block', title: 'Always block this site for every device', data: { action: 'dns-override', domain: q.qname, op: 'deny', note: 'quick action' } }))));
       });
     }).catch(function () {});
+  }
+  /* A device named, not numbered: its name first and the address muted beside it. */
+  function clientCell(q) {
+    var name = q.device_label || q.client_label || '';
+    if (!name || name === q.client) return el('td', { className: 'mono', text: q.client });
+    return el('td', {}, el('span', { text: name }), el('span', { className: 'device-ip', text: q.client }));
   }
   function initDns() {
     var c = $('#chart-dns-hours');
     if (c && window.Charts) {
       getJSON('/api/dns/series?hours=24').then(function (series) {
-        window.Charts.bar(c, { values: series.map(function (p) { return p.total; }), overlay: series.map(function (p) { return p.blocked; }), labels: series.map(function (p) { return hourLabel(p.hour); }), title: 'DNS queries per hour', height: 150, emptyText: 'No DNS queries yet' });
+        window.Charts.bar(c, { values: series.map(function (p) { return p.total; }), overlay: series.map(function (p) { return p.blocked; }), labels: series.map(function (p) { return hourLabel(p.hour); }), title: 'Look-ups per hour, with the blocked share drawn over each bar', height: 150, emptyText: 'No website look-ups in the last 24 hours' });
       }).catch(function () {});
     }
     ['#log-client', '#log-action'].forEach(function (sel) { var n = $(sel); if (n) { n.addEventListener('change', refreshDnsLog); n.addEventListener('input', refreshDnsLog); } });
@@ -427,7 +661,26 @@
     var grid = $('#metrics-grid');
     if (!grid || !window.Charts) return;
     clear(grid);
-    if (!data.names.length) { grid.appendChild(el('div', { className: 'chart-empty', text: 'No metrics recorded yet — they appear once the scheduler runs its first job.' })); return; }
+    if (!data.names.length) {
+      /* Say why it is empty. "The scheduler hasn't run its first job" is only true when the
+         metrics table is truly empty; otherwise the window is simply shorter than the data's age. */
+      var h = Number(data.hours) || 168;
+      var windowWords = h % 24 === 0 && h >= 48 ? (h / 24) + ' days' : h + ' hours';
+      var box = el('div', { className: 'chart-empty' });
+      if (data.last_ts) {
+        box.appendChild(el('span', { text: 'No measurements in the last ' + windowWords + ' — Home SOC last recorded one ' + ago(data.last_ts) + '.' }));
+        var sel = $('#metrics-hours');
+        if (sel && h < 720) {
+          var more = el('button', { className: 'btn btn-sm', text: 'Show 30 days', attrs: { type: 'button' } });
+          more.addEventListener('click', function () { sel.value = '720'; refreshMetrics(); });
+          box.appendChild(more);
+        }
+      } else {
+        box.appendChild(el('span', { text: 'No measurements recorded yet — they appear once the scheduler runs its first job.' }));
+      }
+      grid.appendChild(box);
+      return;
+    }
     data.names.forEach(function (name) {
       var pts = data.series[name] || [];
       var values = pts.map(function (p) { return p[1]; });
@@ -485,6 +738,8 @@
   }
 
   /* ---------- scans ---------- */
+  /* A check's result, in the same words as _macros.html run_result. */
+  var RUN_WORDS = { ok: 'Finished', error: 'Failed', partial: 'Partly finished', aborted: 'Stopped', running: 'Running now' };
   function refreshScans() {
     var tb = $('#scans-body');
     if (!tb) return;
@@ -493,10 +748,12 @@
       if (!scans.length) tb.appendChild(el('tr', {}, el('td', { className: 'empty', text: 'No scans yet.', attrs: { colspan: 6 } })));
       scans.forEach(function (s) {
         var summary = typeof s.summary === 'object' && s.summary ? Object.keys(s.summary).map(function (k) { return k + '=' + (typeof s.summary[k] === 'object' ? JSON.stringify(s.summary[k]) : s.summary[k]); }).join('  ') : (s.summary || '');
+        var st = String(s.status || '').toLowerCase();
         tb.appendChild(el('tr', {},
           el('td', { className: 'mono', text: s.kind }),
-          el('td', {}, badge(s.status)),
-          el('td', { text: fmtTs(s.started_at), title: s.started_at }),
+          el('td', {}, el('span', { className: 'status-chip' }, badge(st, RUN_WORDS[st] || st || 'unknown'),
+            RUN_WORDS[st] ? ' ' : null, RUN_WORDS[st] ? el('span', { className: 'tech-word', text: st }) : null)),
+          el('td', { className: 'nowrap', text: fmtTs(s.started_at), title: s.started_at }),
           el('td', { className: 'num', text: s.duration_sec === null || s.duration_sec === undefined ? '' : s.duration_sec + 's' }),
           el('td', { className: 'muted small wrap', text: summary }),
           el('td', { className: 'small wrap error', text: s.error || '' })));
@@ -554,7 +811,18 @@
   function feedItemNode(it, isNew) {
     var ref = it.ref || {};
     var repeats = Number(ref.count || 0);
-    var title = el('span', { className: 'tl-title', text: it.title });
+    /* The severity's action word leads the title for medium and above, and is read out
+       (visually hidden) for low and info — the same markup as feed.html — so colour is never
+       the only signal. */
+    var sv = String(it.severity || '').toLowerCase(), word = SEV_WORDS[sv] || '';
+    var title = el('span', { className: 'tl-title' });
+    if (word && (sv === 'critical' || sv === 'high' || sv === 'medium')) {
+      title.appendChild(el('span', { className: 'tl-sev sev-word sev-word-' + sv, text: word, title: 'Severity: ' + sv }));
+      title.appendChild(document.createTextNode(' · '));
+    } else if (word) {
+      title.appendChild(el('span', { className: 'visually-hidden', text: word + ' (' + sv + '): ' }));
+    }
+    title.appendChild(document.createTextNode(it.title || ''));
     var body = el('span', { className: 'tl-body' }, title);
     if (repeats > 1) {
       /* build_feed folded a run of identical events into this row; keep every one reachable. */
@@ -586,7 +854,7 @@
     if (it.link) body.appendChild(el('a', { className: 'tl-link link', href: it.link, text: 'open →' }));
     return el('li', { className: 'tl-item sev-' + it.severity + (isNew ? ' tl-new' : ''), data: { ts: it.ts, kind: it.kind, title: it.title } },
       el('span', { className: 'tl-glyph', text: GLYPH[it.icon] || '•', title: it.kind }),
-      el('span', { className: 'tl-dot sev-dot-' + it.severity, title: it.severity }),
+      el('span', { className: 'tl-dot sev-dot-' + it.severity, title: sv + (word ? ' · ' + word : '') }),
       el('span', { className: 'tl-when', text: ago(it.ts), title: it.ts }),
       body);
   }
@@ -688,24 +956,26 @@
     if (!seed || !C) return;
     var data;
     try { data = JSON.parse(seed.textContent); } catch (e) { return; }
-    var col = C.colors();
     var trend = data.trend || [];
     C.line($('#chart-summary-trend'), {
-      series: [{ name: 'score', values: trend.map(function (p) { return p[1]; }), color: col.accent }],
+      series: [{ name: 'safety score', values: trend.map(function (p) { return p[1]; }), token: '--accent' }],
       labels: trend.map(function (p) { return p[0]; }),
       height: 170,
-      title: 'Security score over the window',
+      title: 'Safety score over the window',
       emptyText: 'The trend appears once an hourly score sample has been recorded'
     });
     var bysev = data.by_severity || {};
     C.groupedBar($('#chart-found-remediated'), {
       groups: (data.severities || []).map(function (sv) {
+        /* "Critical", not "critical": the axis reads like every other severity mention. */
         return {
-          label: sv,
+          label: String(sv).charAt(0).toUpperCase() + String(sv).slice(1),
           values: [(bysev.open || {})[sv] || 0, (bysev.acknowledged || {})[sv] || 0, (bysev.resolved || {})[sv] || 0]
         };
       }),
-      series: [{ name: 'open', color: col.high }, { name: 'acknowledged', color: col.medium }, { name: 'resolved', color: col.low }],
+      /* Status series in the status tokens, never in severity colours (from across a room the
+         old chart read as "lots of High/Medium"). */
+      series: [{ name: 'open (needs attention)', token: '--status-open' }, { name: 'acknowledged (seen)', token: '--status-ack' }, { name: 'resolved (fixed)', token: '--status-resolved' }],
       height: 190,
       title: 'Findings by severity and status',
       emptyText: 'Nothing has been found yet'

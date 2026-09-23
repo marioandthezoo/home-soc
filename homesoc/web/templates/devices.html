@@ -1,37 +1,101 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- Devices, named not numbered: the name first, the address muted beside it. Unknown and
+    unnamed devices sort to the top (the ones worth a look). Technical columns (MAC, maker,
+    network name, first/last seen, open ports) sit one click away in each row's detail. -#}
 {% block content %}
+{% set kind_words = {
+  'router': 'Router', 'gateway': 'Router', 'self': 'Computer', 'computer': 'Computer', 'laptop': 'Laptop',
+  'desktop': 'Computer', 'pc': 'Computer', 'phone': 'Phone', 'tablet': 'Tablet', 'tv': 'TV',
+  'speaker': 'Speaker', 'printer': 'Printer', 'camera': 'Camera', 'iot': 'Smart device',
+  'console': 'Games console', 'nas': 'Network storage', 'apple': 'Apple device', 'watch': 'Watch',
+  'access_point': 'Access point', 'ap': 'Access point', 'switch': 'Network switch',
+  'randomized': 'Device (private address)', 'unknown': 'Device'} %}
+{% set ns = namespace(first=[], second=[], third=[], rest=[]) %}
+{% for d in devices %}
+  {%- set unnamed = (d|device_label).startswith('Unnamed') -%}
+  {%- if not d.trusted and unnamed %}{% set ns.first = ns.first + [d] %}
+  {%- elif not d.trusted %}{% set ns.second = ns.second + [d] %}
+  {%- elif unnamed %}{% set ns.third = ns.third + [d] %}
+  {%- else %}{% set ns.rest = ns.rest + [d] %}{% endif -%}
+{% endfor %}
+{% set ordered = ns.first + ns.second + ns.third + ns.rest %}
+{% set untrusted = ns.first|length + ns.second|length %}
+<p class="lede">
+  {%- if counts.total -%}
+  Home SOC knows about <b>{{ counts.total }}</b> device{{ '' if counts.total == 1 else 's' }} on your network;
+  <b>{{ counts.online }}</b> {{ 'was' if counts.online == 1 else 'were' }} online at its last check{% if staleness.age_text and not staleness.never %} ({{ staleness.age_text }}){% endif %}.
+  {%- if untrusted %} <b>{{ untrusted }}</b> {{ 'is' if untrusted == 1 else 'are' }} not marked as yours yet — {{ 'it is' if untrusted == 1 else 'they are' }} listed first.{% endif -%}
+  {%- else -%}
+  Home SOC has not found any devices yet.
+  {%- endif -%}
+</p>
+
 <div class="filters">
-  <span class="chip"><b>{{ counts.online }}</b> online</span>
-  <span class="chip"><b>{{ counts.total }}</b> total</span>
-  <input type="search" placeholder="filter by name, ip, mac, vendor…" data-filter="#devices-table" aria-label="Filter devices">
-  <label>Online
-    <select data-filter="#devices-table" data-filter-key="online"><option value="">any</option><option value="1">online</option><option value="0">offline</option></select>
+  {% if devices %}
+  <input type="search" placeholder="Search devices…" title="Search by name, address or maker" data-filter="#devices-table" aria-label="Search devices by name, address or maker">
+  <label>Online?
+    <select data-filter="#devices-table" data-filter-key="online"><option value="">All devices</option><option value="1">Online</option><option value="0">Offline</option></select>
+  </label>
+  <label>Is it yours?
+    <select data-filter="#devices-table" data-filter-key="trusted" title="Trusted or not"><option value="">Either</option><option value="1">Yes, it's ours (trusted)</option><option value="0">Not marked as yours</option></select>
   </label>
   <span class="muted small" data-filter-count="devices-table">{{ devices|length }} shown</span>
-  <button class="btn btn-primary" data-action="scan" data-kind="quick">Discover now</button>
+  {% endif %}
+  <button class="btn btn-primary" data-action="scan" data-kind="quick" title="Runs a quick check now: looks for devices, then their open doors (ports)">Check for devices now</button>
 </div>
 
 <section class="card">
+  {% if devices %}<p class="muted small">Select a row (or the ▸ before a name, with the keyboard) for its addresses, maker and open doors ({{ ui.term('port', 'ports') }}). “Online” means seen at Home SOC's last network check, not live.</p>{% endif %}
   <div class="tbl-wrap">
-  <table class="tbl" id="devices-table" data-filterable>
-    <thead><tr><th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th><th>Kind</th><th>Online</th><th>First seen</th><th>Last seen</th><th class="num">Ports</th><th class="num">Findings</th><th>Trusted</th></tr></thead>
+  <table class="tbl" id="devices-table"{% if devices %} data-filterable{% endif %}>
+    <thead><tr>
+      <th>Device</th>
+      <th>Kind</th>
+      <th title="Seen at Home SOC's last network check">Online?</th>
+      <th class="num" title="Open findings about this device">Things to fix</th>
+      <th title="Trusted means you know this device: Home SOC will not warn about it as a new arrival">Is it yours?</th>
+    </tr></thead>
     <tbody>
-      {% for d in devices %}
-      <tr data-online="{{ 1 if d.online else 0 }}" data-trusted="{{ 1 if d.trusted else 0 }}">
-        <td class="wrap"><a href="/devices/{{ d.id }}"><b>{{ d.display_name }}</b></a>{% if d.nickname and d.hostname %}<br><span class="muted small">{{ d.hostname }}</span>{% endif %}</td>
-        <td class="mono">{{ d.ip or '' }}</td>
-        <td class="mono">{{ d.mac }}</td>
-        <td class="wrap">{{ d.vendor or '' }}</td>
-        <td>{{ d.kind or '' }}</td>
-        <td>{{ badge('online' if d.online else 'offline') }}</td>
-        <td class="nowrap" title="{{ d.first_seen|ts }}">{{ d.first_seen|ago }}</td>
-        <td class="nowrap" title="{{ d.last_seen|ts }}">{{ d.last_seen|ago }}</td>
-        <td class="num">{{ d.open_ports }}</td>
-        <td class="num">{% if d.open_findings %}<a href="/findings?status=open&q={{ d.mac }}">{{ d.open_findings }}</a>{% else %}0{% endif %}</td>
-        <td><button class="btn btn-sm{% if d.trusted %} btn-ok{% endif %}" data-action="device-trusted" data-id="{{ d.id }}" data-trusted="{{ 1 if d.trusted else 0 }}">{{ 'Trusted' if d.trusted else 'Untrusted' }}</button></td>
+      {% for d in ordered %}
+      {%- set label = d|device_label -%}
+      {%- set to_fix = (d.open_findings or 0) + (d.host_findings_open or 0) -%}
+      <tr class="expandable" data-online="{{ 1 if d.online else 0 }}" data-trusted="{{ 1 if d.trusted else 0 }}">
+        <td class="wrap">
+          <button type="button" class="row-toggle row-toggle-icon" aria-expanded="false" aria-controls="dev-detail-{{ d.id }}"><span class="visually-hidden">Addresses and maker of {{ label }}</span></button><b><a href="/devices/{{ d.id }}"{% if label.startswith('Unnamed') %} class="device-unnamed"{% endif %}>{{ label }}</a></b>{% if d.ip %}<span class="device-ip">{{ d.ip }}</span>{% endif %}
+          {%- if d.is_this_computer %} <span class="badge badge-trusted" title="Home SOC runs on this computer">This computer</span>{% endif %}
+          {%- if d.nickname and d.hostname and d.hostname != d.nickname %}<br><span class="muted small">{{ d.hostname }}</span>{% endif %}
+          <span class="visually-hidden">{{ d.mac or '' }} {{ d.vendor or '' }}</span>
+        </td>
+        <td class="wrap">{{ kind_words.get((d.kind or '')|lower, (d.kind or 'Device')|capitalize) }}{% if d.vendor %}<br><span class="muted small">made by {{ d.vendor }}</span>{% endif %}</td>
+        <td class="nowrap">{{ badge('online' if d.online else 'offline', 'Online' if d.online else 'Offline') }}{% if not d.online %}<br><span class="muted small" title="{{ d.last_seen|ts }}">last seen {{ d.last_seen|ago }}</span>{% endif %}</td>
+        <td class="num">
+          {%- if to_fix -%}
+          <a href="/devices/{{ d.id }}#things-to-fix"{% if d.host_findings_open %} title="{{ d.open_findings or 0 }} about this device on the network, {{ d.host_findings_open }} about this computer's own settings"{% endif %}>{{ to_fix }}</a>
+          {%- else -%}<span class="muted">0</span>{%- endif -%}
+        </td>
+        <td><button class="btn btn-sm{% if d.trusted %} btn-ok{% endif %}" data-action="device-trusted" data-id="{{ d.id }}" data-trusted="{{ 1 if d.trusted else 0 }}" data-label-on="Yes, it's ours" data-label-off="Not sure" title="Trusted means you know this device (technical: trusted / untrusted). Click to change.">{{ "Yes, it's ours" if d.trusted else 'Not sure' }}</button></td>
+      </tr>
+      <tr class="detail-row" id="dev-detail-{{ d.id }}" hidden>
+        <td colspan="5">
+          <div class="detail">
+            <div>
+              <h4>Addresses</h4>
+              <p class="small">{{ ui.term('IP') }} address {% if d.ip %}<span class="mono">{{ d.ip }}</span>{% else %}<span class="muted">not known</span>{% endif %}<br>{{ ui.term('MAC') }} address {% if d.mac %}<span class="mono">{{ d.mac }}</span>{% else %}<span class="muted">not known</span>{% endif %}</p>
+              <p class="small muted">Maker (worked out from the MAC address): {{ d.vendor or 'not known' }}</p>
+            </div>
+            <div>
+              <h4>On the network</h4>
+              <p class="small">Network name (hostname): {% if d.hostname %}<span class="mono">{{ d.hostname }}</span>{% else %}<span class="muted">none reported</span>{% endif %}<br>
+                First seen <span title="{{ d.first_seen|ts }}">{{ d.first_seen|ago }}</span> · last seen <span title="{{ d.last_seen|ts }}">{{ d.last_seen|ago }}</span><br>
+                Open doors ({{ ui.term('port', 'ports') }}): {{ d.open_ports or 0 }}</p>
+              <p class="small"><a class="link" href="/devices/{{ d.id }}">Everything about {{ label }} →</a></p>
+            </div>
+          </div>
+        </td>
       </tr>
       {% else %}
-      <tr><td colspan="11" class="empty">No devices discovered yet. Run a quick scan to populate the inventory.</td></tr>
+      <tr><td colspan="5" class="empty">No devices found yet. Press “Check for devices now” and Home SOC will look around your network.</td></tr>
       {% endfor %}
     </tbody>
   </table>

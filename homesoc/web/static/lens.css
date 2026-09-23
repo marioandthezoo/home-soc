@@ -8,24 +8,34 @@
 /* ===================================================================== phone: the shell */
 
 body.lens {
-  /* Scoped, not :root, so the desktop pages keep style.css's light/dark palette. The camera
-     app is dark in every theme: it sits over a live image and is used in dim cupboards. */
-  --bg: #0b0d13;
-  --panel: #141824;
-  --panel-2: #1b2030;
-  --line: #2b3243;
-  --fg: #f3f5fb;
-  --muted: #a8b0c6;
-  --accent: #6b8afd;
-  --accent-fg: #07090f;
-  --ok: #4cc38a;
-  --warn: #ffbe3d;
-  --err: #ff6169;
-  --sev-critical: #ff5a61;
-  --sev-high: #ff8f3f;
-  --sev-medium: #ffc53d;
-  --sev-low: #4cc38a;
-  --sev-info: #7aa2ff;
+  /* Scoped, not :root, so the desktop pages keep style.css's day/dusk palette. The camera
+     app is dark in every theme: it sits over a live image and is used in dim cupboards. Its
+     hues are the dashboard's dusk tokens ("Stone & Sage"), so a severity is the same colour on
+     the wall screen and on the phone (design/final/lens-tokens.md). The card is translucent
+     at 90 %: that opacity is what carries the contrast over a white camera frame (critical
+     ink stays >= 5.8:1); do not lower it without re-running the palette numbers. */
+  --bg: #1d1915;
+  --panel: rgba(40, 34, 29, .90);
+  --panel-solid: #28221d;
+  --panel-2: #342d27;
+  --line: #4d453e;
+  --fg: #efe8db;
+  --fg-2: #e6dfd1;
+  --muted: #bdb4a3;
+  --accent: #8fb39c;          /* sage: fills, edges and glyphs only */
+  --accent-ink: #abcbb4;      /* sage as text */
+  --accent-fg: #1f2a24;
+  --accent-tint: #434d40;
+  --ok: #abcbb4;
+  --warn: #edd08f;
+  --err: #f2a49c;
+  --sev-critical: #e2605f;  --sev-critical-ink: #f2a49c;  --sev-critical-on: #221a15;  --sev-critical-tint: #5c3b35;
+  --sev-high:     #f09e55;  --sev-high-ink:     #f2b684;  --sev-high-on:     #221a15;  --sev-high-tint:     #5b4533;
+  --sev-medium:   #f9d898;  --sev-medium-ink:   #f3d693;  --sev-medium-on:   #221a15;  --sev-medium-tint:   #564b36;
+  --sev-low:      #b4c7a8;  --sev-low-ink:      #c2d2b6;  --sev-low-on:      #221a15;  --sev-low-tint:      #4a5140;
+  --sev-info:     #78a2b8;  --sev-info-ink:     #a8c6d6;  --sev-info-on:     #221a15;  --sev-info-tint:     #414b52;
+  --scrim-strong: rgba(18, 14, 10, .88);
+  --shadow-pop: 0 10px 32px -8px rgba(18, 12, 8, .6);
   --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --safe-b: env(safe-area-inset-bottom, 0px);
@@ -54,7 +64,7 @@ body.lens .scrim {
     linear-gradient(to top, rgba(0, 0, 0, .78), rgba(0, 0, 0, 0) 34%);
 }
 /* No camera stream: paint a calm background instead of a black void. */
-body.lens.no-video { background: radial-gradient(120% 80% at 50% 0%, #1a2133 0%, #0b0d13 70%); }
+body.lens.no-video { background: radial-gradient(120% 80% at 50% 0%, #342d27 0%, #1d1915 70%); }
 body.lens.no-video .scrim { background: none; }
 
 body.lens .sr-only {
@@ -72,12 +82,12 @@ body.lens .topbar {
 body.lens .brand { font-weight: 600; letter-spacing: .02em; text-shadow: 0 1px 3px rgba(0, 0, 0, .8); }
 body.lens .brand-mark { color: var(--accent); }
 body.lens .state {
-  font-size: 13px; color: var(--fg); background: rgba(11, 13, 19, .72);
+  font-size: 13px; color: var(--fg); background: var(--panel);
   border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px;
   max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 body.lens .state.is-busy { border-color: var(--accent); }
-body.lens .state.is-bad { border-color: var(--err); color: #ffd7d9; }
+body.lens .state.is-bad { border-color: var(--sev-critical); color: var(--err); }
 
 /* ---------------------------------------------------------------- phone: reticle */
 
@@ -93,7 +103,7 @@ body.lens .corner.br { bottom: 0; right: 0; border-left: 0; border-top: 0; }
 body.lens .reticle.is-hit .corner { border-color: var(--ok); }
 body.lens .reticle-hint {
   position: fixed; z-index: 3; left: 22px; right: 22px; top: calc(40% + min(33vw, 140px) + 18px);
-  margin: 0; text-align: center; font-size: 14px; color: #e7ebf6;
+  margin: 0; text-align: center; font-size: 14px; color: var(--fg);
   text-shadow: 0 1px 4px rgba(0, 0, 0, .9);
 }
 
@@ -102,7 +112,8 @@ body.lens .reticle-hint {
 body.lens .notice {
   position: fixed; z-index: 5; left: 14px; right: 14px; top: calc(var(--safe-t) + 62px);
   background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
-  padding: 16px 16px 14px; box-shadow: 0 12px 34px rgba(0, 0, 0, .55);
+  padding: 16px 16px 14px; box-shadow: var(--shadow-pop);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
 }
 body.lens .notice-title { margin: 0 0 6px; font-size: 17px; font-weight: 650; }
 body.lens .notice-body { margin: 0; color: var(--muted); font-size: 14.5px; }
@@ -125,27 +136,27 @@ body.lens .btn:active { transform: translateY(1px); }
 body.lens .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 650; }
 body.lens .btn-ghost { background: transparent; }
 body.lens .btn-wide { width: 100%; margin-top: 12px; }
-/* 44px is the floor for a touch target, and these are Acknowledge and the sheet Close
+/* 44px is the floor for a touch target, and these are "I've seen this" and the sheet Close
    buttons — the controls a one-handed user in a dim cupboard actually has to hit. */
 body.lens .btn-small { min-height: 44px; padding: 0 12px; font-size: 14px; }
-body.lens .btn.is-bad { border-color: var(--err); color: #ffd7d9; }
+body.lens .btn.is-bad { border-color: var(--sev-critical); color: var(--err); }
 body.lens .btn[disabled] { opacity: .5; }
 
 body.lens .dock {
   position: fixed; z-index: 6; left: 0; right: 0; bottom: 0;
   display: grid; grid-template-columns: 1fr 1.4fr 1fr; gap: 8px;
   padding: 8px 12px calc(var(--safe-b) + 10px);
-  background: linear-gradient(to top, rgba(7, 9, 14, .96), rgba(7, 9, 14, .72));
-  border-top: 1px solid rgba(255, 255, 255, .08);
+  background: linear-gradient(to top, var(--scrim-strong), rgba(18, 14, 10, .66));
+  border-top: 1px solid rgba(239, 232, 219, .08);
 }
 body.lens .dock-btn {
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
   min-height: 54px; border-radius: 14px; border: 1px solid var(--line);
-  background: rgba(20, 24, 36, .9); color: var(--fg); font: 500 12.5px/1 var(--sans);
+  background: var(--panel); color: var(--fg); font: 500 12.5px/1 var(--sans);
   cursor: pointer; -webkit-tap-highlight-color: transparent;
 }
 body.lens .dock-icon { font-size: 19px; line-height: 1; }
-body.lens .dock-btn.is-on { border-color: var(--accent); color: #cfd9ff; }
+body.lens .dock-btn.is-on { border-color: var(--accent); color: var(--accent-ink); }
 body.lens .dock-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 650; }
 /* A full-screen pane or sheet is modal: leaving the dock focusable underneath it puts three
    invisible buttons in the tab order, and activating one re-enters a sheet that is open. */
@@ -160,7 +171,8 @@ body.lens .card {
   position: fixed; z-index: 7; left: 0; right: 0; bottom: 0;
   max-height: 80vh; display: flex; flex-direction: column;
   background: var(--panel); border-top: 1px solid var(--line);
-  border-radius: 20px 20px 0 0; box-shadow: 0 -14px 40px rgba(0, 0, 0, .6);
+  border-radius: 20px 20px 0 0; box-shadow: 0 -14px 40px -8px rgba(18, 12, 8, .6);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
   animation: rise .18s ease-out;
   touch-action: pan-y;
 }
@@ -172,7 +184,7 @@ body.lens .card-handle {
   flex: 0 0 auto; width: 100%; min-height: 48px; padding: 0; background: none; border: 0; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
 }
-body.lens .grip { display: block; width: 44px; height: 5px; border-radius: 3px; background: #4a536b; }
+body.lens .grip { display: block; width: 44px; height: 5px; border-radius: 3px; background: var(--muted); opacity: .6; }
 body.lens .card-body { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 2px 16px calc(var(--safe-b) + 16px); }
 
 body.lens .dev-head { display: flex; align-items: flex-start; gap: 12px; padding-bottom: 12px; }
@@ -189,26 +201,39 @@ body.lens .flag {
   display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; padding: 3px 9px;
   border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2); color: var(--fg);
 }
-body.lens .flag .dot { width: 8px; height: 8px; border-radius: 50%; background: #5c6479; }
-body.lens .flag.on .dot { background: var(--ok); }
-body.lens .flag.off .dot { background: #5c6479; }
-body.lens .flag.untrusted { border-color: #6b3f1d; color: #ffd7a8; }
+body.lens .flag .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+/* Same pills as the dashboard's status badges: sage edge and sage ink for "fine", terracotta
+   for "not trusted", muted for neutral. Each also says its state in words. */
+body.lens .flag.on, body.lens .flag.trusted { border-color: var(--accent); color: var(--ok); background: var(--accent-tint); }
+body.lens .flag.on .dot { background: var(--accent); }
+body.lens .flag.off { color: var(--muted); background: transparent; }
+body.lens .flag.off .dot { background: var(--muted); }
+body.lens .flag.untrusted { border-color: var(--sev-high); color: var(--sev-high-ink); background: var(--sev-high-tint); }
 
 body.lens .headline { margin: 2px 0 12px; font-size: 16px; line-height: 1.4; overflow-wrap: anywhere; }
 
-body.lens .sev-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+/* Two even columns on a phone, so five counts read as a tidy legend rather than a ragged wrap. */
+body.lens .sev-strip { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 6px; margin-bottom: 14px; }
 body.lens .sev-chip {
-  display: inline-flex; align-items: baseline; gap: 6px; padding: 5px 10px; border-radius: 10px;
-  font-size: 13px; border: 1px solid var(--line); background: var(--panel-2);
+  display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 0 6px; padding: 5px 11px; border-radius: 12px;
+  font-size: 13.5px; border: 1px solid var(--line); background: var(--panel-2); color: var(--fg);
 }
 body.lens .sev-chip b { font-size: 15px; }
+/* The technical label is written lower-case in lens.js ("critical"); shown in sentence case. */
+body.lens .sev-chip b + span { text-transform: capitalize; }
+/* The friendly action word under the technical label: "1 Critical / Fix now". */
+body.lens .sev-chip .chip-word { flex: 1 1 100%; font-size: 12.5px; font-weight: 550; color: var(--fg-2); }
 /* Colour is never the only signal: every chip and badge also spells the severity out. */
-body.lens .sev-chip.sev-critical { border-color: var(--sev-critical); color: #ffd9db; }
-body.lens .sev-chip.sev-high { border-color: var(--sev-high); color: #ffdcc2; }
-body.lens .sev-chip.sev-medium { border-color: var(--sev-medium); color: #ffeebf; }
-body.lens .sev-chip.sev-low { border-color: var(--sev-low); color: #c9f0dc; }
-body.lens .sev-chip.sev-info { border-color: var(--sev-info); color: #d3e0ff; }
-body.lens .sev-chip.is-clean { border-color: var(--ok); color: #c9f0dc; }
+body.lens .sev-chip.sev-critical { border-color: var(--sev-critical); color: var(--sev-critical-ink); }
+body.lens .sev-chip.sev-high { border-color: var(--sev-high); color: var(--sev-high-ink); }
+body.lens .sev-chip.sev-medium { border-color: var(--sev-medium); color: var(--sev-medium-ink); }
+body.lens .sev-chip.sev-low { border-color: var(--sev-low); color: var(--sev-low-ink); }
+body.lens .sev-chip.sev-info { border-color: var(--sev-info); color: var(--sev-info-ink); }
+body.lens .sev-chip.sev-critical .chip-word { color: var(--sev-critical-ink); }
+body.lens .sev-chip.sev-high .chip-word { color: var(--sev-high-ink); }
+/* Healthy is sage, never the low-severity moss. */
+body.lens .sev-chip.is-clean { border-color: var(--accent); color: var(--ok); background: var(--accent-tint); }
+body.lens .sev-chip.is-points { color: var(--muted); background: transparent; align-items: center; align-content: center; }
 
 body.lens .sec { border-top: 1px solid var(--line); }
 body.lens .sec[open] { padding-bottom: 10px; }
@@ -235,21 +260,46 @@ body.lens .row-main { min-width: 0; flex: 1 1 auto; }
 body.lens .row-title { font-size: 15px; overflow-wrap: anywhere; }
 body.lens .row-sub { margin: 3px 0 0; color: var(--muted); font-size: 13.5px; overflow-wrap: anywhere; }
 
+/* Badges are the dashboard's dusk badges: severity is a solid fill with a dark label, in
+   sentence case (the one place colour is loud); status is a quiet tinted pill with an edge. */
 body.lens .badge {
-  display: inline-block; font-size: 11.5px; font-weight: 650; letter-spacing: .03em; text-transform: uppercase;
-  padding: 3px 7px; border-radius: 6px; border: 1px solid var(--line); color: var(--fg); white-space: nowrap;
+  display: inline-block; font-size: 12.5px; font-weight: 650; line-height: 1.45; letter-spacing: .005em;
+  padding: 1px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--fg-2);
+  background: var(--panel-2); white-space: nowrap;
 }
-body.lens .badge-critical { border-color: var(--sev-critical); color: #ffd9db; background: rgba(255, 90, 97, .14); }
-body.lens .badge-high { border-color: var(--sev-high); color: #ffdcc2; background: rgba(255, 143, 63, .14); }
-body.lens .badge-medium { border-color: var(--sev-medium); color: #ffeebf; background: rgba(255, 197, 61, .13); }
-body.lens .badge-low { border-color: var(--sev-low); color: #c9f0dc; background: rgba(76, 195, 138, .13); }
-body.lens .badge-info { border-color: var(--sev-info); color: #d3e0ff; background: rgba(122, 162, 255, .13); }
-body.lens .badge-kev { border-color: var(--err); color: #ffd9db; background: rgba(255, 97, 105, .18); }
+body.lens .badge::first-letter { text-transform: uppercase; }
+body.lens .badge-critical { background: var(--sev-critical); color: var(--sev-critical-on); border-color: transparent; }
+body.lens .badge-high { background: var(--sev-high); color: var(--sev-high-on); border-color: transparent; }
+body.lens .badge-medium { background: var(--sev-medium); color: var(--sev-medium-on); border-color: var(--sev-medium-ink); }
+body.lens .badge-low { background: var(--sev-low); color: var(--sev-low-on); border-color: var(--sev-low-ink); }
+body.lens .badge-info { background: var(--sev-info); color: var(--sev-info-on); border-color: transparent; }
+body.lens .badge-kev {
+  background: var(--sev-critical); color: var(--sev-critical-on); border: 1px solid var(--sev-critical);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+body.lens .badge-open { color: var(--sev-high-ink); border-color: var(--sev-high); background: var(--sev-high-tint); }
+body.lens .badge-acknowledged { color: var(--sev-medium-ink); border-color: var(--sev-medium); background: var(--sev-medium-tint); }
+body.lens .badge-resolved { color: var(--ok); border-color: var(--accent); background: var(--accent-tint); }
+body.lens .badge-suppressed { color: var(--muted); border-color: var(--line); background: transparent; }
+body.lens .badge-status { font-size: 12px; font-weight: 600; padding: 0 8px; }
+
+/* A finding, port or flaw row: a head line carrying the badge, its plain action word and the
+   status, then the title at the card's full width (a 390px phone cannot spare a badge column). */
+body.lens .row.is-stacked { flex-direction: column; align-items: stretch; gap: 5px; }
+body.lens .row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+body.lens .row-head .badge-status { margin-left: auto; }
+body.lens .sev-word { font-size: 13.5px; font-weight: 600; color: var(--fg-2); white-space: nowrap; }
+body.lens .sev-word-critical { color: var(--sev-critical-ink); }
+body.lens .sev-word-high { color: var(--sev-high-ink); }
+body.lens .row.is-stacked .row-title { font-weight: 600; }
+/* Technical details sit one tap away and a step quieter than "How to fix this". */
+body.lens .fix.tech-details > summary { min-height: 40px; font-size: 13.5px; color: var(--muted); }
+body.lens .sec-note { margin: 4px 0 10px; font-size: 12.5px; line-height: 1.5; color: var(--muted); }
 
 body.lens .fix { border-top: 1px dashed var(--line); }
 body.lens .fix > summary {
   list-style: none; cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 8px;
-  font-size: 14px; color: var(--accent);
+  font-size: 14.5px; font-weight: 550; color: var(--accent-ink);
 }
 body.lens .fix > summary::-webkit-details-marker { display: none; }
 body.lens .fix-steps { margin: 2px 0 12px; padding-left: 22px; font-size: 14.5px; }
@@ -349,7 +399,7 @@ body.lens .card-foot .btn { flex: 1 1 45%; }
 body.lens .foot-note { flex: 1 1 100%; margin: 2px 0 0; font-size: 12.5px; color: var(--muted); }
 body.lens .stale-strip {
   margin: 0 0 12px; padding: 9px 12px; border-radius: 10px; font-size: 13.5px;
-  background: rgba(255, 190, 61, .13); border: 1px solid var(--warn); color: #ffe6ad;
+  background: var(--sev-medium-tint); border: 1px solid var(--sev-medium); color: var(--warn);
 }
 
 /* ---------------------------------------------------------------- phone: panes + sheets */
@@ -370,7 +420,7 @@ body.lens .search-input {
   width: 100%; min-height: 46px; padding: 0 14px; border-radius: 12px;
   border: 1px solid var(--line); background: var(--panel); color: var(--fg); font: 15px var(--sans);
 }
-body.lens .search-input::placeholder { color: #7b839a; }
+body.lens .search-input::placeholder { color: var(--muted); }
 body.lens .code-raw {
   margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: var(--panel-2);
   border: 1px solid var(--line); font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere;
@@ -396,7 +446,7 @@ body.lens .device-badges { margin-left: auto; display: flex; flex-direction: col
 
 body.lens.claim {
   position: static; inset: auto; overflow-y: auto;
-  background: radial-gradient(120% 70% at 50% 0%, #1a2133 0%, #0b0d13 62%);
+  background: radial-gradient(120% 70% at 50% 0%, #342d27 0%, #1d1915 62%);
   min-height: 100vh;
 }
 body.lens .claim-wrap {
@@ -407,7 +457,7 @@ body.lens .claim-brand { margin: 0 0 18px; font-size: 15px; color: var(--muted);
 body.lens .claim-brand .brand-mark { margin-right: 4px; }
 body.lens .claim-card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
-  padding: 22px 20px 20px; box-shadow: 0 16px 40px rgba(0, 0, 0, .45);
+  padding: 22px 20px 20px; box-shadow: var(--shadow-pop);
 }
 body.lens .claim-title { margin: 0 0 8px; font-size: 23px; line-height: 1.2; font-weight: 700; letter-spacing: -.015em; }
 body.lens .claim-body { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -424,7 +474,8 @@ body.lens .spinner {
 
 /* ===================================================================== desktop: pair page */
 
-.pair-main { padding: 22px 26px 40px; max-width: 1180px; }
+/* Centred on a wide screen instead of pinned left with a third of the page empty. */
+.pair-main { padding: 22px 26px 40px; max-width: 1280px; margin-inline: auto; }
 .pair-grid { display: grid; grid-template-columns: minmax(320px, 1.1fr) minmax(300px, .9fr); gap: 16px; align-items: start; }
 .pair-qr-panel { grid-row: span 2; }
 @media (max-width: 900px) { .pair-grid { grid-template-columns: 1fr; } .pair-qr-panel { grid-row: auto; } }
@@ -438,7 +489,7 @@ body.lens .spinner {
 .check-text p { margin: 4px 0 0; }
 .check-pill {
   flex: 0 0 auto; min-width: 46px; text-align: center; align-self: flex-start;
-  font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  font-size: 13px; font-weight: 650; letter-spacing: 0; text-transform: none;  /* sentence case, like every other badge */
   padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
 }
 .check-pill-ok { border-color: var(--ok); color: var(--ok); }
@@ -446,7 +497,7 @@ body.lens .spinner {
 .check-pill-fail { border-color: var(--err); color: var(--err); }
 .warn-strip {
   margin: 14px 0 0; padding: 10px 12px; border-radius: 8px; font-size: 13.5px;
-  border: 1px solid var(--warn); background: rgba(255, 178, 36, .1);
+  border: 1px solid var(--sev-medium, var(--warn)); background: var(--sev-medium-tint, rgba(255, 178, 36, .1));
 }
 .qr-wrap {
   background: #fff; padding: 14px; border-radius: 12px; width: max-content; max-width: 100%;
@@ -473,7 +524,7 @@ body.stickers { background: var(--bg); }
 body.stickers .no-print > .topbar { padding: 18px 26px; }
 
 .page {
-  background: #fff; color: #000; margin: 0 auto 18px; box-shadow: 0 2px 14px rgba(0, 0, 0, .35);
+  background: #fff; color: #000; margin: 0 auto 18px; box-shadow: var(--shadow-pop, 0 2px 14px rgba(0, 0, 0, .35));
   overflow: hidden;
 }
 .label-grid { display: grid; justify-content: start; align-content: start; }
@@ -530,11 +581,13 @@ body.lens .fallback {
 }
 body.lens .fallback-inner {
   width: 100%; max-width: 420px; text-align: center;
-  background: rgba(11, 13, 19, .82); border: 1px solid var(--line); border-radius: 16px;
-  padding: 18px 16px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 18px 16px; box-shadow: var(--shadow-pop);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
 }
 body.lens .fallback-title { margin: 0 0 6px; font-size: 17px; font-weight: 650; }
 body.lens .fallback-body { margin: 0; color: var(--muted); font-size: 14.5px; }
+body.lens .fallback-inner .steps { text-align: left; margin: 12px 0 0; }
 body.lens .fallback-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 body.lens .fallback-row .btn { flex: 1 1 45%; }
 

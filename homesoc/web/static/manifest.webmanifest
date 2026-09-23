@@ -7,8 +7,8 @@
   "scope": "/lens",
   "display": "standalone",
   "orientation": "portrait",
-  "theme_color": "#0b0d13",
-  "background_color": "#0b0d13",
+  "theme_color": "#1d1915",
+  "background_color": "#1d1915",
   "categories": ["utilities", "security"],
   "icons": [
     {

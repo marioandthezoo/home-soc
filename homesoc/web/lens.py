@@ -161,7 +161,7 @@ PORT_INFO: dict[int, tuple[str, str, str]] = {
     554: ("RTSP camera stream", "live video, which cameras very often serve with no password", "high"),
     631: ("Printer (IPP)", "network printing; check whether it needs a password", "low"),
     1433: ("Microsoft SQL Server", "a database engine listening on the network", "high"),
-    1900: ("UPnP / SSDP", "lets other devices punch holes in your router by themselves", "medium"),
+    1900: ("UPnP / SSDP", "Plug and Play control; on a router it can let devices open doors to the internet by themselves", "medium"),
     2323: ("Telnet (alternate port)", "remote control with no encryption — a favourite of IoT botnets", "critical"),
     3306: ("MySQL", "a database engine listening on the network", "high"),
     3389: ("Remote Desktop (RDP)", "full remote control of the screen and keyboard", "high"),
@@ -184,21 +184,21 @@ FINDING_CLAUSE: dict[str, str] = {
     "NET-SVC-003": "shares files over SMB, the protocol ransomware worms spread through",
     "NET-SVC-004": "has its remote-desktop screen open to anyone on this network",
     "NET-SVC-005": "serves its admin web page without encryption",
-    "NET-SVC-006": "lets other devices open holes in the router by themselves through UPnP",
+    "NET-SVC-006": "answers UPnP (Plug and Play) requests from any device on your network",
     "NET-SVC-007": "has a database port open to the network",
-    "NET-SVC-008": "accepts print jobs from anyone, with no password",
+    "NET-SVC-008": "has a print port any device on your network can reach, which may not ask for a password",
     "NET-SVC-009": "answers SNMP with the factory password, handing over its configuration",
-    "NET-SVC-010": "streams its camera video to anyone who asks",
+    "NET-SVC-010": "has a video-stream service other devices on your network can reach (it may still ask for a password)",
     "NET-SVC-011": "runs an out-of-date SSH server",
     "NET-SVC-012": "announces its exact hardware model to every device on the network",
     "NET-DEV-001": "has not been confirmed as yours yet",
     "NET-DEV-002": "hides behind a randomised MAC address, so it cannot be recognised reliably",
     "NET-DEV-003": "has been missing from the network for days",
-    "NET-VUL-001": "runs software with a flaw criminals are exploiting right now",
-    "NET-VUL-002": "may run software with a flaw criminals are exploiting right now",
+    "NET-VUL-001": "runs software with a flaw attackers are known to have used in real attacks",
+    "NET-VUL-002": "may run software with a flaw attackers are known to have used in real attacks",
     "NET-VUL-003": "runs software with publicly known security flaws",
-    "NET-VUL-004": "runs software attackers are likely to attack next",
-    "NET-RTR-002": "is a router still using its factory administrator password",
+    "NET-VUL-004": "runs software with flaws likely to be exploited somewhere in the next 30 days",
+    "NET-RTR-002": "is a router that lets devices open doors to the internet by themselves (UPnP)",
     "NET-WIFI-001": "is on a Wi-Fi network with no encryption",
     "NET-WIFI-002": "is on a Wi-Fi network still using WPA2 rather than WPA3",
     "NET-WIFI-003": "is on a Wi-Fi network using TKIP, an encryption scheme broken years ago",
@@ -747,7 +747,8 @@ def headline(device: dict, open_findings: list[dict], *, scanned: bool = True) -
     """One sentence a non-expert understands, built from the worst open findings.
 
     "Two critical problems: this camera accepts Telnet logins, which send the password across
-    the network in clear text, and it streams its camera video to anyone who asks."
+    the network in clear text, and it has a video-stream service other devices on your network can
+    reach (it may still ask for a password)."
     """
     noun = _device_noun(device)
     name = "this " + noun
@@ -822,18 +823,22 @@ def service_view(service: dict) -> dict:
 
 
 def _epss_text(epss: float | None) -> str:
-    """EPSS as something to act on rather than a decimal nobody can weigh."""
+    """EPSS as something to act on rather than a decimal nobody can weigh.
+
+    EPSS forecasts whether a flaw is exploited *anywhere* in the next 30 days. It says nothing
+    about whether this household is targeted, so it is never worded as a risk to this home.
+    """
     if epss is None:
         return "No exploitation forecast available."
     pct = epss * 100.0
     if pct >= 10:
-        shape = "very likely to be attacked"
+        shape = "among the flaws most likely to be exploited"
     elif pct >= 1:
         shape = "worth fixing soon"
     else:
-        shape = "unlikely to be attacked in the near term"
+        shape = "exploitation looks unlikely in the near term"
     shown = f"{pct:.1f}%" if pct < 10 else f"{pct:.0f}%"
-    return f"{shown} chance of exploitation in the next 30 days — {shape}."
+    return f"{shown} chance this flaw is exploited somewhere in the next 30 days — {shape}."
 
 
 def vuln_view(v: dict) -> dict:
@@ -946,7 +951,7 @@ def dns_section(
                      "is only what happens to be in the query log.")
     if not ip:
         out["note"] = " ".join(notes + [
-            "Home SOC has no current IP address for this device, so its DNS traffic cannot be matched."
+            "Home SOC has no current IP address for this device, so its website look-ups (DNS) cannot be matched to it."
         ])
         return out
 
@@ -1054,7 +1059,7 @@ def dns_section(
     # ...and the other half of the same truth: somebody else held this address earlier.
     if handover:
         notes.append(
-            f"{ip} was also used by another device inside this window, so only traffic from "
+            f"{ip} was also used by another device inside this window, so only look-ups from "
             f"{since} onwards is counted here."
         )
     if total == 0:

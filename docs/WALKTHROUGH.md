@@ -311,6 +311,20 @@ including the charts, which are hand-drawn SVG. The dashboard works with the mac
 The web layer reads the tables with its own SQL rather than importing the scanner packages, so the
 dashboard renders even when a scanner has never run, is missing, or is mid-edit.
 
+**Plain words beside the technical ones.** Every page leads with plain language — "Things to fix",
+"Fix now", "Needs attention", "Unnamed camera (192.168.1.142)" — and keeps the technical name beside
+it or one click away under **Technical details**. Nothing technical was removed. Two honesty rules
+shape the wording: the dependency map never claims to show connections or traffic, and EPSS is
+always "the chance this flaw is exploited somewhere in the next 30 days", never a chance that your
+home is attacked. When the last network check is older than three times its schedule, every page
+says so at the top.
+
+**Themes.** The dashboard is designed to be left up on a screen. **Day** ("Stone & Sage", the
+default) is warm stone and paper with deep slate-green text; **Dusk** is the same room after sunset,
+in warm cocoa rather than black and neon; **Auto** follows the computer's light/dark setting. The
+**Theme** button at the foot of the sidebar switches between them, and the choice is remembered in
+that browser. A healthy screen carries no alarm colour at all, and colour is never the only signal.
+
 ### The embedded DNS resolver
 
 Optional, off by default. When enabled, it listens on UDP and TCP port 53 and every DNS query from
@@ -360,20 +374,29 @@ failures raise a finding (`SOC-SYS-004`) so a quietly broken job cannot hide.
 
 ## 5. A guided tour of the dashboard
 
-Ten pages plus Settings. Each exists to answer one question.
+Ten pages plus Settings. Each exists to answer one question. The sidebar groups them: the everyday
+pages first (Home, Things to fix, Devices, What happened, Report, This computer, Web blocking),
+then an **Advanced** group (What depends on what, Known flaws, Checks, System health, Settings).
+Each heading below gives the page's plain name, then its technical name in brackets — the name it
+had before, which still sits beside the page title. The addresses are unchanged.
 
-### Overview (`/`) — "what should I worry about today?"
+### Home (Overview, `/`) — "what should I worry about today?"
 
-![The Overview page: security score gauge and trend, open findings donut, device and DNS counters, the Fix these first list, feed freshness, job health, last scans and latest events](images/01-overview.png)
+![The Home page: a one-sentence status, the safety score gauge and trend, what needs fixing by urgency, devices seen at the last check, web blocking over 24 hours, the Fix these first list and the devices that need attention](images/01-overview.png)
 
 *The one page to check daily. Score 10/100, grade F: two open criticals, which on their own would
 have held the score at 20 or below however tidy the rest of the network was.*
 
-Top row, four cards: the **security score** with its gauge and 30-day trend; **open findings** broken
-down by severity as a donut (each badge is a link straight into a filtered Findings view); **devices**
-online out of total, with the age of the last discovery and service scan; and **DNS filter · 24 h** —
-queries, how many were blocked and what percentage, how many clients, and whether the resolver is
-actually running.
+At the top, one sentence about the whole network — "Eight things need your attention, two of them
+urgent." It only ever says "looks healthy" when the data is fresh, no check failed, and every core
+check (open ports, software flaws, this computer, threat lists) has run within its schedule; a
+device check on its own is not enough. If web blocking is switched on but not running, the sentence
+says that too.
+
+Then four cards: **How safe is your network?** — the safety score with a word beside it (Good, Fair,
+Needs work), its trend and the letter grade; **What needs fixing** — open problems by urgency, each
+with its action word ("Fix now", "Fix this week"…); **Devices at home** — how many were *seen at the
+last check* (not a live reading); and **Web blocking** — look-ups, blocks and devices over 24 hours.
 
 Underneath, the card that makes this page worth opening: **Fix these first**. It lists finding *types*
 sorted by how many points they are costing you, and — crucially — how far the score would rise if you
@@ -388,16 +411,19 @@ WIN-UPD-004   Outdated high-risk app          x2   fixing it: +2
 That is a worklist ordered by value, not by severity alphabet. The `x2` means two rows of the same
 type collapsed into one line.
 
-The rest of the page is health: **feed freshness** (are the definitions current?), **jobs** (is
-anything failing?), **last scans** (when did each kind last run?) and the **latest events**.
+Beside it, **Devices that need attention**, worst first. Below: **What your home relies on** (the
+load-bearing devices) and **Recent activity** — the latest six events as plain sentences, with the
+raw log line in each row's tooltip. Home SOC's own health is one line under the buttons: "Home SOC is
+working normally", or exactly which job failed, which check has not run yet or is overdue, and how
+old the threat lists are.
 
-The three buttons at the top — Run quick scan, Full scan, Update feeds — hand work to the scheduler
+The three buttons at the top — Quick check, Full check, Update threat lists — hand work to the scheduler
 immediately. Clicking one twice while it is already running returns politely rather than stacking
 another run.
 
-### Activity feed (`/feed`) — "what happened on my network?"
+### What happened (Activity feed, `/feed`) — "what happened on my network?"
 
-![The Activity feed: a reverse-chronological stream of findings, device arrivals, scans, feed updates and DNS blocks, with kind chips across the top and filters for kind, severity, time window and text](images/02-activity-feed.png)
+![What happened (the activity feed): a reverse-chronological stream of findings, device arrivals, scans, feed updates and DNS blocks, with kind chips across the top and filters for kind, severity, time window and text](images/02-activity-feed.png)
 
 *One stream, everything in it. The chips along the top are counts per kind in the window; clicking one
 filters to it.*
@@ -420,13 +446,13 @@ Filter by kind, minimum severity, time window or free text. There is also an RSS
 `/feed.rss` if you would rather read it in a feed reader, and a terminal version:
 `python -m homesoc feed`.
 
-### Summary (`/summary`) — "what was found, and what actually got fixed?"
+### Report (Security summary, `/summary`) — "what was found, and what actually got fixed?"
 
-![The Summary page: score trend, found vs remediated bars by severity, category table, the remediated table with time-open and how, and the still-open worklist as expandable cards](images/03-summary.png)
+![Your safety report (the Summary page): score trend, found vs remediated bars by severity, category table, the remediated table with time-open and how, and the still-open worklist as expandable cards](images/03-summary.png)
 
 *The report you would show someone else. Exportable as Markdown or JSON, or printable.*
 
-The Overview says what is wrong now. The Summary says what has been happening over a window (30 days
+Home says what is wrong now. The Report says what has been happening over a window (30 days
 by default):
 
 - the **score trend** over the window;
@@ -446,20 +472,23 @@ demo network the median was 12 hours and the slowest 10% took 3 days or more.
 The same report is available offline with `python -m homesoc report` — see
 [section 7](#7-living-with-it).
 
-### Findings (`/findings`) — "everything, filterable"
+### Things to fix (Findings, `/findings`) — "everything, filterable"
 
-![The Findings page: severity badges across the top, filters for status, severity, category and text, and a table of every finding with severity, title, subject, status, occurrence count and last seen](images/04-findings.png)
+![Things to fix (the Findings page): status tabs and urgency badges across the top, filters for urgency, kind and text, and a table of every open problem with its urgency and action word, plain headline and why it matters, the device by name, its status and when it was last seen](images/04-findings.png)
 
-*Every issue Home SOC has ever raised, in one table. The severity badges at the top are shortcuts into
-filtered views.*
+*Every problem Home SOC has raised, opening on the ones that need attention. The tabs and the urgency
+badges at the top are shortcuts into filtered views.*
 
-The columns are severity, the finding (title plus its ID and category), the subject (a device link
-where one applies), status, how many times it has been seen, and when it was last seen.
+The columns are **How urgent** (the severity badge with its action word: critical "Fix now", high
+"Fix this week", medium "Worth fixing", low "When you have time", info "Good to know"), **What's
+wrong** (a plain headline and why it matters; the technical title and check ID are under Technical
+details), **Where** (the device by name, its address muted beside it), **Status** and **Last seen**.
 
-Filter by status (`open`, `acknowledged`, `resolved`, `suppressed`), severity, category or free text.
-There is a second, instant filter that narrows only the rows currently shown, and an **Acknowledge all
-shown** button for the case where you have filtered down to a class of thing you have decided to live
-with.
+The status tabs use plain words with the technical status beside them: *Needs attention* (`open`),
+*Seen, not fixed yet* (`acknowledged`), *Fixed* (`resolved`, with how many a later check confirmed)
+and *Ignored (your choice)* (`suppressed`). Filter by urgency, kind or free text and press
+**Search** (the filters do not reload the page as you arrow through them). **Mark all shown as
+seen** is for when you have filtered down to a class of thing you have decided to live with.
 
 Four statuses, and the difference matters:
 
@@ -472,10 +501,12 @@ Four statuses, and the difference matters:
 
 ### A finding in detail — the unknown camera
 
-![A finding row expanded: the detail paragraph, the evidence JSON, numbered remediation steps, reference links and the Acknowledge / Resolve / Suppress / Reopen buttons](images/05-finding-detail.png)
+![A finding row opened: what Home SOC found, the numbered steps to fix it, the I've seen this / I've fixed it / Ignore this from now on… buttons, and the Technical details disclosure with the check ID and evidence](images/05-finding-detail.png)
 
-*Clicking a row opens it in place. Left: what was seen and the raw evidence. Right: what to do about
-it.*
+*Clicking a row — or tabbing to its title and pressing Enter — opens it in place. Left: what was
+seen. Right: what to do about it. The check ID, evidence and references are under **Technical
+details**. "I've fixed it" shows as **Marked fixed** until Home SOC's own next check confirms the
+problem is gone; only then does it read **Fixed**.*
 
 Let us walk the worked example on screen. The demo network has a device at `192.168.1.142` that
 nobody in the household recognises, and the critical finding against it is `NET-SVC-001`. Here is
@@ -525,17 +556,19 @@ verify the fix, so you are not left wondering whether it worked.
 
 **What you would do.** Work the steps: find the camera physically, open its admin page, turn Telnet
 off. Then either wait for the next service scan — which will stop reporting the finding and
-auto-resolve it with a `verified by rescan` event — or press **Resolve** yourself. If you cannot
-disable it today, press **Acknowledge**: the finding stays visible, drops to quarter weight in the
-score, and stops being counted as something you have not looked at. **Suppress** is for things you
-have decided are permanently fine; it survives rescans.
+auto-resolve it with a `verified by rescan` event (shown as **Fixed**) — or press **I've fixed it**
+yourself (shown as **Marked fixed** until a later check confirms it). If you cannot disable it
+today, press **I've seen this** (acknowledge): the finding stays visible, drops to quarter weight in
+the score, and stops being counted as something you have not looked at. **Ignore this from now on…**
+(suppress) asks you to confirm, and is for things you have decided are permanently fine; it survives
+rescans.
 
 Do not suppress this one. A device you cannot identify, offering Telnet, is the single most
 alarming combination in the whole demo network.
 
 ### Devices (`/devices`) — the inventory
 
-![The Devices page: 17 online of 18 total, and a table of every device with name, IP, MAC, vendor, kind, online state, first and last seen, open port and finding counts, and a Trusted toggle](images/06-devices.png)
+![The Devices page: 17 of 18 seen at the last check, and a table of every device by name with its address beside it, its kind, whether it was seen at the last check, what it has to fix and whether it is yours](images/06-devices.png)
 
 *The inventory. Note the last row: no name, no vendor, untrusted, and findings against it.*
 
@@ -605,18 +638,22 @@ the guest/IoT network so it can reach the internet but not your laptop.
 The **Scan this device now** button re-runs a service scan against just this device, so you can verify
 each fix in a few seconds rather than waiting for the 24-hour cycle.
 
-### Map (`/map`) — "what breaks if this dies?"
+### What depends on what (Dependency map, `/map`) — "what breaks if this dies?"
 
-The Devices page answers *what is on my network*. The Map answers the question you only ever ask
+The Devices page answers *what is on my network*. The map answers the question you only ever ask
 during an outage: **what depends on this, and what stops working without it?**
 
-The graph runs left to right — internet, gateway, then the infrastructure (the resolver, any hubs,
-anything offering a service), then the leaf devices, with external endpoints folded into a single
-"external services" node on the right until you open it. Node colour is the worst open finding, node
-size is how many things depend on it, and a hollow node is one that is currently offline.
+The graph runs left to right — The internet, Your router, Shared services (the resolver, any hubs,
+anything offering a service), Your devices — with outside services folded into a single node on the
+right until you open it. The node's letter and colour are its most urgent open problem, node size is
+how many things depend on it, and a hollow node is one that was not seen at the last network check.
+It is not a traffic diagram: Home SOC cannot see devices talking to each other, and the map never
+says it can.
 
-**Click a node and the map enters blast-radius mode.** Everything that would fail lights up,
-everything unaffected dims, and a side panel gives you one sentence. On a six-device test network,
+**Click a node (or Tab into the map, move with the arrow keys and press Enter) and the map enters
+blast-radius mode.** Everything recorded as depending on it lights up, the rest dims, and a side
+panel gives you one sentence. The count of the rest reads *not known to be affected*, never
+"unaffected": nothing recorded depends on them, which is not the same as knowing nothing does. On a six-device test network,
 clicking the router produces:
 
 > If Living-room router fails, 5 devices lose their internet connection. They stay on the local
@@ -667,7 +704,7 @@ default is a ten-minute window, not within seconds. Home SOC was not watching in
 that are routinely offline — the phone that goes to work every morning — are excluded, so your
 weekday commute does not turn into a fake dependency.
 
-Two smaller surfaces carry the same data. The Overview grows a **load-bearing devices** card with the
+Two smaller surfaces carry the same data. Home grows a **What your home relies on** (load-bearing devices) card with the
 top three by criticality, and every device page grows a **Depends on / Depended on by / If this
 fails** section. Lens gets it too, which is arguably the best use of the feature: point the phone at
 a box in a cupboard and read what the house loses without it, while you are standing in front of it.
@@ -697,9 +734,9 @@ resolver that is not Home SOC. [docs/TOPOLOGY.md](TOPOLOGY.md) covers all of it,
 things that would lift the map from inference to measurement — a managed switch read over SNMP,
 `conntrack` from an OpenWrt/pfSense router, or a passive listener on a spare machine.
 
-### Vulnerabilities (`/vulns`) — CVEs matched to real services
+### Known flaws (Vulnerabilities, `/vulns`) — CVEs matched to real services
 
-![The Vulnerabilities page: a table of CVEs with KEV badge, CVSS, EPSS probability, the device and service they came from, what the match was based on, and links out to NVD](images/08-vulnerabilities.png)
+![Known software flaws (the Vulnerabilities page): a table of CVEs with KEV badge, CVSS, EPSS probability, the device and service they came from, what the match was based on, and links out to NVD](images/08-vulnerabilities.png)
 
 *Filter to KEV-only or by minimum CVSS to see what genuinely matters first.*
 
@@ -725,9 +762,9 @@ builds and lying banners all produce wrong answers in both directions. That is e
 without a usable version are reported separately as "possible" (`NET-VUL-002`) rather than as
 confirmed.
 
-### Host posture and Defender (`/host`) — "is this computer OK?"
+### This computer (Host posture and Defender, `/host`) — "is this computer OK?"
 
-![The Host posture page: Windows Defender card with antivirus, real-time protection, signature age and scan history plus recent threats; Updates with outdated apps; grouped posture checks; autostart entries; and listeners](images/09-host-posture.png)
+![This computer (the Host posture page): Windows Defender card with antivirus, real-time protection, signature age and scan history plus recent threats; Updates with outdated apps; grouped posture checks; autostart entries; and listeners](images/09-host-posture.png)
 
 *The deepest part of the audit, because this is the one machine Home SOC can actually see inside.*
 
@@ -760,9 +797,9 @@ genuinely high-signal malware indicators available to an unprivileged process.
 
 **Listeners.** What this computer is listening on, and which process owns each port.
 
-### DNS filter (`/dns`) — "what is my network asking for?"
+### Web blocking (DNS filter, `/dns`) — "what is my network asking for?"
 
-![The DNS filter page: 24-hour query, block and client counters, resolver state, a queries-per-hour chart with blocks in red, top blocked domains, top clients, loaded blocklists, overrides, the live query log and the reputation cache](images/10-dns-filter.png)
+![Web blocking (the DNS filter page): 24-hour query, block and client counters, resolver state, a queries-per-hour chart with blocks in red, top blocked domains, top clients, loaded blocklists, overrides, the live query log and the reputation cache](images/10-dns-filter.png)
 
 *Empty until you enable the resolver. Once it is running, this is the most immediately interesting
 page in the program.*
@@ -785,9 +822,9 @@ for a domain that reputation services call malicious, Home SOC raises `NET-DNS-0
 specific client* — as it did in the demo, against `192.168.1.32`, for
 `secure-appleid-verify.example`. That is a phone that clicked something.
 
-### Telemetry (`/telemetry`) — "is the agent itself healthy?"
+### System health (Telemetry, `/telemetry`) — "is the agent itself healthy?"
 
-![The Telemetry page: metric charts with a selectable window, a jobs table with status, last run, duration, next run, run and failure counts and last error, the scan history and the raw event log](images/11-telemetry.png)
+![System health (the Telemetry page): metric charts with a selectable window, a jobs table with status, last run, duration, next run, run and failure counts and last error, the scan history and the raw event log](images/11-telemetry.png)
 
 *The agent watching itself. This is where you look when a page is empty and you do not know why.*
 
@@ -800,9 +837,9 @@ The honest use for this page: when something is not working, almost every explan
 A job that has never run, a job failing repeatedly, a scan that errored, a feed that has not updated.
 `python -m homesoc status` prints the same information in the terminal.
 
-### Scans (`/scans`) — "run something now"
+### Checks (Scans, `/scans`) — "run something now"
 
-![The Scans page: buttons to run quick, full, host, exposure, feeds and files scans, chips showing when each kind last ran, and the full scan history with status, start time, duration, summary and error](images/12-scans.png)
+![Checks (the Scans page): buttons to run quick, full, host, exposure, feeds and files scans, chips showing when each kind last ran, and the full scan history with status, start time, duration, summary and error](images/12-scans.png)
 
 *Six buttons and a history. The summary column is the most useful part.*
 
@@ -908,7 +945,7 @@ The short version:
 4. Give this PC a **fixed address** in your router's DHCP settings (a reservation / static lease).
    This step is not optional — if the PC's address changes later, the whole network loses DNS.
 5. In the router's DHCP settings, set the DNS server handed out to clients to this PC's LAN IP. Renew
-   the lease (or reboot) on a device and watch the query log fill up on the DNS filter page.
+   the lease (or reboot) on a device and watch the look-ups fill up on the Web blocking page (`/dns`).
 
 Home SOC will tell you if step 5 did not take: when the resolver has been up for an hour and fewer
 than two distinct devices have used it, you get a `NET-DNS-001` finding.

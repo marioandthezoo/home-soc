@@ -100,7 +100,7 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict:
         d["evidence"] = {}
     spec = catalog.get(d.get("finding_id", ""))
     d["category"] = spec.category if spec else "unknown"
-    d["rationale"] = spec.rationale if spec else ""
+    d["rationale"] = (catalog.render_why(d.get("finding_id", ""), d["evidence"], d.get("subject", "")) or spec.rationale) if spec else ""
     d["refs"] = list(spec.refs) if spec else []
     d["remediation"] = catalog.render_remediation(d.get("finding_id", ""), d["evidence"], d.get("subject", ""))
     return d

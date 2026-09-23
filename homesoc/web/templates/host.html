@@ -1,57 +1,145 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- This computer's protection. Every check leads with a plain name for the setting; the check ID,
+    the raw value and command/registry paths stay beside it, quieter, or one click away. -#}
 {% block content %}
 {% set h = host %}
 {% set df = h.defender %}
+{#- Neutral names for each safety setting (they read the same whether it passes or fails). The
+    finding catalogue's titles describe the problem; these describe the setting. -#}
+{% set check_names = {
+  'WIN-DEF-001': "Windows' built-in antivirus (Defender) switched on", 'WIN-DEF-002': 'Checks files as they arrive (real-time protection)',
+  'WIN-DEF-003': "Antivirus threat list is up to date", 'WIN-DEF-004': 'Antivirus settings locked (tamper protection)',
+  'WIN-DEF-005': 'Asks Microsoft about brand-new files (cloud protection)',
+  'WIN-DEF-006': 'Blocks adware bundled with installers (PUA protection)', 'WIN-DEF-007': 'Full virus scan in the last 30 days',
+  'WIN-DEF-008': 'Ransomware protection for your folders (controlled folder access)',
+  'WIN-DEF-009': 'Blocks dangerous websites for every app (network protection)',
+  'WIN-DEF-010': 'Extra protection against booby-trapped documents (ASR rules)', 'WIN-DEF-011': 'Threats caught by the antivirus',
+  'WIN-DEF-012': 'Antivirus service running normally', 'WIN-DEF-013': 'Only runs apps with a good reputation (Smart App Control)',
+  'WIN-DEF-014': 'Antivirus strictness for files it has not seen before',
+  'WIN-FW-001': 'Firewall on for every kind of network', 'WIN-FW-002': 'Firewall blocks incoming by default',
+  'WIN-UPD-001': 'Windows updates installed', 'WIN-UPD-002': 'Monthly security update installed recently',
+  'WIN-UPD-003': 'Apps up to date', 'WIN-UPD-004': 'Often-attacked apps up to date',
+  'WIN-ACC-001': 'Everyday account is not an administrator', 'WIN-ACC-002': 'Built-in Administrator account switched off',
+  'WIN-ACC-003': 'Guest account switched off', 'WIN-ACC-004': 'Needs a password to sign in (no automatic sign-in)',
+  'WIN-ACC-005': 'Asks before programs make changes (User Account Control)',
+  'WIN-NET-001': 'Outdated file sharing (SMBv1) removed', 'WIN-NET-002': 'Remote Desktop switched off',
+  'WIN-NET-003': 'Shared-folder transfers protected (SMB signing)', 'WIN-NET-004': 'Old name-lookup method (LLMNR) switched off',
+  'WIN-NET-005': 'Remote management (WinRM, Remote Registry) switched off', 'WIN-NET-006': 'No unexpected programs open to the network',
+  'WIN-SYS-001': 'Secure Boot on', 'WIN-SYS-002': 'Drive encrypted (BitLocker / device encryption)',
+  'WIN-SYS-003': 'Memory integrity running', 'WIN-SYS-004': 'Sign-in details protected in memory (LSA protection)',
+  'WIN-SYS-005': 'Old PowerShell 2.0 removed', 'WIN-SYS-006': 'Warns before risky downloads (SmartScreen)',
+  'WIN-SYS-007': 'Locks itself when you walk away', 'WIN-SYS-008': 'Security chip ready (TPM)',
+  'POSIX-ENC-001': 'Disk encrypted', 'POSIX-FW-001': 'Firewall switched on', 'POSIX-NET-001': 'No unexpected programs open to the network',
+  'POSIX-SSH-001': 'Remote login cannot go straight to the root account', 'POSIX-UPD-001': 'System updates installed'} %}
+{% set group_names = {
+  'defender': 'Antivirus (Microsoft Defender)', 'firewall': 'Firewall', 'updates': 'Updates',
+  'accounts': 'Accounts and signing in', 'host-network': 'Sharing and remote access', 'system': 'System protection',
+  'persistence': 'Programs that start by themselves', 'posix': 'System settings', 'files': 'Downloads'} %}
+{% set status_words = {'pass': 'OK', 'fail': 'Needs fixing', 'warn': 'Check this', 'needs_admin': "Couldn't check (needs administrator)", 'unknown': "Couldn't tell"} %}
+{% set status_order = ['fail', 'warn', 'needs_admin', 'unknown', 'pass'] %}
+{% macro check_badge(status) -%}
+{%- set st = (status or 'unknown')|string|lower -%}
+<span class="status-chip"><span class="badge badge-{{ st|css_token }}" title="Result: {{ st }}">{{ status_words.get(st, st) }}</span></span>
+{%- endmacro %}
+{% macro check_table(rows) -%}
+<div class="tbl-wrap">
+<table class="tbl checks-tbl">
+  <colgroup><col class="col-setting"><col class="col-found"><col class="col-result"></colgroup>
+  <thead><tr><th>Setting</th><th>What Home SOC found</th><th>Result</th></tr></thead>
+  <tbody>
+    {% for c in rows %}
+    <tr>
+      <td class="wrap">{{ check_names.get(c.check_id, (c.expected or c.check_id)|capitalize) }}<br><span class="tech-word">{{ c.check_id }}</span></td>
+      <td class="wrap small">{% if c.value %}{{ c.value }}{% else %}<span class="muted">—</span>{% endif %}{% if c.expected and c.status != 'pass' %}<div class="muted small">should be: {{ c.expected }}</div>{% endif %}</td>
+      <td class="nowrap">{{ check_badge(c.status) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{%- endmacro %}
+{% macro on_off(flag) -%}
+{{ badge('ok' if flag else 'fail', 'On' if flag else 'Off') }}
+{%- endmacro %}
+{% set n_total = h.checks|length %}
+{% set n_pass = h.checks|selectattr('status', 'equalto', 'pass')|list|length %}
+{% set n_fail = h.checks|selectattr('status', 'equalto', 'fail')|list|length %}
+{% set n_warn = h.checks|selectattr('status', 'equalto', 'warn')|list|length %}
+{% set n_unsure = n_total - n_pass - n_fail - n_warn %}
+
+<p class="lede">
+  {%- if n_total -%}
+  <b>{{ n_pass }} of {{ n_total }}</b> safety settings on this computer are OK.
+  {%- if n_fail %} <b>{{ n_fail }}</b> need{{ 's' if n_fail == 1 else '' }} fixing{% endif %}{% if n_warn %}{{ ',' if n_fail else '' }} <b>{{ n_warn }}</b> {{ 'is' if n_warn == 1 else 'are' }} worth a look{% endif %}{% if n_fail or n_warn %}.{% endif %}
+  {%- if n_unsure %} {{ n_unsure }} could not be checked{% if h.checks|selectattr('status', 'equalto', 'needs_admin')|list %} without administrator rights{% endif %}.{% endif %}
+  {%- else -%}
+  Home SOC has not checked this computer's safety settings yet. Press “Check this computer now” to start.
+  {%- endif -%}
+</p>
+
 <div class="toolbar">
-  <button class="btn btn-primary" data-action="scan" data-kind="host">Run posture scan</button>
-  <span class="muted small">{{ h.checks|length }} checks · platform {{ h.platform }}</span>
+  <button class="btn btn-primary" data-action="scan" data-kind="host" title="Runs the posture scan: antivirus, firewall, updates, accounts and sharing settings">Check this computer now</button>
+  <span class="muted small">{{ n_total }} check{{ '' if n_total == 1 else 's' }} · {{ h.platform or 'unknown system' }}</span>
 </div>
 
-<div class="grid grid-2">
+<div class="grid grid-2 grid-top">
   <section class="card">
-    <h2>Windows Defender</h2>
+    <h2>Antivirus <span class="muted small">(Microsoft Defender)</span></h2>
     {% if df.status %}
+    {% set av = df.status.get('AntivirusEnabled', df.status.get('enabled')) %}
+    {% set rt = df.status.get('RealTimeProtectionEnabled', df.status.get('realtime')) %}
     <div class="stat-row">
-      <div class="stat"><div class="v">{{ badge('ok' if df.status.get('AntivirusEnabled', df.status.get('enabled')) else 'fail', 'on' if df.status.get('AntivirusEnabled', df.status.get('enabled')) else 'off') }}</div><div class="l">antivirus</div></div>
-      <div class="stat"><div class="v">{{ badge('ok' if df.status.get('RealTimeProtectionEnabled', df.status.get('realtime')) else 'fail', 'on' if df.status.get('RealTimeProtectionEnabled', df.status.get('realtime')) else 'off') }}</div><div class="l">real-time</div></div>
-      <div class="stat"><div class="v">{{ df.signature_age_days if df.signature_age_days is not none else '?' }}d</div><div class="l">signature age</div></div>
-      <div class="stat"><div class="v small">{{ df.last_quick_scan or 'never' }}</div><div class="l">last quick scan</div></div>
-      <div class="stat"><div class="v small">{{ df.last_full_scan or 'never' }}</div><div class="l">last full scan</div></div>
+      <div class="stat"><div class="v">{{ on_off(av) }}</div><div class="l">Antivirus</div></div>
+      <div class="stat"><div class="v">{{ on_off(rt) }}</div><div class="l">Checks files as they arrive</div></div>
+      <div class="stat"><div class="v">{% if df.signature_age_days is not none %}{{ df.signature_age_days }} day{{ '' if df.signature_age_days == 1 else 's' }}{% else %}?{% endif %}</div><div class="l">Age of its threat list</div></div>
     </div>
-    {% else %}<p class="muted">No Defender status recorded yet — run a posture scan.</p>{% endif %}
+    <p class="small">Last quick scan: {{ df.last_quick_scan or 'never' }} · last full scan: {{ df.last_full_scan or 'never' }}</p>
+    {% else %}<p class="muted">Home SOC has not read the antivirus status yet. Press “Check this computer now”.</p>{% endif %}
     <div class="actions">
-      <button class="btn" data-action="defender" data-op="quick-scan">Quick scan</button>
-      <button class="btn" data-action="defender" data-op="update">Update signatures</button>
-      {% if df.status %}<button class="btn btn-sm" data-action="toggle" data-target="#defender-raw">raw status</button>{% endif %}
+      <button class="btn" data-action="defender" data-op="quick-scan" title="Asks Microsoft Defender to run a quick scan; it can take several minutes">Run a quick virus scan</button>
+      <button class="btn" data-action="defender" data-op="update" title="Asks Microsoft Defender to download its latest threat list">Update the threat list</button>
     </div>
-    {% if df.status %}<pre id="defender-raw" hidden>{{ df.status|pretty }}</pre>{% endif %}
-    <h3>Threats · last 30 days</h3>
+    {% if df.status %}
+    {% call ui.tech_details('Technical details: raw Defender status') %}<pre id="defender-raw">{{ df.status|pretty }}</pre>{% endcall %}
+    {% endif %}
+    <h3>Threats the antivirus caught</h3>
     {% if df.threats %}
     <ul class="check-list">
-      {% for t in df.threats %}<li><span>{{ badge('fail', 'threat') }}</span><span class="wrap"><b>{{ t.get('name') or t.get('ThreatName') or 'threat' }}</b><div class="cv">{{ t.get('detail') or t.get('Resources') or '' }}</div></span><span class="muted small">{{ t.get('seen') or t.get('InitialDetectionTime') or '' }}</span></li>{% endfor %}
+      {% for t in df.threats %}
+      {%- set outcome = t.get('action') or t.get('ActionSuccess') or '' -%}
+      <li>
+        <span>{{ badge('fail', 'Threat') }}</span>
+        <span class="wrap"><b>{{ t.get('name') or t.get('ThreatName') or 'Unnamed threat' }}</b>{% if outcome %} — {{ outcome|string|lower }}{% else %} <span class="muted small">(what happened to it was not recorded: check Windows Security › Protection history)</span>{% endif %}<div class="cv">{{ t.get('detail') or t.get('Resources') or '' }}</div></span>
+        <span class="muted small">{{ t.get('seen') or t.get('InitialDetectionTime') or '' }}</span>
+      </li>
+      {% endfor %}
     </ul>
-    {% else %}<p class="muted small">No threats detected.</p>{% endif %}
+    {% else %}<p class="muted small">{% if df.status %}The antivirus has not reported any threats.{% else %}Nothing recorded yet.{% endif %}</p>{% endif %}
   </section>
 
   <section class="card">
-    <h2>Updates</h2>
+    <h2>Windows updates</h2>
     {% if h.updates.pending %}
+    <p><b>{{ h.updates.pending|length }}</b> update{{ '' if h.updates.pending|length == 1 else 's' }} waiting to install. Open <b>Settings › Windows Update</b> and install {{ 'it' if h.updates.pending|length == 1 else 'them' }}, then restart when asked.</p>
     <ul class="check-list">
-      {% for u in h.updates.pending %}<li><span>{{ badge('warn', 'pending') }}</span><span class="wrap">{{ u.get('title') if u is mapping else u }}{% if u is mapping and u.get('kb') %} <span class="mono muted small">{{ u.get('kb') }}</span>{% endif %}</span><span class="muted small">{{ u.get('severity', '') if u is mapping else '' }}</span></li>{% endfor %}
+      {% for u in h.updates.pending %}<li><span>{{ badge('warn', 'Waiting') }}</span><span class="wrap">{{ u.get('title') if u is mapping else u }}{% if u is mapping and u.get('kb') %} <span class="tech-word">{{ u.get('kb') }}</span>{% endif %}</span><span class="muted small">{{ u.get('severity', '') if u is mapping else '' }}</span></li>{% endfor %}
     </ul>
     {% elif h.updates.checks %}
     <ul class="check-list">
-      {% for c in h.updates.checks %}<li><span class="cid">{{ c.check_id }}</span><span class="cv wrap">{{ c.value or '' }}</span><span>{{ badge(c.status) }}</span></li>{% endfor %}
+      {% for c in h.updates.checks %}<li><span class="tech-word">{{ c.check_id }}</span><span class="wrap">{{ check_names.get(c.check_id, c.expected or c.check_id) }}<div class="cv">{{ c.value or '' }}</div></span><span>{{ check_badge(c.status) }}</span></li>{% endfor %}
     </ul>
-    {% else %}<p class="muted small">No update information yet.</p>{% endif %}
-    {% if h.updates.last_hotfix %}<p class="muted small">last hotfix {{ h.updates.last_hotfix }}</p>{% endif %}
-    <h3>Outdated apps ({{ h.software|length }})</h3>
-    <div class="tbl-wrap">
+    {% else %}<p class="muted small">Home SOC has not read the update status yet.</p>{% endif %}
+    {% if h.updates.last_hotfix %}<p class="muted small">Last update installed: {{ h.updates.last_hotfix }}</p>{% endif %}
+
+    <h3>Apps with a newer version ({{ h.software|length }})</h3>
+    {% if h.software %}<p class="small">Update them from inside each app, or all at once by running <span class="kbd">winget upgrade --all</span> in a terminal.</p>{% endif %}
+    <div class="tbl-wrap tbl-scroll">
     <table class="tbl">
-      <thead><tr><th>App</th><th>Installed</th><th>Available</th><th>Source</th></tr></thead>
+      <thead><tr><th>App</th><th>You have</th><th>Newest</th><th>Found by</th></tr></thead>
       <tbody>
-        {% for s in h.software[:60] %}<tr><td class="wrap">{{ s.name }}</td><td class="mono">{{ s.version or '' }}</td><td class="mono">{{ s.available }}</td><td>{{ s.source }}</td></tr>
-        {% else %}<tr><td colspan="4" class="empty">Everything is up to date (or winget has not run yet).</td></tr>{% endfor %}
+        {% for s in h.software[:60] %}<tr><td class="wrap">{{ s.name }}</td><td class="mono">{{ s.version or '?' }}</td><td class="mono">{{ s.available }}</td><td class="muted small">{{ s.source }}</td></tr>
+        {% else %}<tr><td colspan="4" class="empty">Every app Home SOC can see is up to date — or the app check (winget) has not run yet.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
@@ -59,56 +147,71 @@
 </div>
 
 <section class="card">
-  <h2>Posture checks</h2>
+  <h2>Safety settings <span class="muted small">(posture checks)</span></h2>
   {% if groups %}
-  <div class="grid grid-2">
-    {% for name, checks in groups.items() %}
-    <div>
-      <h3>{{ name }}</h3>
-      <ul class="check-list">
-        {% for c in checks %}
-        <li>
-          <span class="cid">{{ c.check_id }}</span>
-          <span class="wrap"><span class="cv">{{ c.value or '' }}</span>{% if c.expected %}<div class="muted small">expected: {{ c.expected }}</div>{% endif %}</span>
-          <span>{{ badge(c.status) }}</span>
-        </li>
-        {% endfor %}
-      </ul>
-    </div>
-    {% endfor %}
-  </div>
-  {% else %}<p class="muted">No posture checks recorded yet — run a posture scan.</p>{% endif %}
+  <p class="muted small">Each group lists what needs a look first; the settings that are fine are one click away. Hover a result for the technical status.</p>
+  {% for name, checks in groups.items() %}
+  {%- set bad = [] -%}
+  {%- for st in status_order if st != 'pass' %}{% for c in checks if (c.status or 'unknown') == st or (st == 'unknown' and c.status not in status_order) %}{% set _ = bad.append(c) %}{% endfor %}{% endfor -%}
+  {%- set good = checks|selectattr('status', 'equalto', 'pass')|list -%}
+  <h3>{{ group_names.get(name, name|capitalize) }} <span class="muted small">· {% if bad %}{{ bad|length }} to look at, {% endif %}{{ good|length }} OK</span></h3>
+  {% if bad %}{{ check_table(bad) }}{% endif %}
+  {% if good %}
+  {% call ui.tech_details(('Show the ' ~ good|length ~ ' setting' ~ ('' if good|length == 1 else 's') ~ ' that ' ~ ('is' if good|length == 1 else 'are') ~ ' OK') if bad else ('All ' ~ good|length ~ ' are OK — show them')) %}{{ check_table(good) }}{% endcall %}
+  {% endif %}
+  {% endfor %}
+  {% else %}<p class="muted">Home SOC has not checked this computer's safety settings yet. Press “Check this computer now”.</p>{% endif %}
 </section>
 
 <div class="grid grid-2">
   <section class="card">
-    <h2>Persistence (autostarts)</h2>
+    <h2>Programs that start by themselves <span class="muted small">(autostarts)</span></h2>
+    {% set kind_words = {'run': 'Starts when you sign in', 'runonce': 'Starts once at next sign-in', 'startup': 'Startup folder', 'task': 'Scheduled task', 'service': 'Background service'} %}
+    {% set added = h.persistence|rejectattr('baseline')|list %}
+    {% if h.persistence %}<p class="muted small">{% if added %}<b>{{ added|length }}</b> {{ 'was' if added|length == 1 else 'were' }} added after Home SOC started watching (marked New) — check you recognise {{ 'it' if added|length == 1 else 'them' }}.{% else %}Nothing new since Home SOC started watching.{% endif %} Select a row (or its name, with the keyboard) for the command it runs.</p>{% endif %}
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Kind</th><th>Name</th><th>Command</th><th>Location</th><th>Seen</th></tr></thead>
+      <thead><tr><th>Program</th><th>How it starts</th><th>Last seen</th></tr></thead>
       <tbody>
         {% for p in h.persistence %}
-        <tr>
-          <td class="nowrap">{{ p.kind }}{% if not p.baseline %} {{ badge('new') }}{% endif %}</td>
-          <td class="wrap">{{ p.name }}</td>
-          <td class="mono small wrap">{{ p.command or '' }}</td>
-          <td class="mono small wrap">{{ p.location }}</td>
+        <tr class="expandable">
+          <td class="wrap"><button type="button" class="row-toggle" aria-expanded="false" aria-controls="persist-detail-{{ loop.index }}">{{ p.name }}</button>{% if not p.baseline %} {{ badge('new', 'New') }}{% endif %}</td>
+          <td class="wrap">{{ kind_words.get((p.kind or '')|lower, p.kind) }} <span class="tech-word">{{ p.kind }}</span></td>
           <td class="nowrap">{{ p.last_seen|ago }}</td>
         </tr>
-        {% else %}<tr><td colspan="5" class="empty">No autostart entries recorded yet.</td></tr>{% endfor %}
+        <tr class="detail-row" id="persist-detail-{{ loop.index }}" hidden>
+          <td colspan="3">
+            <p class="small">Runs <span class="mono">{{ p.command or '(no command recorded)' }}</span></p>
+            <p class="small muted">Registered in <span class="mono">{{ p.location }}</span></p>
+          </td>
+        </tr>
+        {% else %}<tr><td colspan="3" class="empty">No start-up programs recorded yet.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
   </section>
   <section class="card">
-    <h2>Listeners</h2>
+    <h2>Programs waiting for connections <span class="muted small">(listeners)</span></h2>
+    <p class="muted small">A program listening on a door ({{ ui.term('port') }}) can be reached by whoever that door is open to. Fewer open doors is safer.</p>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Port</th><th>Process / detail</th><th>Status</th></tr></thead>
+      <thead><tr><th>Door ({{ ui.term('port') }})</th><th>Program</th><th>Who can reach it</th></tr></thead>
       <tbody>
         {% for l in h.listeners %}
-        <tr><td class="mono">{{ l.get('port') }}{% if l.get('proto') %}/{{ l.get('proto') }}{% endif %}</td><td class="wrap">{{ l.get('process') or l.get('value') or '' }}</td><td>{% if l.get('status') %}{{ badge(l.get('status')) }}{% endif %}</td></tr>
-        {% else %}<tr><td colspan="3" class="empty">No listener information yet.</td></tr>{% endfor %}
+        {%- set addr = (l.get('address') or '')|string -%}
+        <tr>
+          <td class="mono nowrap">{{ l.get('port') }}{% if l.get('proto') %}/{{ l.get('proto') }}{% endif %}</td>
+          <td class="wrap">{{ l.get('process') or l.get('value') or 'Not recorded' }}</td>
+          <td class="wrap">
+            {%- if addr in ('127.0.0.1', '::1') or addr.startswith('127.') -%}Only this computer
+            {%- elif addr in ('0.0.0.0', '::', '*') -%}Every network it is on (unless the firewall blocks it)
+            {%- elif addr -%}Devices on your network (unless the firewall blocks it)
+            {%- elif l.get('status') -%}{{ check_badge(l.get('status')) }}
+            {%- else -%}<span class="muted">Not recorded</span>{%- endif -%}
+            {%- if addr %} <span class="tech-word">{{ addr }}</span>{% endif -%}
+          </td>
+        </tr>
+        {% else %}<tr><td colspan="3" class="empty">Home SOC has not recorded which programs are listening yet.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>

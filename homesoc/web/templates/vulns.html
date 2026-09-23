@@ -1,48 +1,105 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- Known software flaws. Plain "what" first, then the device by name, then three questions a
+    person asks: are attackers using it (KEV), how bad could it be (CVSS, out of 10), how likely is
+    it to be exploited somewhere soon (EPSS, worldwide — never "the chance you are attacked").
+    CVE numbers, product codes (CPE) and sources are one click away in each row. -#}
+{#- "94%", "4.2%", "<1%": the same rounding as api.epss_text, so the table and its tooltip agree. -#}
+{% macro epss_short(pct) -%}
+{%- if pct is none -%}—{%- elif pct < 1 -%}&lt;1%{%- elif pct < 10 -%}{{ '%.1f'|format(pct)|replace('.0', '') }}%{%- else -%}{{ '%.0f'|format(pct) }}%{%- endif -%}
+{%- endmacro %}
+{#- CVSS v3 rating bands. Shown as a quiet word, not as a finding's action word: CVSS says how bad
+    a flaw could be in general, not how urgent it is in this house. -#}
+{% macro cvss_band(x) -%}
+{%- if x is none -%}{%- elif x >= 9 -%}critical{%- elif x >= 7 -%}high{%- elif x >= 4 -%}medium{%- elif x > 0 -%}low{%- else -%}none{%- endif -%}
+{%- endmacro %}
 {% block content %}
-<form class="filters" method="get" action="/vulns" data-submit-on-change>
-  <label><input type="checkbox" name="kev" value="1"{% if filters.kev %} checked{% endif %}> KEV only</label>
-  <label>Min CVSS
+{% set filtered = filters.kev or filters.min_cvss or filters.q %}
+{% set kev_count = vulns|selectattr('kev')|list|length %}
+{% set devices_hit = vulns|map(attribute='device_id')|unique|list|length %}
+{% if vulns %}
+<p class="lede">
+  {%- if filtered %}<b>{{ vulns|length }}</b> known flaw{{ '' if vulns|length == 1 else 's' }} match{{ 'es' if vulns|length == 1 else '' }} these filters
+  {%- else %}Home SOC matched <b>{{ vulns|length }}</b> known software flaw{{ '' if vulns|length == 1 else 's' }} to the software on <b>{{ devices_hit }}</b> device{{ '' if devices_hit == 1 else 's' }}{% endif %}.
+  {%- if kev_count %} <b>{{ kev_count }}</b> {{ 'is' if kev_count == 1 else 'are' }} on the list of flaws attackers are known to use ({{ ui.term('KEV') }}) — fix {{ 'that' if kev_count == 1 else 'those' }} first.{% endif %}
+</p>
+{% endif %}
+
+{% if vulns or filtered %}
+<form class="filters" method="get" action="/vulns">
+  <label><input type="checkbox" name="kev" value="1"{% if filters.kev %} checked{% endif %}> <span>Only flaws attackers are known to use ({{ ui.term('KEV') }})</span></label>
+  <label><span>How bad, at least ({{ ui.term('CVSS') }})</span>
     <select name="min_cvss">
-      {% for v in ['', '4', '7', '9'] %}<option value="{{ v }}"{% if filters.min_cvss == v %} selected{% endif %}>{{ v or 'any' }}</option>{% endfor %}
+      {% for v, words in [('', 'Any'), ('4', '4 — medium'), ('7', '7 — high'), ('9', '9 — critical')] %}<option value="{{ v }}"{% if filters.min_cvss == v %} selected{% endif %}>{{ words }}</option>{% endfor %}
     </select>
   </label>
-  <input type="search" name="q" value="{{ filters.q }}" placeholder="cve, title, ip, product…">
-  <button class="btn" type="submit">Apply</button>
-  <input type="search" placeholder="filter shown rows" data-filter="#vulns-table" aria-label="Filter rows">
+  <input type="search" name="q" value="{{ filters.q }}" placeholder="Search flaws…" title="Search by flaw ID (CVE), title, device address or product" aria-label="Search known flaws by flaw ID, title, device address or product">
+  <button class="btn" type="submit">Search</button>
+  {% if filtered %}<a class="link" href="/vulns">Clear filters</a>{% endif %}
   <span class="muted small" data-filter-count="vulns-table">{{ vulns|length }} shown</span>
 </form>
+{% endif %}
 
 <section class="card">
+  {% if vulns %}<p class="muted small">Select a row (or its title, with the keyboard) for how to fix it and the technical details.</p>{% endif %}
   <div class="tbl-wrap">
-  <table class="tbl" id="vulns-table" data-filterable>
-    <thead><tr><th>CVE</th><th>KEV</th><th class="num">CVSS</th><th class="num">EPSS</th><th>Device</th><th>Service</th><th>Matched on</th><th>First seen</th><th>Links</th></tr></thead>
+  <table class="tbl" id="vulns-table"{% if vulns %} data-filterable{% endif %}>
+    <thead><tr>
+      <th>What the flaw is</th>
+      <th>Device</th>
+      <th title="On CISA's Known Exploited Vulnerabilities list (KEV): attackers are known to have used it in real attacks">Known to be used by attackers?</th>
+      <th class="num" title="CVSS base score: how bad the flaw could be, from 0 to 10">How bad</th>
+      <th class="num" title="EPSS: the chance this flaw is exploited somewhere in the world in the next 30 days. It does not say whether your home is being targeted.">Exploited somewhere, next 30 days</th>
+      <th>First seen</th>
+    </tr></thead>
     <tbody>
       {% for v in vulns %}
+      {%- set band = cvss_band(v.cvss) -%}
       <tr class="expandable">
-        <td class="mono nowrap">{{ v.cve }}</td>
-        <td>{% if v.kev %}{{ badge('kev') }}{% endif %}</td>
-        <td class="num">{% if v.cvss is not none %}{{ sev('critical' if v.cvss >= 9 else 'high' if v.cvss >= 7 else 'medium' if v.cvss >= 4 else 'low') }} {{ v.cvss }}{% endif %}</td>
-        <td class="num">{{ '%.2f'|format(v.epss) if v.epss is not none else '' }}</td>
-        <td class="wrap">{% if v.device_id %}<a href="/devices/{{ v.device_id }}">{{ v.device_name }}</a> <span class="mono muted small">{{ v.device_ip or '' }}</span>{% endif %}</td>
-        <td class="wrap small">{% if v.port %}<span class="mono">{{ v.port }}/{{ v.proto }}</span> {% endif %}{{ v.product or v.service_name or '' }} {{ v.service_version or '' }}</td>
-        <td class="wrap small">{{ v.matched_on }}</td>
+        <td class="wrap"><button type="button" class="row-toggle" aria-expanded="false" aria-controls="vuln-detail-{{ loop.index }}">{{ v.title or 'No description published' }}</button><br><span class="tech-word">{{ v.cve }}</span></td>
+        <td class="wrap">{% if v.device_id %}{{ ui.device_name(v) }}{% else %}<span class="muted">No longer on the device list</span>{% endif %}</td>
+        <td class="wrap">{% if v.kev %}{{ badge('kev') }}<br><span class="small sev-word-critical">Yes — attackers are known to have used this flaw in real attacks</span>{% else %}<span class="muted small">Not known to be</span>{% endif %}</td>
+        <td class="num nowrap">{% if v.cvss_text %}<b>{{ v.cvss_text }}</b><br><span class="muted small" title="CVSS rating: {{ band }}">{{ band }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td class="num nowrap" title="{{ v.epss_text or 'No EPSS estimate for this flaw' }}">{{ epss_short(v.epss_pct) }}</td>
         <td class="nowrap" title="{{ v.first_seen|ts }}">{{ v.first_seen|ago }}</td>
-        <td class="nowrap"><a href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">NVD</a>{% if v.kev %} · <a href="{{ v.kev_url }}" target="_blank" rel="noopener noreferrer">KEV</a>{% endif %}</td>
       </tr>
-      <tr class="detail-row" hidden>
-        <td colspan="9">
+      <tr class="detail-row" id="vuln-detail-{{ loop.index }}" hidden>
+        <td colspan="6">
           <div class="detail">
-            <div><h4>{{ v.title or v.cve }}</h4><p class="small">source {{ v.source }}{% if v.published %} · published {{ v.published }}{% endif %} · last seen {{ v.last_seen|ts }}</p></div>
-            <div><h4>Remediation</h4><p class="small">{{ v.remediation or 'Update the affected software to a fixed version or isolate the device.' }}</p></div>
+            <div>
+              <h4>How to fix it</h4>
+              <p>{{ v.remediation or 'Update the affected software to a fixed version, or keep the device away from anything untrusted until you can.' }}</p>
+              <h4>What the numbers mean</h4>
+              <p class="small">{{ v.kev_text }}.</p>
+              {% if v.epss_text %}<p class="small">{{ v.epss_text }} ({{ ui.term('EPSS') }}). {{ v.epss_note }}</p>{% endif %}
+              {% if v.cvss_text %}<p class="small">How bad it could be: {{ v.cvss_text }} ({{ ui.term('CVSS') }}, rated {{ band }}).</p>{% endif %}
+            </div>
+            <div>
+              <h4>Technical details</h4>
+              <p class="small">
+                {{ ui.term('CVE') }} <span class="mono">{{ v.cve }}</span><br>
+                Matched on ({{ ui.term('CPE') }}) <span class="mono small">{{ v.matched_on }}</span><br>
+                {% if v.port %}Service: <span class="mono">{{ v.port }}/{{ v.proto }}</span> {{ v.product or v.service_name or '' }} {{ v.service_version or '' }}<br>{% endif %}
+                Source {{ v.source }}{% if v.published %} · published {{ v.published }}{% endif %} · last seen {{ v.last_seen|ts }}
+                {%- if v.epss is not none %}<br>EPSS {{ '%.4f'|format(v.epss) }}{% endif %}{% if v.cvss is not none %} · CVSS {{ v.cvss }}{% endif %}
+              </p>
+              <p class="small"><a href="{{ v.nvd_url }}" target="_blank" rel="noopener noreferrer">Read it on NVD</a>{% if v.kev %} · <a href="{{ v.kev_url }}" target="_blank" rel="noopener noreferrer">CISA KEV entry</a>{% endif %}</p>
+            </div>
           </div>
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="9" class="empty">No vulnerabilities matched yet. They appear after a service scan when KEV/NVD data is available.</td></tr>
+      <tr><td colspan="6" class="empty">
+        {%- if filtered -%}
+        No known flaws match these filters. <a href="/vulns">Show them all</a>.
+        {%- else -%}
+        No known software flaws matched yet. They appear after Home SOC's port check has found software that reports its version, and once the flaw lists (NVD and CISA KEV) have been downloaded.
+        {%- endif -%}
+      </td></tr>
       {% endfor %}
     </tbody>
   </table>
   </div>
+  {% if vulns %}<p class="muted small">{{ ui.term('EPSS') }} is a worldwide forecast for the flaw itself: it does not say whether your home is being targeted. Matches come from the software version a device reports, so a device that hides its version, or was patched without changing it, can be listed wrongly or missed.</p>{% endif %}
 </section>
 {% endblock %}

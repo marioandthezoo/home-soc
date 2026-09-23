@@ -26,21 +26,45 @@
     return v || fallback;
   }
 
+  /* Every colour is a design token read at draw time; the fallbacks are the day theme, so a
+     missing token degrades to the default look rather than to the retired neon palette. */
   function colors() {
     var c = {
-      fg: cssVar('--fg', '#e6e8ef'),
-      muted: cssVar('--muted', '#8b91a3'),
-      grid: cssVar('--line', '#262a36'),
-      panel: cssVar('--panel', '#171a23'),
-      accent: cssVar('--accent', '#3e63dd'),
-      critical: cssVar('--sev-critical', '#e5484d'),
-      high: cssVar('--sev-high', '#f76b15'),
-      medium: cssVar('--sev-medium', '#ffb224'),
-      low: cssVar('--sev-low', '#46a758'),
-      info: cssVar('--sev-info', '#3e63dd')
+      fg: cssVar('--fg', '#1f2d29'),
+      muted: cssVar('--muted', '#4d5a54'),
+      grid: cssVar('--line', '#d3cdc0'),
+      track: cssVar('--chart-track', '#dcd6ca'),
+      panel: cssVar('--panel', '#eeeae0'),
+      accent: cssVar('--accent', '#46705d'),
+      critical: cssVar('--sev-critical', '#842a2f'),
+      high: cssVar('--sev-high', '#975b30'),
+      medium: cssVar('--sev-medium', '#ae7b2f'),
+      low: cssVar('--sev-low', '#728b6b'),
+      info: cssVar('--sev-info', '#365c7a'),
+      labelSize: parseFloat(cssVar('--chart-label-size', '12')) || 12
     };
-    c.palette = [c.accent, c.low, c.medium, c.high, c.critical, '#8e4ec6', '#12a594', '#e93d82', '#ad7f58'];
+    /* The severity as text or as an edge (>=4.5:1 on the card): captions, arc and swatch edges. */
+    c.ink = {
+      critical: cssVar('--sev-critical-ink', '#842a2f'),
+      high: cssVar('--sev-high-ink', '#85502a'),
+      medium: cssVar('--sev-medium-ink', '#694e12'),
+      low: cssVar('--sev-low-ink', '#4a5f44'),
+      info: cssVar('--sev-info-ink', '#335874')
+    };
+    c.palette = [c.accent, c.low, c.medium, c.high, c.critical,
+      cssVar('--chart-5', '#7a6788'), cssVar('--chart-6', '#4c7f7a'), cssVar('--chart-7', '#9c5460'), cssVar('--chart-8', '#87684a')];
     return c;
+  }
+
+  /* A series may name a token instead of a hex ({token: '--status-open'}), so a theme switch
+     re-reads it on redraw instead of keeping the colour captured when the page loaded. */
+  function seriesColor(sr, c, i) {
+    if (sr && sr.token) return cssVar(sr.token, c.palette[i % c.palette.length]);
+    return (sr && sr.color) || c.palette[i % c.palette.length];
+  }
+
+  function allZero(values) {
+    return !values.some(function (v) { return Number(v) > 0; });
   }
 
   function node(name, attrs, text) {
@@ -55,7 +79,7 @@
   }
 
   function svg(w, h, label, cls) {
-    var s = node('svg', { viewBox: '0 0 ' + w + ' ' + h, preserveAspectRatio: 'xMidYMid meet', 'class': cls || 'chart-svg', role: 'img' });
+    var s = node('svg', { viewBox: '0 0 ' + w + ' ' + h, preserveAspectRatio: 'xMidYMid meet', 'class': (cls || 'chart-svg') + ' chart-tokens', role: 'img' });
     if (label) s.appendChild(node('title', null, label));
     return s;
   }
@@ -143,15 +167,18 @@
     return d;
   }
 
-  /* ---- bar chart: values (+ optional overlay, e.g. blocked over total) ---- */
+  /* ---- bar chart: values (+ optional overlay, e.g. blocked over total) ----
+     A series that is zero everywhere draws the calm empty box instead of bare axes: for
+     counts (DNS look-ups per hour) zero everywhere means "nothing happened in this window",
+     which opts.emptyText must say in those words. */
   function bar(container, opts) {
     mount(container, function () {
       var c = colors();
       var values = opts.values || [];
       var overlay = opts.overlay || null;
       var labels = opts.labels || [];
-      if (!values.length) return empty(opts.emptyText);
-      var W = boxWidth(container), H = opts.height || 150, padL = 36, padR = 6, padT = 8, padB = 20;
+      if (!values.length || allZero(values)) return empty(opts.emptyText);
+      var W = boxWidth(container), H = opts.height || 150, padL = 40, padR = 6, padT = 8, padB = c.labelSize + 12;
       var s = svg(W, H, opts.title);
       var max = niceMax(Math.max.apply(null, values.concat([1])));
       var innerW = W - padL - padR, innerH = H - padT - padB;
@@ -159,10 +186,10 @@
       [0, 0.5, 1].forEach(function (f) {
         var y = padT + innerH - innerH * f;
         s.appendChild(node('line', { x1: padL, x2: W - padR, y1: y, y2: y, stroke: c.grid, 'stroke-width': 1 }));
-        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': 10, fill: c.muted }, fmt(max * f)));
+        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': c.labelSize, fill: c.muted }, fmt(max * f)));
       });
       /* Only label as many ticks as actually fit, so "14:00" never collides with "15:00". */
-      var widest = labels.reduce(function (a, l) { return Math.max(a, textWidth(l, 10)); }, 24);
+      var widest = labels.reduce(function (a, l) { return Math.max(a, textWidth(l, c.labelSize)); }, 24);
       var every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(innerW / (widest + 8)))));
       values.forEach(function (v, i) {
         var x = padL + i * slot + (slot - bw) / 2;
@@ -177,7 +204,7 @@
         }
         s.appendChild(g);
         if (labels[i] !== undefined && i % every === 0) {
-          s.appendChild(node('text', { x: x + bw / 2, y: H - 6, 'text-anchor': 'middle', 'font-size': 10, fill: c.muted }, labels[i]));
+          s.appendChild(node('text', { x: x + bw / 2, y: H - 5, 'text-anchor': 'middle', 'font-size': c.labelSize, fill: c.muted }, labels[i]));
         }
       });
       return s;
@@ -193,11 +220,11 @@
       var series = opts.series || [];
       var any = groups.some(function (g) { return (g.values || []).some(function (v) { return v > 0; }); });
       if (!groups.length || !series.length || !any) return empty(opts.emptyText);
-      var W = boxWidth(container), padL = 36, padR = 8, padT = 10;
+      var W = boxWidth(container), padL = 40, padR = 8, padT = 10;
       /* Lay the legend out first: it may need two rows on a narrow card, and the plot area
          has to give up the height rather than let the swatches spill past the SVG. */
       var legend = layoutLegend(series, W - padL - padR, c);
-      var legendBand = legend.rows * 16, padB = 14 + legendBand + 6;
+      var rowH = c.labelSize + 8, legendBand = legend.rows * rowH, padB = c.labelSize + 6 + legendBand + 6;
       var H = Math.max(opts.height || 190, padT + 60 + padB);
       var s = svg(W, H, opts.title);
       var flat = [];
@@ -208,7 +235,7 @@
       (max >= 2 ? [0, 0.5, 1] : [0, 1]).forEach(function (f) {
         var y = padT + innerH - innerH * f;
         s.appendChild(node('line', { x1: padL, x2: W - padR, y1: y, y2: y, stroke: c.grid, 'stroke-width': 1 }));
-        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': 10, fill: c.muted }, fmt(Math.round(max * f))));
+        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': c.labelSize, fill: c.muted }, fmt(Math.round(max * f))));
       });
       var slot = innerW / groups.length, inner = slot * 0.78, bw = Math.max(3, inner / series.length - 2);
       groups.forEach(function (g, gi) {
@@ -218,19 +245,19 @@
           var h = innerH * ((v || 0) / max);
           var rect = node('rect', {
             x: x.toFixed(1), y: (padT + innerH - h).toFixed(1), width: bw.toFixed(1), height: Math.max(0, h).toFixed(1),
-            rx: 2, fill: (series[si] && series[si].color) || c.palette[si % c.palette.length]
+            rx: 2, fill: seriesColor(series[si], c, si)
           });
           rect.appendChild(node('title', null, g.label + ' · ' + ((series[si] && series[si].name) || '') + ': ' + fmt(v || 0)));
           s.appendChild(rect);
         });
-        var label = node('text', { x: (x0 + inner / 2).toFixed(1), y: (H - padB + 11).toFixed(1), 'text-anchor': 'middle', 'font-size': 10, fill: c.muted }, fitText(g.label, 10, slot - 2));
+        var label = node('text', { x: (x0 + inner / 2).toFixed(1), y: (H - padB + c.labelSize + 2).toFixed(1), 'text-anchor': 'middle', 'font-size': c.labelSize, fill: c.muted }, fitText(g.label, c.labelSize, slot - 2));
         label.appendChild(node('title', null, g.label));
         s.appendChild(label);
       });
       legend.items.forEach(function (it) {
-        var y = H - legendBand + it.row * 16 + 11;
-        s.appendChild(node('rect', { x: (padL + it.x).toFixed(1), y: (y - 8).toFixed(1), width: 9, height: 9, rx: 2, fill: it.color }));
-        s.appendChild(node('text', { x: (padL + it.x + 13).toFixed(1), y: y.toFixed(1), 'font-size': 10, fill: c.muted }, it.name));
+        var y = H - legendBand + it.row * rowH + c.labelSize;
+        s.appendChild(node('rect', { x: (padL + it.x).toFixed(1), y: (y - c.labelSize + 2).toFixed(1), width: 11, height: 11, rx: 2, fill: it.color }));
+        s.appendChild(node('text', { x: (padL + it.x + 16).toFixed(1), y: y.toFixed(1), 'font-size': c.labelSize, fill: c.muted }, it.name));
       });
       return s;
     });
@@ -241,9 +268,9 @@
     var items = [], x = 0, row = 0;
     series.forEach(function (sr, si) {
       var name = String(sr.name || '');
-      var w = 13 + textWidth(name, 10) + 12;
+      var w = 16 + textWidth(name, c.labelSize) + 14;
       if (x > 0 && x + w > width) { x = 0; row += 1; }
-      items.push({ name: name, color: sr.color || c.palette[si % c.palette.length], x: x, row: row });
+      items.push({ name: name, color: seriesColor(sr, c, si), x: x, row: row });
       x += w;
     });
     return { items: items, rows: row + 1 };
@@ -254,8 +281,10 @@
     mount(container, function () {
       var c = colors();
       var series = (opts.series || []).filter(function (sr) { return sr.values && sr.values.length; });
+      /* No all-zero shortcut here, unlike bar(): a line of zeros (a safety score of 0 held for
+         a week) is a real reading, and calling it "no data yet" would hide a bad week. */
       if (!series.length) return empty(opts.emptyText);
-      var W = boxWidth(container), H = opts.height || 150, padL = 40, padR = 8, padT = 8, padB = opts.labels ? 20 : 8;
+      var W = boxWidth(container), H = opts.height || 150, padL = 40, padR = 8, padT = 8, padB = opts.labels ? c.labelSize + 10 : 8;
       var s = svg(W, H, opts.title);
       var all = [];
       series.forEach(function (sr) { all = all.concat(sr.values); });
@@ -268,10 +297,10 @@
       [0, 0.5, 1].forEach(function (f) {
         var v = min + (max - min) * f, y = ys(v);
         s.appendChild(node('line', { x1: padL, x2: W - padR, y1: y, y2: y, stroke: c.grid }));
-        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': 10, fill: c.muted }, fmt(v)));
+        s.appendChild(node('text', { x: padL - 5, y: y + 4, 'text-anchor': 'end', 'font-size': c.labelSize, fill: c.muted }, fmt(v)));
       });
       series.forEach(function (sr, si) {
-        var color = sr.color || c.palette[si % c.palette.length];
+        var color = seriesColor(sr, c, si);
         var pts = sr.values.map(function (v, i) { return xs(i).toFixed(1) + ',' + ys(v).toFixed(1); });
         if (sr.values.length === 1) {
           s.appendChild(node('circle', { cx: xs(0), cy: ys(sr.values[0]), r: 3, fill: color }));
@@ -285,9 +314,9 @@
       });
       if (opts.labels && opts.labels.length) {
         var room = (innerW - 12) / 2;
-        s.appendChild(node('text', { x: padL, y: H - 5, 'font-size': 10, fill: c.muted }, fitText(opts.labels[0], 10, room)));
+        s.appendChild(node('text', { x: padL, y: H - 5, 'font-size': c.labelSize, fill: c.muted }, fitText(opts.labels[0], c.labelSize, room)));
         if (opts.labels.length > 1) {
-          s.appendChild(node('text', { x: W - padR, y: H - 5, 'text-anchor': 'end', 'font-size': 10, fill: c.muted }, fitText(opts.labels[opts.labels.length - 1], 10, room)));
+          s.appendChild(node('text', { x: W - padR, y: H - 5, 'text-anchor': 'end', 'font-size': c.labelSize, fill: c.muted }, fitText(opts.labels[opts.labels.length - 1], c.labelSize, room)));
         }
       }
       return s;
@@ -334,13 +363,17 @@
       /* Its own class: `.chart-svg` alone would also match the 10x10 legend swatches below,
          and any rule sizing the ring would blow them up to the same size. */
       var s = svg(size, size, opts.title, 'chart-svg chart-ring');
-      s.appendChild(node('circle', { cx: cx, cy: cy, r: r, fill: 'none', stroke: c.grid, 'stroke-width': 14 }));
+      s.appendChild(node('circle', { cx: cx, cy: cy, r: r, fill: 'none', stroke: c.track, 'stroke-width': 14 }));
+      /* A 1.5-unit gap in the card colour between slices, so two light neighbours (ochre next
+         to moss) never merge into one band. */
+      var gap = slices.length > 1 ? 1.5 : 0;
       var offset = 0;
       slices.forEach(function (sl, i) {
         var len = C * sl.value / total;
+        var drawn = Math.max(0.5, len - gap);
         var circ = node('circle', {
           cx: cx, cy: cy, r: r, fill: 'none', stroke: sl.color || c[sl.label] || c.palette[i % c.palette.length],
-          'stroke-width': 14, 'stroke-dasharray': len.toFixed(2) + ' ' + (C - len).toFixed(2),
+          'stroke-width': 14, 'stroke-dasharray': drawn.toFixed(2) + ' ' + (C - drawn).toFixed(2),
           'stroke-dashoffset': (-offset + C / 4).toFixed(2)
         });
         circ.appendChild(node('title', null, sl.label + ': ' + fmt(sl.value)));
@@ -348,7 +381,7 @@
         offset += len;
       });
       s.appendChild(node('text', { x: cx, y: cy + 2, 'text-anchor': 'middle', 'font-size': 22, 'font-weight': 700, fill: c.fg }, opts.centerText !== undefined ? opts.centerText : fmt(total)));
-      s.appendChild(node('text', { x: cx, y: cy + 18, 'text-anchor': 'middle', 'font-size': 10, fill: c.muted }, opts.centerSub || ''));
+      s.appendChild(node('text', { x: cx, y: cy + 18, 'text-anchor': 'middle', 'font-size': 11, fill: c.muted }, opts.centerSub || ''));
       wrap.appendChild(s);
       var ul = document.createElement('ul');
       ul.className = 'legend';
@@ -357,14 +390,29 @@
         var sw = document.createElement('span');
         sw.className = 'sw';
         var swSvg = svg(10, 10, null, 'legend-swatch');
-        swSvg.appendChild(node('rect', { width: 10, height: 10, rx: 2, fill: sl.color || c[sl.label] || c.palette[i % c.palette.length] }));
+        /* A zero row gets an outline swatch, not a solid one: DESIGN §1 promises that every
+           solid severity colour disappears when its count is zero, so a healthy screen shows
+           only stone, paper and sage. */
+        var zero = !(Number(sl.value) > 0);
+        swSvg.appendChild(node('rect', zero
+          ? { x: 0.75, y: 0.75, width: 8.5, height: 8.5, rx: 2, fill: 'none', stroke: c.muted, 'stroke-width': 1 }
+          : { x: 0.5, y: 0.5, width: 9, height: 9, rx: 2, fill: sl.color || c[sl.label] || c.palette[i % c.palette.length],
+              stroke: c.ink[sl.label] || 'none', 'stroke-width': 1 }));
         sw.appendChild(swSvg);
         var lb = document.createElement('span');
         lb.className = 'lb';
         lb.textContent = sl.label;
-        lb.title = sl.label;
+        lb.title = sl.label + (sl.word ? ' · ' + sl.word : '');
+        /* The plain action word beside the technical label ("critical  Fix now"). */
+        if (sl.word) {
+          lb.className = 'lb has-word';
+          var word = document.createElement('span');
+          word.className = 'sev-word' + (sl.value > 0 ? ' sev-word-' + sl.label : ' is-zero');
+          word.textContent = sl.word;
+          lb.appendChild(word);
+        }
         var lv = document.createElement('span');
-        lv.className = 'lv';
+        lv.className = zero ? 'lv is-zero' : 'lv';
         lv.textContent = fmt(sl.value);
         li.appendChild(sw); li.appendChild(lb); li.appendChild(lv);
         ul.appendChild(li);
@@ -392,11 +440,30 @@
         return 'M ' + (cx - r) + ' ' + cy + ' A ' + r + ' ' + r + ' 0 ' + (frac > 0.5 ? 1 : 0) + ' 1 ' + e.x.toFixed(2) + ' ' + e.y.toFixed(2);
       };
       var frac = v / max;
-      var color = frac >= 0.8 ? c.low : frac >= 0.6 ? c.medium : frac >= 0.4 ? c.high : c.critical;
-      s.appendChild(node('path', { d: d(1), fill: 'none', stroke: c.grid, 'stroke-width': sw, 'stroke-linecap': 'round' }));
-      if (frac > 0.001) s.appendChild(node('path', { d: d(frac), fill: 'none', stroke: color, 'stroke-width': sw, 'stroke-linecap': 'round' }));
+      if (opts.unknown) {
+        /* Nothing has been checked yet: an empty track and a dash, never a full "100 Good" arc
+           that would read as a clean bill of health. */
+        container.setAttribute('data-band', 'unknown');
+        s.appendChild(node('path', { d: d(1), fill: 'none', stroke: c.track, 'stroke-width': sw, 'stroke-linecap': 'round' }));
+        s.appendChild(node('text', { x: cx, y: cy - 8, 'text-anchor': 'middle', 'font-size': 34, 'font-weight': 700, fill: c.muted }, '–'));
+        s.appendChild(node('text', { x: cx, y: cy + 11, 'text-anchor': 'middle', 'font-size': 13, fill: c.muted, 'font-weight': 650, 'class': 'chart-caption' }, opts.label || 'not checked yet'));
+        return s;
+      }
+      /* 80+ is "good": drawn in the sage accent (the design's colour for all-is-well), not in
+         the low-severity moss, so a healthy score never looks like a finding. */
+      var band = frac >= 0.8 ? 'good' : frac >= 0.6 ? 'medium' : frac >= 0.4 ? 'high' : 'critical';
+      var color = band === 'good' ? c.accent : c[band];
+      var ink = band === 'good' ? cssVar('--accent-ink', '#2f5a4b') : c.ink[band];
+      container.setAttribute('data-band', band);
+      s.appendChild(node('path', { d: d(1), fill: 'none', stroke: c.track, 'stroke-width': sw, 'stroke-linecap': 'round' }));
+      if (frac > 0.001) {
+        /* The fill is drawn over a 3-unit-wider stroke in the severity ink, so the arc keeps a
+           >=4.5:1 edge against the track even for the light ochre and moss fills. */
+        s.appendChild(node('path', { d: d(frac), fill: 'none', stroke: ink, 'stroke-width': sw + 3, 'stroke-linecap': 'round' }));
+        s.appendChild(node('path', { d: d(frac), fill: 'none', stroke: color, 'stroke-width': sw, 'stroke-linecap': 'round' }));
+      }
       s.appendChild(node('text', { x: cx, y: cy - 8, 'text-anchor': 'middle', 'font-size': 34, 'font-weight': 700, fill: c.fg }, Math.round(v)));
-      s.appendChild(node('text', { x: cx, y: cy + 10, 'text-anchor': 'middle', 'font-size': 12, fill: color, 'font-weight': 600 }, opts.label || ''));
+      s.appendChild(node('text', { x: cx, y: cy + 11, 'text-anchor': 'middle', 'font-size': 13, fill: ink, 'font-weight': 650, 'class': 'chart-caption' }, opts.label || ''));
       return s;
     });
   }
@@ -416,6 +483,10 @@
     var mq = global.matchMedia('(prefers-color-scheme: dark)');
     if (mq.addEventListener) mq.addEventListener('change', redrawAll);
     else if (mq.addListener) mq.addListener(redrawAll);
+  }
+  /* A manual day/dusk toggle flips data-theme on <html>; redraw so the SVGs pick up the tokens. */
+  if (global.MutationObserver && global.document) {
+    new global.MutationObserver(redrawAll).observe(global.document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   }
 
   global.Charts = { bar: bar, groupedBar: groupedBar, line: line, sparkline: sparkline, donut: donut, gauge: gauge, colors: colors, redrawAll: redrawAll, fmt: fmt };

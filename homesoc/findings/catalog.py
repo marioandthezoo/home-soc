@@ -128,6 +128,12 @@ class FindingSpec:
     refs: list[str] = field(default_factory=list)
     category: str = "general"
     emits_per_subject: bool = True
+    # The one line a non-technical reader understands, sitting beside ``title`` (which stays the
+    # technical headline used by notifications, the CLI and the "Technical details" disclosure).
+    # It may use only placeholders the technical title uses, and it follows the same honesty rules
+    # as everything else here: nothing it says may be more certain than the evidence. "Why it
+    # matters" is ``rationale``; there is deliberately no second, friendlier rationale to drift.
+    plain_title: str = ""
 
 
 # --- reusable reference URLs -------------------------------------------------------------------
@@ -209,22 +215,29 @@ def _spec(
     id: str,
     severity: str,
     title: str,
+    plain_title: str,
     rationale: str,
     remediation: list[str],
     refs: list[str],
     category: str,
     per_subject: bool = True,
 ) -> FindingSpec:
+    """One catalog entry. Every entry is written as: ID, severity, technical title, plain title, why."""
     assert severity in SEVERITIES, id
-    return FindingSpec(id, severity, title, rationale, list(remediation), list(refs), category, per_subject)
+    assert plain_title and plain_title != title, id
+    return FindingSpec(id, severity, title, rationale, list(remediation), list(refs), category, per_subject,
+                       plain_title)
 
 
 _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Windows Defender (AV)
     _spec(
         "WIN-DEF-001", "critical", "Windows Defender antivirus is disabled",
-        "With no antivirus running, any file you download or open runs unchecked; ransomware and info-stealers "
-        "rely on exactly this. Windows 11 Home ships Defender for free, so there is no reason to run without it.",
+        "Windows' built-in antivirus (Defender) is switched off — check another antivirus is protecting this computer",
+        "Defender reports that it is switched off. Windows turns it off by itself when another antivirus is "
+        "installed, so first check whether one is protecting this computer; if none is, any file you download or "
+        "open runs unchecked, and ransomware and info-stealers rely on exactly this. Windows 11 Home ships "
+        "Defender for free, so there is no reason to run without any antivirus.",
         [
             _OPEN_VTP,
             "If a banner says another antivirus is installed, decide which one you want; uninstall the other so "
@@ -238,6 +251,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-002", "critical", "Defender real-time protection is off",
+        "Your antivirus is not checking files as they arrive",
         "Real-time protection is the part of Defender that stops malware the moment it lands on disk or runs; "
         "without it a scan only finds problems after the damage is done.",
         [
@@ -250,6 +264,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-003", "high", "Defender signatures are {age_days} days old",
+        "Your antivirus's list of known threats is {age_days} days old",
         "Defender receives new detections several times a day; stale signatures miss this week's malware even "
         "though the antivirus looks 'on'.",
         [
@@ -261,6 +276,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-004", "medium", "Defender tamper protection is off",
+        "Your antivirus settings are not locked against being switched off",
         "Tamper protection stops malware (or a bad script) from silently switching Defender off; it is a "
         "one-click safeguard that costs nothing.",
         [
@@ -274,6 +290,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-005", "medium", "Defender cloud-delivered protection is off",
+        "Your antivirus is not asking Microsoft about brand-new files",
         "Cloud protection lets Defender ask Microsoft about brand-new files in milliseconds, catching threats "
         "hours before a signature update ships.",
         [
@@ -285,6 +302,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-006", "low", "Defender PUA (potentially unwanted app) protection is off",
+        "Adware and junk bundled into free installers are not being blocked",
         "PUA protection blocks adware, bundled toolbars and crypto-miners that hide inside 'free' installers; "
         "they are not classic viruses so plain antivirus lets them through.",
         [
@@ -296,6 +314,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-007", "low", "No Defender full scan in the last 30 days",
+        "This computer has not had a full virus scan in the last 30 days",
         "Quick scans only look at common hiding spots; a periodic full scan checks every file, including old "
         "downloads and external drives.",
         [
@@ -306,6 +325,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-008", "low", "Defender controlled folder access is off",
+        "Ransomware protection for your Documents and Pictures folders is off",
         "Controlled folder access stops unknown programs from rewriting Documents, Pictures and Desktop, which "
         "is exactly what ransomware does first.",
         [
@@ -317,6 +337,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-009", "low", "Defender network protection is off",
+        "Windows is not blocking known-dangerous websites for apps outside the browser",
         "Network protection blocks connections to known-malicious domains from any app, not just the browser; "
         "it complements the Home SOC DNS filter for this PC.",
         [
@@ -328,6 +349,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-010", "low", "No Defender attack surface reduction (ASR) rules configured",
+        "Extra protection against booby-trapped documents and scripts is not set up",
         "ASR rules block the tricks most phishing malware uses (Office macros spawning programs, script "
         "droppers, credential theft from LSASS) and are free on Windows Home.",
         [
@@ -341,6 +363,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-011", "high", "Defender detected a threat: {threat_name}",
+        "Your antivirus caught a threat on this computer ({threat_name}): check it was removed",
         "Defender found and (usually) quarantined malware recently; you should confirm it was removed, find out "
         "how it arrived, and check nothing else came with it.",
         [
@@ -355,6 +378,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-012", "high", "Defender service is unhealthy ({state})",
+        "Your antivirus is not running properly ({state})",
         "The antivirus engine is not running or not reporting status; the PC may be unprotected even though "
         "nothing is visibly wrong.",
         [
@@ -367,6 +391,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-013", "info", "Smart App Control is off",
+        "Windows is not limiting this computer to apps with a good reputation",
         "Smart App Control only lets apps with a good reputation run, blocking most malware outright. It can "
         "only be enabled on a clean install of Windows 11, so this is informational if it is off.",
         [
@@ -381,6 +406,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-DEF-014", "info", "Defender cloud block level / sample submission is at the basic setting",
+        "Your antivirus is on its gentlest setting for files it has not seen before",
         "A higher cloud block level makes Defender more aggressive on unknown files with little downside for a "
         "home user; sample submission helps it learn from new threats.",
         [
@@ -392,6 +418,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Firewall
     _spec(
         "WIN-FW-001", "critical", "Windows Firewall is disabled for the {profile} profile",
+        "This computer's firewall is switched off on {profile} networks",
         "The firewall is the only thing stopping other devices (or a compromised gadget) on your network from "
         "reaching file shares and services on this PC.",
         [
@@ -404,6 +431,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-FW-002", "high", "Windows Firewall default inbound action is Allow ({profile})",
+        "This computer's firewall lets other devices in unless told otherwise ({profile})",
         "With inbound 'allow' by default, every listening program on this PC is reachable from the network, "
         "which defeats the purpose of having a firewall.",
         [
@@ -417,6 +445,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Updates
     _spec(
         "WIN-UPD-001", "medium", "{count} Windows updates are pending",
+        "Windows has {count} updates waiting to install",
         "Most malware exploits bugs that were already fixed; installing the pending updates (especially security "
         "and cumulative ones) closes those doors.",
         [
@@ -428,6 +457,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-UPD-002", "high", "Last cumulative Windows update was {days} days ago",
+        "Windows has not installed its monthly security update in {days} days",
         "Windows should receive a cumulative security update every month; going more than 45 days without one "
         "usually means updates are stuck or paused and known holes are open.",
         [
@@ -440,6 +470,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-UPD-003", "low", "Outdated app: {name} {version} (available {available})",
+        "An app on this computer is out of date: {name}",
         "Old versions of everyday apps keep known bugs that drive-by downloads and malicious documents exploit; "
         "updating them is the cheapest fix there is.",
         [
@@ -451,6 +482,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-UPD-004", "high", "Outdated high-risk app: {name} {version} (available {available})",
+        "An app that attackers often target is out of date: {name}",
         "This program (browser, runtime, archiver, remote-access or media tool) is a favourite exploit target; "
         "running an old version is one of the most common ways home PCs get compromised.",
         [
@@ -463,6 +495,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Accounts
     _spec(
         "WIN-ACC-001", "medium", "Your daily account '{user}' is an Administrator",
+        "You use an administrator account ('{user}') for everyday work",
         "Malware runs with the rights of the user who launched it; using a standard account for daily work means "
         "a bad click cannot install drivers, disable the antivirus or encrypt other users' files without a UAC prompt.",
         [
@@ -478,6 +511,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-ACC-002", "high", "Built-in Administrator account is enabled",
+        "The built-in Administrator account, which Windows keeps off, is switched on",
         "The built-in Administrator has no UAC prompts and a well-known name, making it the first account "
         "attackers try; Windows disables it by default for a reason.",
         [
@@ -489,6 +523,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-ACC-003", "high", "Guest account is enabled",
+        "The Guest account is on, so someone could sign in without a password",
         "The Guest account lets anyone on the network or at the keyboard sign in without a password and can be "
         "used as a foothold; it should stay disabled on Windows 11.",
         [
@@ -499,6 +534,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-ACC-004", "high", "Automatic logon is enabled",
+        "This computer signs itself in with no password needed",
         "Autologon stores your password in the registry in a recoverable form and lets anyone who powers on the "
         "PC straight into your session; a stolen laptop is then fully open.",
         [
@@ -513,6 +549,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-ACC-005", "high", "User Account Control (UAC) is off or set to never prompt",
+        "Programs can take full control of this computer without asking you",
         "UAC is the prompt that stops a program from silently becoming administrator; with it off, any malware "
         "you run owns the whole machine immediately.",
         [
@@ -527,6 +564,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Network services on the host
     _spec(
         "WIN-NET-001", "high", "SMBv1 file sharing protocol is enabled",
+        "This computer still has the outdated file-sharing method ransomware worms spread through",
         "SMBv1 is the 30-year-old protocol WannaCry and NotPetya spread through; nothing modern needs it and "
         "Microsoft removes it by default.",
         [
@@ -538,6 +576,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-NET-002", "medium", "Remote Desktop is enabled (Network Level Authentication: {nla})",
+        "Remote Desktop is on: this computer accepts remote sign-ins from the network",
         "Remote Desktop exposes a password login to the network; it is constantly brute-forced, and without "
         "Network Level Authentication an attacker can probe it before even entering a password.",
         [
@@ -553,6 +592,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-NET-003", "low", "SMB signing is not required",
+        "Shared-folder transfers on this computer are not protected against tampering",
         "Without SMB signing, a device on the same Wi-Fi can tamper with or relay file-sharing traffic; requiring "
         "it is a small hardening step with no visible cost at home.",
         [
@@ -565,6 +605,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-NET-004", "low", "LLMNR name resolution is enabled",
+        "This computer uses an old name-lookup method attackers on your network can abuse to capture password data",
         "LLMNR lets any device on the LAN answer 'who is FILESERVER?'; attackers use it to capture password "
         "hashes from a mistyped share name. Home networks resolve names fine without it.",
         [
@@ -578,6 +619,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-NET-005", "medium", "WinRM / Remote Registry is listening on the network ({port})",
+        "Windows remote management is open to the network (port {port})",
         "WinRM (5985/5986) and Remote Registry let anyone with your password run commands or edit the registry "
         "remotely; home PCs almost never need them switched on.",
         [
@@ -589,6 +631,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-NET-006", "low", "Unusual program listening on the LAN: port {port} ({process})",
+        "An unexpected program ({process}) is open to other devices on port {port}",
         "A program accepting connections from the network is an entry point; if you did not install it "
         "deliberately, it deserves a look.",
         [
@@ -605,6 +648,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ System
     _spec(
         "WIN-SYS-001", "medium", "Secure Boot is off",
+        "Secure Boot, which stops hidden malware loading before Windows, is off",
         "Secure Boot stops rootkits from loading before Windows starts; with it off, a bootkit can hide from "
         "every antivirus.",
         [
@@ -617,6 +661,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-002", "high", "BitLocker / device encryption is off",
+        "This computer's drive is not encrypted: if it is stolen, every file can be read",
         "If the laptop is lost or stolen, an unencrypted drive gives up every file, saved password and browser "
         "session to whoever plugs it into another PC.",
         [
@@ -630,6 +675,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-003", "low", "Virtualization-based security / memory integrity (HVCI) is not running",
+        "Memory integrity, which keeps bad drivers out of Windows, is not running",
         "Memory integrity keeps malicious drivers out of the Windows kernel, one of the few places antivirus "
         "cannot see. It is free on hardware that supports it.",
         [
@@ -642,6 +688,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-004", "medium", "LSA protection (RunAsPPL) is off",
+        "Your sign-in details held in memory are not protected from theft",
         "LSA holds your logon credentials in memory; without protection, tools like Mimikatz can dump them once "
         "they run as admin.",
         [
@@ -653,6 +700,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-005", "low", "Windows PowerShell 2.0 engine is enabled",
+        "An old version of PowerShell that malware uses to stay unseen is still installed",
         "PowerShell 2.0 has no script logging or AMSI antivirus hooks, so malware launches it on purpose to run "
         "unseen; nothing modern needs it.",
         [
@@ -664,6 +712,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-006", "medium", "SmartScreen is off",
+        "Windows will not warn you before you run a risky download",
         "SmartScreen warns before running downloaded programs and visiting known phishing pages; it is the "
         "layer that catches the 'invoice.exe' a user double-clicks.",
         [
@@ -676,6 +725,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-007", "low", "Screen lock is not enforced",
+        "This computer does not lock itself when you walk away",
         "An unlocked PC left on the desk exposes email, banking sessions and saved passwords to anyone walking "
         "by; an automatic lock after a few minutes costs nothing.",
         [
@@ -690,6 +740,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-SYS-008", "low", "TPM is absent or not ready",
+        "This computer's security chip is missing or not ready",
         "The TPM chip stores encryption keys and Windows Hello secrets in hardware; without it BitLocker, "
         "Secure Boot attestation and passkeys are weaker or unavailable.",
         [
@@ -703,6 +754,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Persistence
     _spec(
         "WIN-PER-001", "medium", "New autostart entry: {name}",
+        "A new program was set to start with Windows: {name}",
         "Programs that start with Windows are how malware survives a reboot; a new entry that appeared since the "
         "last check should be something you installed on purpose.",
         [
@@ -719,6 +771,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-PER-002", "medium", "New scheduled task: {name}",
+        "A new task was set to run automatically: {name}",
         "Scheduled tasks are a favourite way for malware and unwanted updaters to run silently in the "
         "background; new non-Microsoft tasks deserve a quick look.",
         [
@@ -732,6 +785,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "WIN-PER-003", "medium", "New auto-start service: {name}",
+        "A new background service was added: {name}",
         "A Windows service runs with high privileges before anyone logs in; a new one that is not from "
         "Microsoft or a driver you installed is a classic malware foothold.",
         [
@@ -747,6 +801,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ AV file checks
     _spec(
         "AV-FILE-001", "critical", "Malicious file in Downloads: {path}",
+        "Several antivirus engines say a file in your Downloads is malware: do not open it",
         "A file you downloaded recently is flagged as malware by multiple antivirus engines; if it has been "
         "opened, the PC may already be compromised.",
         [
@@ -760,6 +815,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "AV-FILE-002", "medium", "Suspicious file in Downloads: {path}",
+        "A few antivirus engines are wary of a file in your Downloads",
         "A few antivirus engines flag this download; it may be a false positive on an installer bundle, but "
         "check where it came from before opening it.",
         [
@@ -772,6 +828,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ POSIX hosts
     _spec(
         "POSIX-FW-001", "high", "Host firewall is inactive",
+        "This computer's firewall is switched off",
         "Without a host firewall, every listening service on this machine is reachable by any device on the "
         "network, including a compromised smart TV or a guest's phone.",
         [
@@ -784,6 +841,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "POSIX-UPD-001", "medium", "{count} system updates pending",
+        "This computer has {count} system updates waiting to install",
         "Unpatched packages are the most common way Linux and macOS machines get compromised; the fix is one "
         "command away.",
         [
@@ -795,6 +853,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "POSIX-SSH-001", "high", "SSH allows root login",
+        "Remote logins can go straight to the all-powerful root account",
         "Root login over SSH gives brute-force bots a guaranteed username to attack; disabling it and using "
         "sudo from a normal user removes half the attack.",
         [
@@ -806,6 +865,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "POSIX-ENC-001", "medium", "Disk is not encrypted",
+        "This computer's disk is not encrypted: if it is stolen, every file can be read",
         "A lost or stolen laptop with an unencrypted disk exposes every file and saved credential; full-disk "
         "encryption makes the drive useless without your password.",
         [
@@ -817,6 +877,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "POSIX-NET-001", "low", "Unusual service listening on the network: port {port} ({process})",
+        "An unexpected program ({process}) is open to other devices on port {port}",
         "A network-facing service you did not knowingly start is an entry point; confirm what it is and bind "
         "it to localhost or firewall it if it does not need LAN access.",
         [
@@ -829,6 +890,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Devices
     _spec(
         "NET-DEV-001", "medium", "New device on the network: {ip} ({vendor})",
+        "A device Home SOC has not seen before joined your network",
         "Every device on your Wi-Fi can reach every other device; an unknown one may be a neighbour using your "
         "Wi-Fi, a forgotten gadget with default passwords, or an intruder.",
         [
@@ -843,6 +905,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DEV-002", "info", "Device with unknown vendor or randomized MAC: {ip}",
+        "Home SOC cannot tell who made this device, so it may not recognise it next time",
         "Phones and laptops now randomise their Wi-Fi address for privacy, so this is usually harmless, but it "
         "means the inventory cannot recognise the device across reconnects.",
         [
@@ -855,6 +918,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DEV-003", "info", "Trusted device '{name}' has been offline for {days} days",
+        "'{name}' has not been seen on your network for {days} days",
         "A trusted device that has not been seen for a month is probably gone; keeping it trusted means a new "
         "device with the same address would be silently accepted.",
         [
@@ -865,6 +929,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DEV-004", "high", "{count} new devices appeared in one network scan",
+        "{count} new devices appeared at once: one gadget may be misbehaving",
         "A home network gains a device now and then, not dozens at once. A burst like this usually means one "
         "device is answering for many addresses with made-up hardware (MAC) addresses, which is how a "
         "compromised gadget floods or spoofs the network. Home SOC added {added} of them and held the other "
@@ -883,6 +948,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Services on LAN devices
     _spec(
         "NET-SVC-001", "critical", "Telnet open on {ip}:{port}",
+        "This device offers an old way to log in that has no encryption",
         "Telnet sends passwords in clear text and is the main way IoT botnets (Mirai and friends) take over "
         "cameras, routers and DVRs; nothing made in the last decade needs it.",
         [
@@ -895,6 +961,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-002", "high", "FTP open on {ip}:{port}",
+        "This device offers file transfer with no encryption",
         "FTP sends usernames and passwords unencrypted across the Wi-Fi and is frequently left with anonymous "
         "access enabled on NAS boxes and printers.",
         [
@@ -906,6 +973,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-003", "medium", "SMB file sharing on non-Windows device {ip}:{port}",
+        "This device shares files on your network: check who can open them",
         "A NAS, TV or camera exposing SMB may have guest access or an old vulnerable Samba build; file shares "
         "are what ransomware encrypts first.",
         [
@@ -917,6 +985,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-004", "medium", "Remote desktop (RDP/VNC) exposed on {ip}:{port}",
+        "This device offers remote control of its screen to the network",
         "Remote-control services are brute-forced constantly; VNC in particular often has no password or a "
         "trivial one, giving full control of the device.",
         [
@@ -927,6 +996,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-005", "low", "HTTP admin interface without HTTPS on {ip}:{port}",
+        "This device's admin page sends your password unencrypted when you sign in",
         "Logging in to a router or gadget over plain HTTP sends the admin password in clear text over Wi-Fi.",
         [
             "In the device's admin page look for an 'HTTPS only' / 'Secure web access' option and enable it.",
@@ -936,8 +1006,10 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-006", "medium", "UPnP / SSDP control port open on {ip}:{port}",
-        "UPnP lets any program on the network reconfigure the device without a password; on a router that "
-        "means malware can open holes to the internet.",
+        "This device answers UPnP requests from any device on your network",
+        "UPnP (Plug and Play) is designed to let programs on the network change a device's settings, such as "
+        "opening ports, without a password; on a router that can let malware open holes to the internet. Home "
+        "SOC saw the UPnP port answer; it did not test what the device allows.",
         [
             _ROUTER_ADMIN,
             "Find 'UPnP' (often under Advanced > NAT/Gaming or Firewall) and disable it; set up manual port forwards only for what you really need.",
@@ -947,6 +1019,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-007", "high", "Database port open on {ip}:{port} ({product})",
+        "A database on this device is open to the network",
         "Databases like MySQL, Redis and MongoDB often ship without a password; exposed on the LAN they hand "
         "over all their data to anyone who connects.",
         [
@@ -958,6 +1031,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-008", "low", "Printer raw port / IPP without authentication on {ip}:{port}",
+        "Any device on your network can reach this printer's print port, which may not ask for a password",
         "Raw port 9100 and unauthenticated IPP let anyone on the network print, read the job queue or, on some "
         "models, change settings and firmware.",
         [
@@ -969,6 +1043,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-009", "medium", "SNMP with default community on {ip}",
+        "This device's settings can be read with a factory-default password",
         "SNMP with the 'public' community string reveals the device's configuration, connected clients and "
         "sometimes lets an attacker change settings.",
         [
@@ -979,8 +1054,10 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-010", "medium", "RTSP camera stream exposed on {ip}:{port}",
-        "Camera streams with no or default passwords are indexed by public sites; anyone on the network (or "
-        "the internet, if forwarded) can watch.",
+        "This camera's video-stream service can be reached from your network (it may still ask for a password)",
+        "Camera streams with no or default passwords are indexed by public sites; if this one has no password, "
+        "anyone on the network (or the internet, if forwarded) can watch. Home SOC saw the stream port; it did "
+        "not test whether it asks for a password.",
         [
             "Open the camera's app or web page and set a unique strong password; disable RTSP if you only use the app.",
             "Ensure the router does NOT forward this port to the internet (check NET-WAN findings).",
@@ -990,6 +1067,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-011", "low", "Outdated SSH server on {ip}:{port} ({product} {version})",
+        "This device runs an old remote-login server, which usually means old firmware",
         "Old SSH builds carry known vulnerabilities and weak ciphers; on routers and NAS boxes it usually "
         "means the whole firmware is old.",
         [
@@ -1000,6 +1078,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-SVC-012", "info", "Device {ip} advertises its hardware model on the network ({exposed})",
+        "This device announces its exact model to every device on your network",
         "Broadcasting the exact model helps attackers pick the right exploit; it is normal for smart-home "
         "gear and only worth noting.",
         [
@@ -1011,8 +1090,9 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Vulnerabilities
     _spec(
         "NET-VUL-001", "critical", "Known exploited vulnerability {cve} on {ip} ({product} {version})",
-        "This CVE is on CISA's Known Exploited Vulnerabilities list, meaning criminals are actively using it "
-        "right now; devices running the affected version get taken over automatically.",
+        "This device runs software with a flaw attackers are known to have used in real attacks",
+        "This flaw is on CISA's list of flaws attackers are known to have used; devices on the affected version "
+        "are a common target for automated attacks. Home SOC matched it from the version the device reports.",
         [
             "Read the entry: https://www.cisa.gov/known-exploited-vulnerabilities-catalog?search_api_fulltext={cve}",
             "Update the device's firmware or the affected software ({product}) to a fixed version from the vendor.",
@@ -1022,6 +1102,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-VUL-002", "high", "Possible known-exploited vulnerability {cve} on {ip} ({product})",
+        "This device may run software with a flaw attackers are known to have used in real attacks",
         "The software matches a CISA KEV entry but the version could not be confirmed; assume it is vulnerable "
         "until the vendor says otherwise.",
         [
@@ -1032,6 +1113,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-VUL-003", "medium", "{count} known CVEs (max CVSS {max_cvss}) for {product} {version} on {ip}",
+        "Software on this device matches {count} published security flaws",
         "The service version on this device has published vulnerabilities rated high or critical; an update "
         "closes them all at once.",
         [
@@ -1043,8 +1125,10 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-VUL-004", "high", "Exploitation likely in the wild: {cves} on {ip}",
-        "EPSS estimates the chance a CVE is exploited in the wild within 30 days; above 50% it is effectively "
-        "being used by attackers now, so these come before the rest of the backlog.",
+        "Software on this device has flaws likely to be exploited somewhere in the next 30 days",
+        "EPSS estimates the chance a CVE is exploited somewhere in the wild within 30 days (it says nothing "
+        "about whether this home is targeted); above 50% it is among the flaws most likely to be exploited "
+        "soon, so these come before the rest of the backlog.",
         [
             "Update {product} {version} on {ip} (port {port}) as a priority - device admin page > Firmware update, "
             "or the vendor's download page for software.",
@@ -1056,6 +1140,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ WAN exposure
     _spec(
         "NET-WAN-001", "critical", "Port {port} is open to the internet on your public IP",
+        "An internet-wide scanner found port {port} open on your home internet address",
         "Something on your network is reachable from the whole internet; bots scan every public IP many times "
         "a day and will find and attack it.",
         [
@@ -1069,6 +1154,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-WAN-002", "critical", "Internet-facing vulnerabilities reported for your public IP: {vulns}",
+        "Internet-wide scanners list known flaws on your home internet address",
         "Shodan has fingerprinted an exposed service on your public IP with known vulnerabilities; this is the "
         "most likely way your network gets breached.",
         [
@@ -1082,6 +1168,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-WAN-003", "high", "UPnP port mapping: WAN {external_port} -> {internal_client}:{internal_port} ({description})",
+        "A device opened port {external_port} on your router to the internet by itself",
         "A device on your network opened a hole in the router by itself; games and consoles do this, but so "
         "does malware.",
         [
@@ -1093,6 +1180,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-RTR-002", "medium", "Router has UPnP (IGD) enabled",
+        "Your router lets devices open doors to the internet without asking",
         "With UPnP on, any program on any device can open ports on your router without asking; turning it "
         "off stops malware from exposing your network.",
         [
@@ -1105,6 +1193,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ Wi-Fi
     _spec(
         "NET-WIFI-001", "critical", "Wi-Fi '{ssid}' is open or uses WEP",
+        "Anyone nearby can get onto Wi-Fi '{ssid}': it is open or uses broken encryption",
         "Open and WEP networks let anyone nearby read your traffic and join your LAN; WEP can be cracked "
         "in minutes.",
         [
@@ -1116,6 +1205,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-WIFI-002", "info", "Wi-Fi '{ssid}' uses WPA2 without WPA3",
+        "Wi-Fi '{ssid}' could use the newer, stronger security setting",
         "WPA2 is still acceptable, but WPA3 protects against offline password guessing; enable it if your "
         "router and devices support it.",
         [
@@ -1126,6 +1216,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-WIFI-003", "high", "Wi-Fi '{ssid}' uses TKIP encryption",
+        "Wi-Fi '{ssid}' uses an old, weak kind of encryption",
         "TKIP is a 2003 stop-gap cipher with known attacks; modern devices support AES (CCMP) and it also "
         "slows your network down.",
         [
@@ -1136,6 +1227,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-WIFI-004", "info", "WPS appears to be enabled on '{ssid}'",
+        "Wi-Fi '{ssid}' seems to have WPS on, a join-by-PIN feature whose PIN can be guessed",
         "WPS PIN mode can be brute-forced in hours on many routers, bypassing your Wi-Fi password entirely.",
         [
             _ROUTER_ADMIN,
@@ -1146,6 +1238,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ DNS filter
     _spec(
         "NET-DNS-001", "info", "Devices are not using the Home SOC DNS filter",
+        "Most devices are not using Home SOC's web blocking yet",
         "The filter only protects devices that send their DNS queries to this PC; right now almost nobody "
         "does, so ads and malicious domains are not being blocked LAN-wide.",
         [
@@ -1158,6 +1251,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DNS-002", "high", "DNS resolver is not running ({reason})",
+        "Web blocking is not running ({reason})",
         "If devices point at this PC for DNS and the resolver is down, they lose internet access; if another "
         "program holds port 53, the filter cannot start.",
         [
@@ -1169,6 +1263,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DNS-003", "medium", "DNS blocklists are stale ({age_days} days)",
+        "Web blocking's lists of bad sites are {age_days} days old",
         "Malicious domains change daily; with old lists the filter misses this week's phishing and malware sites.",
         [
             "Open the Home SOC Overview page and click 'Update feeds'; check the Feeds table for errors.",
@@ -1179,8 +1274,13 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DNS-004", "high", "{client} tried to reach a malicious domain: {domain}",
-        "A device on your network asked for a domain known for malware, phishing or botnet control. The "
-        "request was blocked, but the device may already be infected or a user clicked a phishing link.",
+        "A device looked up a website known for malware or scams: {domain}",
+        # The reputation check runs after the answer has gone out (it must never delay a lookup, and
+        # only lookups that were answered are checked), so the lookup that raised this finding was
+        # NOT blocked; the domain is blocked from then on (dnsfilter/server.py _on_malicious).
+        "A device on your network asked for a domain known for malware, phishing or botnet control. The check "
+        "runs after the answer is sent, so that first lookup went through; Home SOC blocks the domain from then "
+        "on, but the device may already be infected or a user clicked a phishing link.",
         [
             "Identify the device {client} on the Devices page.",
             "If it is a PC: run a full Defender scan and check recent downloads; if a phone/IoT device: update it, review installed apps, or factory-reset it.",
@@ -1191,6 +1291,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DNS-005", "high", "DNS upstream resolvers are unreachable",
+        "Web blocking cannot reach its outside lookup services, so devices using it may lose internet",
         "The filter cannot answer queries it does not have cached, so devices using it are losing internet access.",
         [
             "Check the PC's own internet connection and that outbound UDP port 53 is not blocked by a VPN or firewall.",
@@ -1201,6 +1302,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DNS-006", "info", "Resolver is bound to the LAN but no firewall rule allows DNS in",
+        "Web blocking is running, but the firewall keeps other devices from using it",
         "Other devices cannot reach the filter until Windows Firewall allows inbound UDP/TCP 53; the resolver "
         "is running but only this PC benefits.",
         [
@@ -1218,6 +1320,7 @@ _SPECS: list[FindingSpec] = [
     # internet through the gateway). Nothing here may read as "we saw traffic".
     _spec(
         "NET-DEP-001", "info", "{name} has become load-bearing: {dependents} devices now depend on it",
+        "{name} has quietly become important: {dependents} devices now depend on it",
         "Nothing is wrong with this device. The point is that it quietly grew important: the dependency map "
         "now counts {dependents} others whose network path or whose services run through it, which is more than "
         "the threshold in your settings. A box that started as 'the thing in the cupboard' is now the thing that "
@@ -1242,6 +1345,7 @@ _SPECS: list[FindingSpec] = [
     _spec(
         "NET-DEP-002", "medium",
         "{name} is a single point of failure: {affected} devices have gone offline with it on {outages} separate occasions",
+        "{affected} devices have gone offline around the same time as {name}, on {outages} occasions",
         "This one is not modelled, it is remembered. On {dates}, {affected} devices dropped off the network in the "
         "same discovery cycle as {name} and came back with it. Home SOC only says this after watching it happen at "
         "least twice, so it is a pattern rather than a coincidence. There is nothing to patch here: the finding is "
@@ -1275,6 +1379,7 @@ _SPECS: list[FindingSpec] = [
     _spec(
         "NET-DEP-003", "info",
         "{name} keeps trying to reach {domain} and never gets through ({failures} lookups, every one blocked)",
+        "{name} keeps trying to look up {domain}, and web blocking stops it every time",
         "This device depends on {domain} for something, and across the whole window every single lookup was blocked "
         "and not one was ever answered. The device will not tell you that. Cameras, doorbells, plugs, televisions and "
         "speakers route their features through a vendor's cloud, and when that path is cut they usually keep their "
@@ -1303,6 +1408,7 @@ _SPECS: list[FindingSpec] = [
     # ------------------------------------------------------------------ SOC health
     _spec(
         "SOC-FEED-001", "medium", "Feed '{name}' has been failing for {hours} hours",
+        "Home SOC could not update its '{name}' threat list for {hours} hours",
         "Without fresh threat-intel feeds the DNS filter and vulnerability matching slowly go blind.",
         [
             "Open the Overview page > Feeds table and read the error for '{name}'.",
@@ -1313,6 +1419,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-FEED-002", "medium", "CISA KEV catalog is stale ({hours} hours)",
+        "Home SOC's list of flaws criminals are exploiting is {hours} hours old",
         "The KEV list is what turns 'a CVE exists' into 'criminals are exploiting this now'; a stale copy means "
         "new critical alerts are missed.",
         [
@@ -1323,6 +1430,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-SYS-001", "info", "nmap is not installed; using the built-in Python scanner",
+        "Home SOC is using its basic scanner, so it cannot tell software versions",
         "The fallback scanner finds open ports but cannot identify product versions, so vulnerability matching "
         "is much weaker.",
         [
@@ -1333,6 +1441,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-SYS-002", "info", "Home SOC is not running as administrator; skipped: {skipped}",
+        "Some checks were skipped because Home SOC is not running as administrator",
         "Some checks (Secure Boot, TPM, BitLocker, Security event log) need elevation; they show as 'needs admin' "
         "rather than pass/fail.",
         [
@@ -1345,6 +1454,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-SYS-003", "high", "Dashboard is reachable from the LAN without a token",
+        "Anyone on your Wi-Fi can open this dashboard without an access code",
         "Anyone on your Wi-Fi could open the dashboard, read your findings and device list, and trigger scans "
         "or change settings.",
         [
@@ -1360,6 +1470,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-LENS-001", "medium", "Lens is reachable on the LAN over plain HTTP",
+        "Lens on your phone is not set up with encryption, so it cannot be used safely",
         # The consequence depends on lens.require_https, so this says which is which rather than
         # asserting the worse one. With the shipped default (true) nothing crosses the network
         # at all — Lens refuses every plain-HTTP request from anything but this PC — and claiming
@@ -1383,6 +1494,7 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "SOC-SYS-004", "medium", "Scheduled job '{job}' keeps failing ({failures} times)",
+        "Part of Home SOC's monitoring keeps failing: '{job}' ({failures} times in a row)",
         "A job that fails repeatedly means part of the monitoring is silently not happening.",
         [
             "Open the Telemetry page > Jobs table and read the last error for '{job}'.",
@@ -1458,23 +1570,93 @@ def _fmt(template: str, values: SafeDict) -> str:
         return template
 
 
-def render(draft: Any) -> tuple[str, str]:
-    """Return (title, detail) for a FindingDraft-like object using the catalog templates."""
+class Rendered(tuple):
+    """``render()``'s result: still exactly the 2-tuple ``(title, detail)`` every caller unpacks,
+    with the plain-language headline riding along as ``.plain_title``.
+
+    A third tuple element would break ``title, detail = catalog.render(d)`` everywhere, so the
+    friendly line is an attribute instead. It is "" for an ID the catalog does not know, which
+    tells the caller to fall back to the technical title rather than inventing wording.
+    """
+
+    plain_title: str
+
+    def __new__(cls, title: str, detail: str, plain_title: str = "") -> "Rendered":
+        obj = super().__new__(cls, (title, detail))
+        obj.plain_title = plain_title
+        return obj
+
+    @property
+    def title(self) -> str:
+        return self[0]
+
+    @property
+    def detail(self) -> str:
+        return self[1]
+
+
+# Evidence is best-effort, so a placeholder can be present but empty ("({state})" -> "()"). The
+# technical title keeps that as-is (it is data), but the plain line is read by people who should not
+# have to parse an empty pair of brackets or quotes.
+_EMPTY_QUOTES = re.compile(r"\s*(?:'\s*'|“\s*”)")
+_EMPTY_PARENS = re.compile(r"\s*\(\s*\)")
+
+
+def _values(evidence: Any, subject: str) -> SafeDict:
+    values = SafeDict(_clean_evidence(_subject_fields(subject)))
+    values.update(_clean_evidence(evidence))
+    return values
+
+
+def _plain(spec: FindingSpec, values: SafeDict) -> str:
+    text = one_line(_fmt(spec.plain_title, values))
+    text = _EMPTY_PARENS.sub("", _EMPTY_QUOTES.sub("", text))
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def render(draft: Any) -> Rendered:
+    """Return (title, detail) for a FindingDraft-like object using the catalog templates.
+
+    The result also carries ``.plain_title`` (see ``Rendered``); unpacking it as a pair still works.
+    """
     spec = get(getattr(draft, "finding_id", ""))
     subject = str(getattr(draft, "subject", "") or "")
-    values = SafeDict(_clean_evidence(_subject_fields(subject)))
-    values.update(_clean_evidence(getattr(draft, "evidence", None)))
+    values = _values(getattr(draft, "evidence", None), subject)
     if spec is None:
         # SPEC-GAP: unknown IDs are tolerated (logged) so a typo in a scanner does not drop the finding.
         logger.warning("finding id %s is not in the catalog", getattr(draft, "finding_id", "?"))
         title = one_line(f"{getattr(draft, 'finding_id', 'UNKNOWN')} on {subject}")
         detail = getattr(draft, "detail", None) or json_evidence(values)
-        return title, detail
+        return Rendered(title, detail)
     # The title is always one line whatever the template or evidence holds: notifications and the
     # CLI print one finding per line.
     title = one_line(_fmt(spec.title, values))
     detail = getattr(draft, "detail", None) or _fmt(spec.rationale, values)
-    return title, detail
+    return Rendered(title, detail, _plain(spec, values))
+
+
+def render_plain_title(finding_id: str, evidence: dict[str, Any] | None = None, subject: str = "") -> str:
+    """The plain-language headline for a stored finding (``finding_id`` + evidence + subject).
+
+    Same interpolation and the same SafeDict/one-line protection as the technical title. Returns ""
+    for an unknown ID so the caller shows the technical title instead.
+    """
+    spec = get(finding_id)
+    if spec is None:
+        return ""
+    return _plain(spec, _values(evidence, subject))
+
+
+def render_why(finding_id: str, evidence: dict[str, Any] | None = None, subject: str = "") -> str:
+    """"Why it matters" for a stored finding: the catalog rationale with evidence filled in.
+
+    A few rationales carry placeholders (NET-DEP-*, NET-DEV-004), so the raw ``spec.rationale`` is
+    not display-ready on its own. Returns "" for an unknown ID.
+    """
+    spec = get(finding_id)
+    if spec is None:
+        return ""
+    return _fmt(spec.rationale, _values(evidence, subject))
 
 
 def render_remediation(finding_id: str, evidence: dict[str, Any] | None, subject: str = "") -> list[str]:
@@ -1482,18 +1664,17 @@ def render_remediation(finding_id: str, evidence: dict[str, Any] | None, subject
     spec = get(finding_id)
     if spec is None:
         return []
-    values = SafeDict(_clean_evidence(_subject_fields(subject)))
-    values.update(_clean_evidence(evidence))
+    values = _values(evidence, subject)
     return [_fmt(step, values) for step in spec.remediation]
 
 
 def placeholders(finding_id: str) -> set[str]:
-    """Every ``{field}`` name used by this ID's title and remediation steps."""
+    """Every ``{field}`` name used by this ID's title, plain title and remediation steps."""
     spec = get(finding_id)
     if spec is None:
         return set()
     names: set[str] = set()
-    for template in [spec.title, *spec.remediation]:
+    for template in [spec.title, spec.plain_title, *spec.remediation]:
         try:
             parsed = Formatter().parse(template)
             names.update(f for _, f, _, _ in parsed if f)

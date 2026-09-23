@@ -1,78 +1,150 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- Things to fix. Each row leads with the plain headline and why it matters; the technical title,
+    check ID, category and evidence sit one click away in "Technical details". Nothing is deleted.
+    Everything here is autoescaped; nothing from the database is marked safe. -#}
+
+{#- "8 days ago" (the |ago filter already speaks in words). -#}
+{% macro when(ts) -%}{{ ts|ago }}{%- endmacro %}
+
+{% set KIND_WORDS = {'accounts': 'User accounts', 'defender': 'Antivirus (Defender)', 'devices': 'Devices on your network',
+    'dns': 'Websites looked up', 'files': 'Downloaded files', 'firewall': 'Firewall',
+    'host-network': "This computer's network settings", 'lan-services': 'Open doors on devices',
+    'services': 'Open doors on devices', 'persistence': 'Programs that start by themselves',
+    'posix': "This computer's settings", 'soc': 'Home SOC itself', 'system': "This computer's system settings",
+    'topology': 'What depends on what', 'updates': 'Software updates', 'vulns': 'Known software flaws',
+    'wan': 'Seen from the internet', 'router': 'Your router', 'wifi': 'Wi-Fi'} %}
+
+{#- With no ?status= at all (the nav link, a bookmark), the page opens on "Needs attention".
+    An explicit ?status= (empty = everything) is always honoured. -#}
+{% set status_given = 'status' in request.args %}
+{% set current = filters.status if status_given else 'open' %}
+{% set rows = findings if status_given else findings|selectattr('status', 'equalto', 'open')|list %}
+
+{% macro tab_href(st) -%}
+/findings?{{ ([('status', st)]
+  + ([('severity', filters.severity)] if filters.severity else [])
+  + ([('category', filters.category)] if filters.category else [])
+  + ([('q', filters.q)] if filters.q else []))|urlencode }}
+{%- endmacro %}
+
 {% block content %}
-<div class="sev-counts" aria-label="Open findings by severity">
-  {% for sv in severities %}<a href="/findings?status=open&severity={{ sv }}">{{ badge(sv, counts.open[sv] ~ ' ' ~ sv) }}</a>{% endfor %}
-  <span class="muted small">open · {{ counts.acknowledged.values()|sum }} acknowledged · {{ counts.resolved.values()|sum }} resolved · {{ counts.suppressed.values()|sum }} suppressed</span>
+<nav class="chips filter-tabs" aria-label="Show things by status">
+  {% for st in statuses %}
+  {% set n = counts[st].values()|sum if counts[st] is defined else 0 %}
+  <a class="chip chip-kind{% if current == st %} chip-on{% endif %}" href="{{ tab_href(st) }}"{% if current == st %} aria-current="page"{% endif %} title="Status: {{ st }}{% if st == 'resolved' and fixed_split is defined %}. {{ fixed_split.confirmed }} confirmed gone by a later check; {{ fixed_split.marked }} only marked fixed{% endif %}">{{ st|status_word }} <b>{{ n }}</b>{% if st == 'resolved' and fixed_split is defined and n %} <span class="chip-note">· {{ fixed_split.confirmed }} confirmed</span>{% endif %}</a>
+  {% endfor %}
+  <a class="chip chip-kind{% if current == '' %} chip-on{% endif %}" href="{{ tab_href('') }}"{% if current == '' %} aria-current="page"{% endif %}>Everything</a>
+</nav>
+
+<div class="sev-counts h-mt" aria-label="Needing attention, by how urgent they are">
+  {% for sv in severities %}{% set n = counts.open[sv] or 0 %}<a href="/findings?status=open&severity={{ sv }}" title="{{ n }} {{ sv }} findings need attention">{{ ui.sev_badge(sv, n) }}</a>{% endfor %}
 </div>
 
-<form class="filters" method="get" action="/findings" data-submit-on-change>
-  <label>Status
-    <select name="status">
-      <option value="">any</option>
-      {% for st in statuses %}<option value="{{ st }}"{% if filters.status == st %} selected{% endif %}>{{ st }}</option>{% endfor %}
-    </select>
-  </label>
-  <label>Severity
+<form class="filters h-mt" method="get" action="/findings">
+  <input type="hidden" name="status" value="{{ current }}">
+  <label>How urgent
     <select name="severity">
       <option value="">any</option>
-      {% for sv in severities %}<option value="{{ sv }}"{% if filters.severity == sv %} selected{% endif %}>{{ sv }}</option>{% endfor %}
+      {% for sv in severities %}<option value="{{ sv }}"{% if filters.severity == sv %} selected{% endif %}>{{ sv|sev_word }} ({{ sv }})</option>{% endfor %}
     </select>
   </label>
-  <label>Category
+  <label>Kind
     <select name="category">
       <option value="">any</option>
-      {% for cat in categories %}<option value="{{ cat }}"{% if filters.category == cat %} selected{% endif %}>{{ cat }}</option>{% endfor %}
+      {% for cat in categories %}<option value="{{ cat }}"{% if filters.category == cat %} selected{% endif %} title="category: {{ cat }}">{{ KIND_WORDS.get(cat, cat) }}</option>{% endfor %}
     </select>
   </label>
-  <input type="search" name="q" value="{{ filters.q }}" placeholder="search title, subject, id…">
-  <button class="btn" type="submit">Apply</button>
-  <input type="search" placeholder="filter shown rows" data-filter="#findings-table" aria-label="Filter rows">
-  <span class="muted small" data-filter-count="findings-table">{{ findings|length }} shown</span>
-  <button class="btn btn-sm" type="button" data-action="findings-ack-shown" title="Acknowledge every open finding currently listed (after filtering)">Acknowledge all shown</button>
+  <input type="search" name="q" value="{{ filters.q }}" placeholder="Search…" aria-label="Search what's wrong, a device or a check ID" title="Search what's wrong, a device or a check ID">
+  <button class="btn" type="submit">Search</button>
+  <span class="muted small">{{ rows|length }} shown</span>
+  {% if current == 'open' and rows %}<button class="btn btn-sm" type="button" data-action="findings-ack-shown" title="Marks every row shown here as seen (acknowledged). They stay on the list until they are fixed.">Mark all shown as seen</button>{% endif %}
 </form>
 
 <section class="card">
+  <p class="muted small">Select a row (or its title, with the keyboard) to see what Home SOC found and how to fix it.</p>
   <div class="tbl-wrap">
   <table class="tbl" id="findings-table" data-filterable>
-    <thead><tr><th>Severity</th><th>Finding</th><th>Subject</th><th>Status</th><th class="num">Seen</th><th>Last seen</th></tr></thead>
+    <thead><tr><th>How urgent</th><th>What's wrong</th><th>Where</th><th>Status</th><th>Last seen</th></tr></thead>
     <tbody>
-      {% for f in findings %}
+      {% for f in rows %}
+      {% set headline = f.plain_title or f.title %}
+      {% set why = f.rationale if f.rationale and '{' not in f.rationale else '' %}
+      {% set where = f.device_label or f|device_label %}
       <tr class="expandable" data-id="{{ f.id }}" data-status="{{ f.status }}" data-severity="{{ f.severity }}" data-category="{{ f.category }}">
-        <td>{{ sev(f.severity) }}</td>
-        <td class="wrap"><b>{{ f.title }}</b><br><span class="mono muted small">{{ f.finding_id }}</span> <span class="muted small">· {{ f.category }}</span></td>
-        <td class="mono wrap">{% if f.device_id %}<a href="/devices/{{ f.device_id }}">{{ f.device_name }}</a> <span class="muted">{{ f.device_ip or '' }}</span>{% else %}{{ f.subject }}{% endif %}</td>
-        <td><span class="badge status-badge badge-{{ f.status }}">{{ f.status }}</span></td>
-        <td class="num">{{ f.occurrences }}</td>
-        <td class="nowrap" title="{{ f.last_seen|ts }}">{{ f.last_seen|ago }}</td>
+        <td>{{ ui.sev_badge(f.severity) }}</td>
+        <td class="wrap"><button type="button" class="row-toggle" aria-expanded="false" aria-controls="detail-{{ f.id }}"><b class="plain-title">{{ headline }}</b></button>{% if why %}<div class="plain-why">{{ why }}</div>{% endif %}</td>
+        <td class="wrap">
+          {%- if f.link_device_id is not none and f.link_device_id is defined -%}<a href="/devices/{{ f.link_device_id }}"{% if where.startswith('Unnamed') %} class="device-unnamed"{% endif %}>{{ where }}</a>
+          {%- elif f.device_id -%}<a href="/devices/{{ f.device_id }}">{{ where }}</a>
+          {%- else -%}{{ where }}{%- endif -%}
+          {%- if f.device_ip and f.device_ip != where %}<br><span class="device-ip">{{ f.device_ip }}</span>{% endif -%}
+        </td>
+        <td>{{ ui.status_chip(f.status, f) }}</td>
+        <td class="nowrap" title="Last seen {{ f.last_seen|ts }}; found by {{ f.occurrences }} check{{ '' if f.occurrences == 1 else 's' }}">{{ when(f.last_seen) }}<br><span class="muted small">found {{ f.occurrences }} time{{ '' if f.occurrences == 1 else 's' }}</span></td>
       </tr>
-      <tr class="detail-row" hidden>
-        <td colspan="6">
+      <tr class="detail-row" id="detail-{{ f.id }}" hidden>
+        <td colspan="5" class="wrap">
           <div class="detail">
             <div>
-              <h4>Detail</h4>
-              <p>{{ f.detail or f.rationale or 'No additional detail.' }}</p>
-              {% if f.detail and f.rationale %}<p class="muted small">{{ f.rationale }}</p>{% endif %}
-              <p class="muted small">subject <span class="mono">{{ f.subject }}</span> · source {{ f.source }} · first seen {{ f.first_seen|ts }}{% if f.resolved_at %} · resolved {{ f.resolved_at|ts }}{% endif %}</p>
-              <h4>Evidence</h4>
-              {% if f.evidence_pretty %}<pre>{{ f.evidence_pretty }}</pre>{% else %}<p class="muted small">none</p>{% endif %}
+              <h4>What Home SOC found</h4>
+              <p>{{ f.detail or headline }}</p>
             </div>
             <div>
-              <h4>Remediation</h4>
+              <h4>How to fix it</h4>
               {% if f.remediation %}<ol>{% for step in f.remediation %}<li>{{ step }}</li>{% endfor %}</ol>
-              {% else %}<p class="muted small">No remediation steps available (findings catalog not loaded).</p>{% endif %}
-              {% if f.refs %}<h4>References</h4><ul>{% for r in f.refs %}<li>{% if r.startswith('http') %}<a href="{{ r }}" target="_blank" rel="noopener noreferrer">{{ r }}</a>{% else %}{{ r }}{% endif %}</li>{% endfor %}</ul>{% endif %}
+              {% else %}<p class="muted small">Home SOC has no steps recorded for this one (the findings catalogue is not loaded).</p>{% endif %}
               <div class="actions">
-                {% if f.status != 'acknowledged' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="acknowledged">Acknowledge</button>{% endif %}
-                {% if f.status != 'resolved' %}<button class="btn btn-sm btn-ok" data-action="finding-status" data-id="{{ f.id }}" data-status="resolved">Resolve</button>{% endif %}
-                {% if f.status != 'suppressed' %}<button class="btn btn-sm btn-danger" data-action="finding-status" data-id="{{ f.id }}" data-status="suppressed">Suppress</button>{% endif %}
-                {% if f.status != 'open' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="open">Reopen</button>{% endif %}
+                {% if f.status == 'open' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="acknowledged" title="Keeps it on the list, marked as seen (acknowledged)">I've seen this</button>{% endif %}
+                {% if f.status != 'resolved' %}<button class="btn btn-sm btn-ok" data-action="finding-status" data-id="{{ f.id }}" data-status="resolved" title="{{ 'Home SOC checks again on the next scan and reopens it if it is still there' if f.rechecks is not defined or f.rechecks else 'Home SOC cannot re-check this one; it stays closed until it happens again' }}">I've fixed it</button>{% endif %}
+                {% if f.status != 'suppressed' %}<button class="btn btn-sm" type="button" data-action="toggle" data-target="#ignore-{{ f.id }}" data-label-alt="Keep listing it" aria-expanded="false" aria-controls="ignore-{{ f.id }}" title="Hides it for good (suppressed). Asks you first.">Ignore this from now on…</button>{% endif %}
+                {% if f.status != 'open' %}<button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="open" title="Puts it back on the Needs attention list (open)">Put it back on the list</button>{% endif %}
               </div>
+              {% if f.status != 'suppressed' %}
+              <div class="card ignore-confirm h-mt" id="ignore-{{ f.id }}" hidden>
+                <p><b>Stop listing this?</b> Home SOC will hide it from now on, even if a later check finds it
+                  again. It is not fixed by ignoring it. You can bring it back from the
+                  <a class="link" href="/findings?status=suppressed">{{ 'suppressed'|status_word }}</a> list.</p>
+                <button class="btn btn-sm" data-action="finding-status" data-id="{{ f.id }}" data-status="suppressed">Yes, ignore it</button>
+              </div>
+              {% endif %}
             </div>
           </div>
+          {% call ui.tech_details() %}
+          <div class="detail">
+            <div>
+              {% if f.plain_title and f.plain_title != f.title %}<h4>Technical title</h4><p>{{ f.title }}</p>{% endif %}
+              <h4>Check</h4>
+              <p class="small"><span class="mono">{{ f.finding_id }}</span> · category {{ f.category }} ({{ KIND_WORDS.get(f.category, f.category) }}) · severity {{ f.severity }} · status {{ f.status }}</p>
+              <p class="muted small">subject <span class="mono">{{ f.subject }}</span> · source {{ f.source }} · first seen {{ f.first_seen|ts }} · last seen {{ f.last_seen|ts }}{% if f.resolved_at %} · resolved {{ f.resolved_at|ts }}{% endif %}</p>
+              {% if f.refs %}<h4>References</h4><ul>{% for r in f.refs %}<li>{% if r.startswith('http') %}<a href="{{ r }}" target="_blank" rel="noopener noreferrer">{{ r }}</a>{% else %}{{ r }}{% endif %}</li>{% endfor %}</ul>{% endif %}
+            </div>
+            <div>
+              <h4>Evidence</h4>
+              {% if f.evidence_pretty %}<pre>{{ f.evidence_pretty }}</pre>{% else %}<p class="muted small">none recorded</p>{% endif %}
+            </div>
+          </div>
+          {% endcall %}
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="empty">No findings match. {% if not filters.status and not filters.severity and not filters.q %}Run a scan to populate this list.{% endif %}</td></tr>
+      <tr><td colspan="5" class="empty">
+        {%- if filters.severity or filters.category or filters.q -%}
+          Nothing matches these filters. <a class="link" href="/findings?status={{ current }}">Clear the filters</a>
+        {%- elif current == 'open' and staleness.never -%}
+          Nothing to show yet: Home SOC hasn't checked your network. Start a check from <a class="link" href="/">Home</a>.
+        {%- elif current == 'open' -%}
+          Nothing needs your attention right now.{% if staleness.stale %} (Home SOC last checked your network {{ staleness.age_text }}, so this may be out of date.){% endif %}
+        {%- elif current == 'acknowledged' -%}
+          Nothing is marked as seen and still waiting to be fixed.
+        {%- elif current == 'resolved' -%}
+          Nothing has been fixed yet.
+        {%- elif current == 'suppressed' -%}
+          You haven't told Home SOC to ignore anything.
+        {%- else -%}
+          Home SOC hasn't found anything yet.
+        {%- endif -%}
+      </td></tr>
       {% endfor %}
     </tbody>
   </table>

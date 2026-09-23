@@ -93,6 +93,16 @@ class FeedItem:
     def as_dict(self) -> dict:
         return asdict(self)
 
+    @property
+    def device_label(self) -> str | None:
+        """The device this item is about, by name ("Ellie's iPhone", "Unnamed camera").
+
+        Carried in ``ref`` so the item's top-level JSON shape (which feed readers and the API
+        contract pin) is unchanged; ``None`` for network-wide items (scans, list updates).
+        """
+        value = self.ref.get("device_label") if isinstance(self.ref, dict) else None
+        return str(value) if value else None
+
 
 # --------------------------------------------------------------------------- helpers
 
@@ -254,12 +264,14 @@ def _findings_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
         conn,
         "SELECT e.id AS event_id, e.event, e.at, e.note, f.id AS row_id, f.finding_id, f.title, f.severity, "
         "f.subject, f.detail, f.first_seen, f.resolved_at, f.device_id, "
-        "COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name "
+        "COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name, d.ip AS device_ip, "
+        "d.nickname AS device_nickname, d.hostname AS device_hostname, d.kind AS device_kind "
         "FROM finding_events e JOIN findings f ON f.id=e.finding_row_id "
         "LEFT JOIN devices d ON d.id=f.device_id "
         f"WHERE 1=1{where} ORDER BY e.at DESC, e.id DESC LIMIT ?",
         params + [q.cap],
     )
+    api.label_subject_rows(conn, data)  # device_label: "Unnamed camera", "This computer (Home PC)"
     out: list[FeedItem] = []
     for r in data:
         mapped = _FINDING_EVENTS.get(str(r.get("event") or "").lower())
@@ -277,7 +289,7 @@ def _findings_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             span = _open_for(r.get("first_seen"), r.get("at"))
             if span:
                 title += f" ({span})"
-        bits = [b for b in (r.get("device_name"), r.get("note")) if b]
+        bits = [b for b in (r.get("device_label"), r.get("note")) if b]
         detail = " · ".join(str(b) for b in bits) or str(r.get("detail") or "")
         out.append(
             FeedItem(
@@ -293,6 +305,8 @@ def _findings_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
                     "finding_id": r.get("finding_id"),
                     "device_id": r.get("device_id"),
                     "subject": r.get("subject"),
+                    "device_label": r.get("device_label"),
+                    "link_device_id": r.get("link_device_id"),
                 },
             )
         )
@@ -308,25 +322,28 @@ def _devices_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             params = params + [q.device.device_id]
         for r in api.rows(
             conn,
-            "SELECT id, ip, mac, vendor, COALESCE(nickname, hostname, ip, mac) AS name, first_seen "
+            "SELECT id, ip, mac, vendor, nickname, hostname, kind, first_seen "
             f"FROM devices WHERE 1=1{where} ORDER BY first_seen DESC LIMIT ?",
             params + [q.cap],
         ):
             ts = _iso(r.get("first_seen"))
             if ts is None:
                 continue
+            # Name first, then the address and maker: "Unnamed camera (192.168.1.142, Acme)", not
+            # the IP twice as "192.168.1.142 (192.168.1.142)" for a device with no name.
+            label = api.device_label(r)
             where_bits = ", ".join(str(b) for b in (r.get("ip"), r.get("vendor")) if b)
             out.append(
                 FeedItem(
                     ts=ts,
                     kind="device_new",
                     severity="medium",
-                    title=f"New device joined the network: {r.get('name') or 'unknown'}"
+                    title=f"New device joined the network: {label}"
                     + (f" ({where_bits})" if where_bits else ""),
                     detail=f"MAC {r.get('mac')}" if r.get("mac") else "",
                     link=f"/devices/{int(r['id'])}",
                     icon="device",
-                    ref={"device_id": int(r["id"]), "ip": r.get("ip"), "mac": r.get("mac")},
+                    ref={"device_id": int(r["id"]), "ip": r.get("ip"), "mac": r.get("mac"), "device_label": label},
                 )
             )
     if q.wants("device_offline"):
@@ -336,23 +353,24 @@ def _devices_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             params = params + [q.device.device_id]
         for r in api.rows(
             conn,
-            "SELECT id, ip, COALESCE(nickname, hostname, ip, mac) AS name, last_seen "
+            "SELECT id, ip, mac, nickname, hostname, kind, last_seen "
             f"FROM devices WHERE online=0{where} ORDER BY last_seen DESC LIMIT ?",
             params + [q.cap],
         ):
             ts = _iso(r.get("last_seen"))
             if ts is None:
                 continue
+            label = api.device_label(r)
             out.append(
                 FeedItem(
                     ts=ts,
                     kind="device_offline",
                     severity="info",
-                    title=f"Device went offline: {r.get('name') or 'unknown'}",
+                    title=f"Device went offline: {label}",
                     detail=f"last seen at {r.get('ip')}" if r.get("ip") else "",
                     link=f"/devices/{int(r['id'])}",
                     icon="device",
-                    ref={"device_id": int(r["id"]), "ip": r.get("ip")},
+                    ref={"device_id": int(r["id"]), "ip": r.get("ip"), "device_label": label},
                 )
             )
     return out
@@ -446,11 +464,13 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
         return []  # DNS rows are keyed on the client address; with none there is nothing to match
     client_where = " AND client=?" if q.device is not None else ""
     client_param: list[Any] = [q.device.ip] if q.device is not None else []
+    threats: list[dict] = []
+    grouped: list[dict] = []
     if q.wants("dns_threat"):
         where, params = q.window("ts")
         where += client_where
         params = params + client_param
-        for r in api.rows(
+        threats = api.rows(
             conn,
             # Addendum A2.1 describes these reasons as `threat:...` / `reputation:...`, but
             # dnsfilter/policy.py writes the bare string "reputation" (Decision("block",
@@ -461,22 +481,7 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             f"(reason LIKE 'threat:%' OR reason = 'reputation' OR reason LIKE 'reputation:%')"
             f"{where} ORDER BY ts DESC, id DESC LIMIT ?",
             params + [q.cap],
-        ):
-            ts = _iso(r.get("ts"))
-            if ts is None:
-                continue
-            out.append(
-                FeedItem(
-                    ts=ts,
-                    kind="dns_threat",
-                    severity="high",
-                    title=f"Blocked a known-malicious domain: {r.get('qname')} requested by {r.get('client')}",
-                    detail=str(r.get("reason") or ""),
-                    link=f"/dns?client={r.get('client') or ''}&q={r.get('qname') or ''}",
-                    icon="threat",
-                    ref={"client": r.get("client"), "domain": r.get("qname"), "reason": r.get("reason")},
-                )
-            )
+        )
     if q.wants("dns_block"):
         where, params = q.window("ts")
         where += client_where
@@ -494,6 +499,37 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             "GROUP BY client, qname, hour ORDER BY ts DESC LIMIT ?",
             params + [max(q.cap * 4, 200)],
         )
+
+    # Clients are addresses; say which device each one is. One lookup for the whole page.
+    names = api.device_labels_by_ip(conn, [r.get("client") for r in threats + grouped])
+
+    def who(client: Any) -> tuple[str, str | None, int | None]:
+        """("Ellie's iPhone (192.168.1.32)", label, device_id); the bare address when unknown."""
+        ip = str(client or "")
+        hit = names.get(ip)
+        if hit is None:
+            return ip or "an unknown device", ("Unnamed device" if ip else None), None
+        return f"{hit['device_label']} ({ip})", hit["device_label"], hit["device_id"]
+
+    for r in threats:
+        ts = _iso(r.get("ts"))
+        if ts is None:
+            continue
+        shown, label, device_id = who(r.get("client"))
+        out.append(
+            FeedItem(
+                ts=ts,
+                kind="dns_threat",
+                severity="high",
+                title=f"Blocked a known-malicious domain: {r.get('qname')} requested by {shown}",
+                detail=_block_reason_words(str(r.get("reason") or "")),
+                link=f"/dns?client={r.get('client') or ''}&q={r.get('qname') or ''}",
+                icon="threat",
+                ref={"client": r.get("client"), "domain": r.get("qname"), "reason": r.get("reason"),
+                     "device_label": label, "device_id": device_id},
+            )
+        )
+    if grouped:
         buckets: dict[tuple[str, str, str], dict] = {}
         for r in grouped:
             domain = registrable_domain(r.get("qname"))
@@ -511,20 +547,22 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
                 continue
             reason = str(b["reason"] or "")
             severity = "medium" if any(t in reason.lower() for t in THREAT_LISTS) else "info"
-            names = sorted(b["names"])
-            detail = f"list: {reason}" if reason else ""
-            if len(names) > 1:
-                detail = (detail + " · " if detail else "") + f"{len(names)} names, e.g. {names[0]}"
+            qnames = sorted(b["names"])
+            detail = _block_reason_words(reason)
+            if len(qnames) > 1:
+                detail = (detail + " · " if detail else "") + f"{len(qnames)} names, e.g. {qnames[0]}"
+            shown, label, device_id = who(client)
             out.append(
                 FeedItem(
                     ts=b["ts"],
                     kind="dns_block",
                     severity=severity,
-                    title=f"Blocked {_plural(b['hits'], 'request')} to {domain or 'a domain'} from {client}",
+                    title=f"Blocked {_plural(b['hits'], 'request')} to {domain or 'a domain'} from {shown}",
                     detail=detail,
                     link=f"/dns?client={client}&q={domain}",
                     icon="dns",
-                    ref={"client": client, "domain": domain, "hour": hour, "hits": b["hits"]},
+                    ref={"client": client, "domain": domain, "hour": hour, "hits": b["hits"],
+                         "device_label": label, "device_id": device_id},
                 )
             )
     return out
@@ -795,3 +833,159 @@ def feed_counts(conn: sqlite3.Connection, hours: int = 24) -> dict[str, int]:
 
 def newest_ts(items: list[FeedItem]) -> str | None:
     return items[0].ts if items else None
+
+
+# --------------------------------------------------------------------------- plain language
+
+#: kind -> the chip's words for someone who does not read "finding_ack". The technical label in
+#: KIND_TABLE stays; this sits beside it.
+PLAIN_LABEL_BY_KIND: dict[str, str] = {
+    "finding_new": "New problems found",
+    "finding_reopened": "Problems that came back",
+    "finding_resolved": "Marked fixed",
+    "finding_auto_resolved": "Fixed and re-checked",
+    "finding_ack": "Marked as seen",
+    "finding_suppressed": "Ignored",
+    "device_new": "New devices",
+    "device_offline": "Devices that went offline",
+    "scan": "Checks run",
+    "feed_update": "Threat lists updated",
+    "dns_block": "Websites blocked",
+    "dns_threat": "Dangerous websites blocked",
+    "av_threat": "Antivirus detections",
+    "notification": "Alerts sent",
+    "system": "Home SOC messages",
+}
+#: The same words for a count of one ("1 Home SOC message", not "1 Home SOC messages").
+PLAIN_LABEL_ONE_BY_KIND: dict[str, str] = {
+    "finding_new": "New problem found",
+    "finding_reopened": "Problem that came back",
+    "finding_resolved": "Marked fixed",
+    "finding_auto_resolved": "Fixed and re-checked",
+    "finding_ack": "Marked as seen",
+    "finding_suppressed": "Ignored",
+    "device_new": "New device",
+    "device_offline": "Device that went offline",
+    "scan": "Check run",
+    "feed_update": "Threat list updated",
+    "dns_block": "Website blocked",
+    "dns_threat": "Dangerous website blocked",
+    "av_threat": "Antivirus detection",
+    "notification": "Alert sent",
+    "system": "Home SOC message",
+}
+
+
+def _block_reason_words(reason: str) -> str:
+    """Why a look-up was refused, in words, with the technical reason kept beside it."""
+    reason = (reason or "").strip()
+    if not reason:
+        return ""
+    if reason.startswith("list:"):
+        name = reason[5:]
+        kind = "a threat list" if name in THREAT_LISTS else "a blocklist"
+        return f"On {kind} ({reason})"
+    if reason.startswith("override"):
+        return f"You chose to always block it ({reason})"
+    if reason == "reputation":
+        return "Security services flagged it as dangerous (reputation)"
+    return f"Reason: {reason}"
+
+
+def feed_chips(counts: dict[str, int] | None) -> list[dict]:
+    """The header chips as data: ``[{kind, label, plain_label, count, zero, icon}]`` in table order.
+
+    ``zero`` flags a chip the page should hide (or render with ``.quiet-badge``): a row of "0 New
+    finding · 0 Defender detection" chips is noise on a quiet day, not information.
+    """
+    counts = counts or {}
+    out = []
+    for kind, label, icon in KIND_TABLE:
+        try:
+            n = max(0, int(counts.get(kind, 0) or 0))
+        except (TypeError, ValueError):
+            n = 0
+        words = PLAIN_LABEL_ONE_BY_KIND if n == 1 else PLAIN_LABEL_BY_KIND
+        out.append({"kind": kind, "label": label, "plain_label": words.get(kind, PLAIN_LABEL_BY_KIND.get(kind, label)),
+                    "count": n, "zero": n == 0, "icon": icon})
+    return out
+
+
+def _window_words(hours: int | None) -> str:
+    if not hours:
+        return "so far"
+    if hours == 1:
+        return "in the last hour"
+    if hours % 24 == 0 and hours >= 48:
+        return f"in the last {hours // 24} days"
+    return f"in the last {hours} hours"
+
+
+def _ever_ran(conn: sqlite3.Connection) -> bool:
+    """Has Home SOC ever recorded anything at all? Cheap EXISTS probes, no table scans."""
+    for table in ("scans", "findings", "devices", "events"):
+        if api.scalar(conn, f"SELECT EXISTS(SELECT 1 FROM {table})", default=0):
+            return True
+    return False
+
+
+def feed_empty_state(
+    conn: sqlite3.Connection,
+    total: int,
+    *,
+    window_hours: int | None = 24,
+    filtered: bool = False,
+    cfg: Any = None,
+) -> dict:
+    """Why the Activity page is empty, so it can say so honestly.
+
+    ``reason`` is one of:
+
+    * ``None`` — the window has items; nothing to explain;
+    * ``"never_run"`` — Home SOC has not recorded anything yet;
+    * ``"filtered"`` — the filters exclude everything in the window;
+    * ``"not_checking"`` — the window is empty *and* the last network check is stale, so the quiet
+      may only mean Home SOC is not looking (a quiet screen must not read as a safe one);
+    * ``"quiet"`` — checks are running and simply nothing happened: normal.
+
+    Also returns ``message`` (one plain sentence), ``last_activity`` (newest item of any age, ISO,
+    or ``None``) with ``last_activity_text`` ("3 days ago"), and ``suggest_window`` — the next wider
+    window key of the page ("7d", "30d", "all") or ``None``.
+    """
+    try:
+        count = int(total or 0)
+    except (TypeError, ValueError):
+        count = 0
+    hours = int(window_hours) if window_hours else None
+    suggest = "7d" if hours and hours < 24 * 7 else "30d" if hours and hours < 24 * 30 else "all" if hours else None
+    out: dict[str, Any] = {"empty": count == 0, "reason": None, "message": None, "last_activity": None,
+                           "last_activity_text": None, "suggest_window": None, "window_hours": hours}
+    if count:
+        return out
+    within = _window_words(hours)
+    if not _ever_ran(conn):
+        out.update(reason="never_run",
+                   message="Nothing has happened yet: Home SOC hasn't run any checks. This page fills up as checks run.")
+        return out
+    newest, _ = build_feed(conn, limit=1, collapse=False)
+    if newest:
+        out["last_activity"] = newest[0].ts
+        dt = api.parse_ts(newest[0].ts)
+        if dt is not None:
+            seconds = max(0, int((api.utcnow() - dt).total_seconds()))
+            out["last_activity_text"] = "just now" if seconds < 60 else f"{api.span_words(seconds)} ago"
+    out["suggest_window"] = suggest
+    if filtered:
+        out.update(reason="filtered", message=f"Nothing matches these filters {within}.")
+        return out
+    stale = api.staleness(conn, cfg)
+    if stale.get("stale") or stale.get("never"):
+        since = f"for {stale['age']}" if stale.get("age") else "yet"
+        out.update(
+            reason="not_checking",
+            message=(f"Nothing new {within}, but Home SOC hasn't checked your network {since}, "
+                     "so this may just mean it isn't looking."),
+        )
+        return out
+    out.update(reason="quiet", message=f"Nothing new {within} — that is normal on a quiet day.")
+    return out

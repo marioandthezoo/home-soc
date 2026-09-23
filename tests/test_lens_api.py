@@ -643,7 +643,8 @@ def test_vulns_express_epss_as_a_probability_and_flag_kev_first(client):
     assert {"cve", "kev", "cvss", "epss", "title", "service", "remediation"} <= set(vulns[0])
     assert vulns[0]["cve"] == "CVE-2022-22707" and vulns[0]["kev"] is True
     assert "actively exploited" in vulns[0]["kev_note"]
-    assert vulns[0]["epss_pct"] == 71.0 and "71% chance of exploitation in the next 30 days" in vulns[0]["epss_text"]
+    assert vulns[0]["epss_pct"] == 71.0 and "71% chance this flaw is exploited somewhere in the next 30 days" in vulns[0]["epss_text"]
+    assert "attack" not in vulns[0]["epss_text"] and "attack" not in vulns[1]["epss_text"]
     assert vulns[1]["kev"] is False and vulns[1]["epss_pct"] == 0.4
     assert "unlikely" in vulns[1]["epss_text"]
     assert vulns[0]["remediation"]

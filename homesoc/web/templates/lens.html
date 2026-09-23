@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#0b0d13">
+<meta name="theme-color" content="#1d1915">
 <meta name="mobile-web-app-capable" content="yes">
 <title>Lens · {{ app_name or 'Home SOC' }}</title>
 <link rel="manifest" href="{{ url_for('static', filename='manifest.webmanifest') }}">
@@ -65,7 +65,7 @@
            autocomplete="off" placeholder="Filter by name, IP or vendor">
   </label>
   <ul id="picker-list" class="device-list"></ul>
-  <p id="picker-empty" class="pane-empty" hidden>No devices yet. Run a discovery scan from the dashboard.</p>
+  <p id="picker-empty" class="pane-empty" hidden>No devices yet. Run a Quick check from the Home SOC dashboard, then look again.</p>
 </section>
 
 <section id="unknown" class="sheet" hidden role="dialog" aria-modal="true" tabindex="-1" aria-label="Unrecognised code">

@@ -1,24 +1,82 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
+{#- "System health" (telemetry): is Home SOC's own background work running properly?
+    Plain names lead; the job IDs, scan kinds and raw errors stay on the page one click away.
+    The tables keep their ids (#jobs-body, #scans-body, #events-body, #metrics-grid): app.js
+    refreshes them in place. -#}
 {% block content %}
-<section class="card">
-  <div class="card-head">
-    <h2>Metrics</h2>
-    <label class="muted small">window
-      <select id="metrics-hours">
-        <option value="24">24 h</option>
-        <option value="168" selected>7 d</option>
-        <option value="720">30 d</option>
-      </select>
-    </label>
-  </div>
-  <div class="metrics-grid" id="metrics-grid">
-    {% for name in metric_names %}<div class="metric"><div class="m-name">{{ name }}</div><div class="m-val muted">…</div></div>
-    {% else %}<div class="chart-empty">No metrics recorded yet — they appear once the scheduler runs its first job.</div>{% endfor %}
-  </div>
-</section>
+{%- set job_word = {
+  'discovery': 'Look for devices on the network',
+  'services': "Check each device's open doors (ports)",
+  'vulns': 'Match software against known flaws',
+  'topology': 'Work out what depends on what',
+  'host': "Check this computer's protection",
+  'exposure': 'Check what the internet can see of your home',
+  'feeds': 'Update threat lists and blocklists',
+  'files': 'Check new downloads',
+  'dns_rollup': 'Tidy up the web-blocking log',
+  'dns_retry': 'Restart web blocking if it could not start',
+  'score': 'Work out the safety score',
+  'housekeeping': 'Clear out old records',
+  'digest': 'Send the daily summary',
+  'quick': 'Quick check (when you ask)',
+  'full': 'Full check (when you ask)',
+  'device_scan': 'Check one device (when you ask)',
+} -%}
+{%- set scan_word = {
+  'discovery': 'Device check', 'services': 'Open-door (port) check', 'vulns': 'Software-flaw check',
+  'host': 'Check of this computer', 'exposure': 'Internet-exposure check', 'feeds': 'Threat-list update',
+  'files': 'Downloads check', 'wifi': 'Wi-Fi check', 'quick': 'Quick check', 'full': 'Full check',
+  'topology': 'Dependency check',
+} -%}
+{%- set manual = ('quick', 'full', 'device_scan') -%}
+{%- set ns = namespace(ok=0, failed=0, never=0, manual_never=0) -%}
+{%- for j in jobs -%}
+  {%- if j.last_status == 'error' %}{% set ns.failed = ns.failed + 1 %}
+  {%- elif not j.last_status %}{% if j.name in manual %}{% set ns.manual_never = ns.manual_never + 1 %}{% else %}{% set ns.never = ns.never + 1 %}{% endif %}
+  {%- else %}{% set ns.ok = ns.ok + 1 %}{% endif -%}
+{%- endfor %}
+
+<p class="lede">Whether Home SOC's own background work is running properly.
+{%- if not jobs or (not ns.ok and not ns.failed) %} Nothing has run yet, so there is nothing to report.
+{%- elif ns.failed %} <b>{{ ns.failed }} job{{ '' if ns.failed == 1 else 's' }} failed the last time {{ 'it' if ns.failed == 1 else 'they' }} ran.</b> The rest are fine or have not run yet.
+{%- else %} <b>No job failed the last time it ran.</b>
+{%- if ns.never %} {{ ns.never }} {{ 'has' if ns.never == 1 else 'have' }} not run yet.{% endif %}
+{%- if ns.manual_never %} {{ ns.manual_never }} only run{{ 's' if ns.manual_never == 1 else '' }} when you ask and {{ 'has' if ns.manual_never == 1 else 'have' }} not been asked yet.{% endif %}
+{%- endif %}</p>
 
 <section class="card">
-  <h2>Jobs</h2>
+  <div class="card-head"><h2>Background jobs <span class="page-tech">Jobs</span></h2></div>
+  {% if jobs %}
+  <div class="tbl-wrap">
+  <table class="tbl job-summary">
+    <thead><tr><th>What it does</th><th>How it went</th><th>Last ran</th><th>Next run</th></tr></thead>
+    <tbody>
+      {% for j in jobs %}
+      {%- set st = (j.last_status or '')|string|lower -%}
+      <tr>
+        <td>{{ job_word.get(j.name) or j.description or j.name }} <span class="tech-word mono">{{ j.name }}</span></td>
+        <td>
+          {%- if not st -%}<span class="badge badge-never">Not run yet</span>
+          {%- elif st == 'error' -%}<span class="badge badge-error">Failed last time</span>{% if j.last_error %} <span class="muted small">{{ j.last_error }}</span>{% endif %}
+          {%- elif st == 'running' -%}<span class="badge badge-running">Running now</span>
+          {%- elif st == 'ok' -%}<span class="badge badge-ok">OK</span>
+            {%- if j.failures %} <span class="muted small"{% if j.last_error %} title="{{ j.last_error }}"{% endif %}>{{ j.failures }} earlier run{{ '' if j.failures == 1 else 's' }} failed</span>
+            {%- elif j.last_error %} <span class="muted small" title="{{ j.last_error }}">left a message (see Technical details)</span>{% endif -%}
+          {%- else -%}{{ badge(st) }}{%- endif -%}
+        </td>
+        <td class="nowrap" title="{{ j.last_run|ts }}">{{ j.last_run|ago if j.last_run else '—' }}</td>
+        <td class="nowrap" title="{{ j.next_run|ts }}">{{ j.next_run|ago if j.next_run else ('when you ask' if j.name in manual else '—') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty">No jobs recorded yet. They appear once the scheduler (the part that runs checks on a timetable) has run one.</p>
+  {% endif %}
+
+  {% call ui.tech_details('Technical details: every job, live') %}
   <div class="tbl-wrap">
   <table class="tbl">
     <thead><tr><th>Job</th><th>Status</th><th>Last run</th><th class="num">Duration</th><th>Next run</th><th class="num">Runs</th><th class="num">Failures</th><th>Last error</th></tr></thead>
@@ -38,41 +96,66 @@
     </tbody>
   </table>
   </div>
+  {% endcall %}
 </section>
 
-<div class="grid grid-2">
+<div class="grid">
   <section class="card">
-    <div class="card-head"><h2>Scan history</h2><a class="link" href="/scans">All scans →</a></div>
+    <div class="card-head"><h2>Recent checks <span class="page-tech">Scan history</span></h2><a class="link" href="/scans">All checks →</a></div>
+    {% if scans %}
+    <p class="muted small">
+      {%- set last = scans[0] -%}
+      Latest: {{ scan_word.get(last.kind, last.kind) }}, {{ last.started_at|ago }}{% if last.status == 'ok' %}, finished normally{% elif last.status %}, ended as “{{ last.status }}”{% endif %}.
+    </p>
+    {% endif %}
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Kind</th><th>Status</th><th>Started</th><th class="num">Duration</th><th>Summary</th><th>Error</th></tr></thead>
+      <thead><tr><th>Check</th><th>Result</th><th>Started</th><th class="num">Took</th><th>Summary</th><th>Error</th></tr></thead>
       <tbody id="scans-body">
         {% for s in scans %}
         <tr>
-          <td class="mono">{{ s.kind }}</td>
-          <td>{{ badge(s.status) }}</td>
-          <td title="{{ s.started_at }}">{{ s.started_at|ts }}</td>
+          <td class="mono" title="{{ scan_word.get(s.kind, s.kind) }}">{{ s.kind }}</td>
+          <td>{{ ui.run_result(s.status) }}</td>
+          <td class="nowrap" title="{{ s.started_at }}">{{ s.started_at|ts }}</td>
           <td class="num">{% if s.duration_sec is not none %}{{ s.duration_sec }}s{% endif %}</td>
           <td class="muted small wrap">{% if s.summary is mapping %}{% for k, v in s.summary.items() %}{{ k }}={{ v }} {% endfor %}{% else %}{{ s.summary or '' }}{% endif %}</td>
           <td class="small wrap error">{{ s.error or '' }}</td>
         </tr>
-        {% else %}<tr><td colspan="6" class="empty">No scans yet.</td></tr>{% endfor %}
+        {% else %}<tr><td colspan="6" class="empty">No checks have run yet.</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
   </section>
   <section class="card">
     <div class="card-head">
-      <h2>Events</h2>
-      <select id="events-level" aria-label="Level filter">
-        <option value="">all levels</option>
-        <option value="error">error</option>
-        <option value="warning">warning</option>
-        <option value="info">info</option>
-        <option value="debug">debug</option>
+      <h2>Home SOC's own log <span class="page-tech">Events</span></h2>
+      <select id="events-level" aria-label="Which messages to show">
+        <option value="">Everything</option>
+        <option value="error">Errors only (error)</option>
+        <option value="warning">Warnings (warning)</option>
+        <option value="info">Information (info)</option>
+        <option value="debug">Developer detail (debug)</option>
       </select>
     </div>
     <ul class="events" id="events-body"><li class="muted">Loading…</li></ul>
   </section>
 </div>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Measurements over time <span class="page-tech">Metrics</span></h2>
+    <label class="muted small">Show the last
+      <select id="metrics-hours">
+        <option value="24">24 hours</option>
+        <option value="168" selected>7 days</option>
+        <option value="720">30 days</option>
+      </select>
+    </label>
+  </div>
+  <p class="muted small">Numbers Home SOC records about itself and your network, such as the safety score and how long checks take.</p>
+  <div class="metrics-grid" id="metrics-grid">
+    {% for name in metric_names %}<div class="metric"><div class="m-name">{{ name }}</div><div class="m-val muted">…</div></div>
+    {% else %}<div class="chart-empty">No measurements recorded yet. They appear once the scheduler runs its first job.</div>{% endfor %}
+  </div>
+</section>
 {% endblock %}

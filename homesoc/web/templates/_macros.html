@@ -1,0 +1,85 @@
+{#- Shared template helpers. Import with:  {% import "_macros.html" as ui %}
+
+    Friendly words sit BESIDE the technical ones, never instead of them. Everything here is
+    autoescaped (this is an .html template): no |safe, no Markup on data. The glossary, the
+    word lists and the filters come from app.py (GLOSSARY, SEV_WORDS, STATUS_WORDS,
+    sev_word / status_word / device_label / css_token). -#}
+
+{#- term('KEV') -> <abbr class="term" tabindex="0" data-tip="plain explanation">KEV</abbr>.
+    Focusable, and the explanation shows on hover AND keyboard focus (a CSS tooltip fed by
+    data-tip), and reaches screen readers through aria-describedby -> a hidden span. No title
+    attribute: that is mouse-only, and would show a second tooltip on top of this one.
+    term('port', 'ports') shows "ports" with the "port" explanation. A word the glossary does
+    not know renders as plain text, so a typo never produces an empty tooltip. -#}
+{% macro term(word, text=none) -%}
+{%- set tip = glossary_tip(word) -%}
+{%- set shown = word if text is none else text -%}
+{%- if tip -%}{%- set tid = term_id() -%}<abbr class="term" tabindex="0" data-tip="{{ tip }}" aria-describedby="{{ tid }}">{{ shown }}</abbr><span class="term-tip" id="{{ tid }}" hidden>{{ tip }}</span>{%- else -%}{{ shown }}{%- endif -%}
+{%- endmacro %}
+
+{#- sev_badge('critical') -> the technical badge ("critical") with its action word ("Fix now").
+    sev_badge('critical', 3) -> "3 critical"; a zero count is a quiet outline (is-zero,
+    quiet-badge) and its word goes muted, so a healthy screen carries no solid severity colour. -#}
+{% macro sev_badge(severity, count=none) -%}
+{%- set s = (severity or '')|string|lower|trim -%}
+{%- set zero = count is not none and not count -%}
+{%- set word = s|sev_word -%}
+<span class="sev-pair"><span class="badge badge-{{ s|css_token }}{% if zero %} is-zero quiet-badge{% endif %}" title="Severity: {{ s }}">{% if count is not none %}{{ count }} {% endif %}{{ s }}</span>
+{%- if word %}<span class="sev-word {% if zero %}is-zero{% else %}sev-word-{{ s|css_token }}{% endif %}">{{ word }}</span>{% endif -%}
+</span>
+{%- endmacro %}
+
+{#- status_chip('open') -> "Needs attention" in the status pill, with the technical status
+    ("open") beside it. The pill keeps class="status-badge" and data-status so app.js can
+    update it in place after a status change. -#}
+{#- A resolved row reads "Fixed" only when Home SOC's own check confirmed it (how='auto'). A row a
+    person marked fixed reads "Marked fixed", and says whether a later check can reopen it.
+    Pass the row itself: status_chip(f.status, f). -#}
+{% macro status_chip(status, row=none) -%}
+{%- set st = (status or '')|string|lower|trim -%}
+{%- set word = st|status_word -%}
+{%- set tip = 'Status: ' ~ st -%}
+{%- if st == 'resolved' and row is not none and row.resolved_how is defined and row.resolved_how -%}
+  {%- if row.resolved_how == 'auto' -%}
+    {%- set tip = tip ~ ". Home SOC's own check found the problem gone." -%}
+  {%- else -%}
+    {%- set word = 'Marked fixed' -%}
+    {%- if row.rechecks is defined and not row.rechecks -%}
+      {%- set tip = tip ~ ". You marked this fixed. Home SOC cannot re-check this one; it stays closed until it happens again." -%}
+    {%- else -%}
+      {%- set tip = tip ~ ". You marked this fixed; Home SOC has not confirmed it. A later check reopens it if the problem is still there." -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+<span class="status-chip"><span class="badge status-badge badge-{{ st|css_token }}" data-status="{{ st }}" title="{{ tip }}">{{ word or st }}</span>
+{%- if word %} <span class="tech-word">{{ st }}</span>{% endif -%}
+</span>
+{%- endmacro %}
+
+{#- run_result('ok') -> "Finished" with the stored status ("ok") beside it. One vocabulary for a
+    check's result on every page (Checks, System health, and app.js's live rows). -#}
+{% macro run_result(status) -%}
+{%- set st = (status or '')|string|lower|trim -%}
+{%- set words = {'ok': 'Finished', 'error': 'Failed', 'partial': 'Partly finished', 'aborted': 'Stopped', 'running': 'Running now'} -%}
+<span class="status-chip"><span class="badge badge-{{ st|css_token }}">{{ words.get(st, st or 'unknown') }}</span>{% if st in words %} <span class="tech-word">{{ st }}</span>{% endif %}</span>
+{%- endmacro %}
+
+{#- device_name(d) -> the device's name first, its IP second and muted; a link to the device
+    page when the row has an id (pass link=false to suppress). Never the bare IP twice. -#}
+{% macro device_name(d, link=true) -%}
+{%- set label = d|device_label -%}
+{#- A finding's own "id" is not a device id: only a device row's id is used as one. -#}
+{%- if d.device_id is defined and d.device_id is not none -%}{%- set dev_id = d.device_id -%}
+{%- elif d.id is defined and d.finding_id is not defined and d.subject is not defined -%}{%- set dev_id = d.id -%}
+{%- else -%}{%- set dev_id = none -%}{%- endif -%}
+{%- set ip = d.ip if d.ip is defined and d.ip else (d.device_ip if d.device_ip is defined else '') -%}
+{%- if link and dev_id is not none -%}<a href="/devices/{{ dev_id }}" class="{% if label.startswith('Unnamed') %}device-unnamed{% endif %}">{{ label }}</a>
+{%- else -%}<span class="{% if label.startswith('Unnamed') %}device-unnamed{% endif %}">{{ label }}</span>{%- endif -%}
+{%- if ip and ip != label %}<span class="device-ip">{{ ip }}</span>{% endif -%}
+{%- endmacro %}
+
+{#- tech_details('Technical details') ... : a disclosure that holds the technical detail one
+    click away. Use with call:  {% call ui.tech_details() %} ... {% endcall %} -#}
+{% macro tech_details(summary='Technical details', open=false) -%}
+<details class="tech tech-details"{% if open %} open{% endif %}><summary>{{ summary }}</summary>{{ caller() }}</details>
+{%- endmacro %}

@@ -168,13 +168,15 @@ def _how_resolved(conn: sqlite3.Connection, row_ids: list[int]) -> dict[int, str
 def _remediated(conn: sqlite3.Connection, cutoff: str, limit: int = 500) -> list[dict]:
     data = api.rows(
         conn,
-        "SELECT f.id, f.finding_id, f.title, f.severity, f.subject, f.first_seen, f.resolved_at, f.occurrences, "
-        "COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name "
+        "SELECT f.id, f.finding_id, f.title, f.severity, f.subject, f.evidence, f.first_seen, f.resolved_at, f.occurrences, "
+        "f.device_id, d.ip AS device_ip, COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name, "
+        "d.nickname AS device_nickname, d.hostname AS device_hostname, d.kind AS device_kind "
         "FROM findings f LEFT JOIN devices d ON d.id=f.device_id "
         "WHERE f.status='resolved' AND f.resolved_at IS NOT NULL AND f.resolved_at>=? "
         "ORDER BY f.resolved_at DESC LIMIT ?",
         (cutoff, limit),
     )
+    api.label_subject_rows(conn, data)
     how = _how_resolved(conn, [int(r["id"]) for r in data])
     out = []
     for r in data:
@@ -191,9 +193,26 @@ def _remediated(conn: sqlite3.Connection, cutoff: str, limit: int = 500) -> list
                 "hours_open": _hours_between(r["first_seen"], r["resolved_at"]),
                 "how": how.get(int(r["id"]), "manual"),
                 "occurrences": int(r.get("occurrences") or 1),
+                # plain-language layer (additive)
+                "device_label": r.get("device_label"),
+                "device_ip": r.get("device_ip"),
+                "link_device_id": r.get("link_device_id"),
+                "severity_word": api.sev_word(r["severity"]),
+                "plain_title": api.catalog_plain_title(r["finding_id"], r.get("evidence"), str(r.get("subject") or "")),
+                "how_text": ("Fixed, and Home SOC's next check confirmed it"
+                             if how.get(int(r["id"])) == "auto" else "Marked fixed"),
+                "time_open_text": _open_words(r["first_seen"], r["resolved_at"]),
             }
         )
     return out
+
+
+def _open_words(start: Any, end: Any) -> str | None:
+    """"Open for 3 days", rounded down the way a person says it."""
+    hours = _hours_between(start, end)
+    if hours is None:
+        return None
+    return f"Open for {api.span_words(hours * 3600)}"
 
 
 def _open_worklist(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
@@ -201,11 +220,13 @@ def _open_worklist(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
     data = api.rows(
         conn,
         "SELECT f.id, f.finding_id, f.title, f.severity, f.subject, f.detail, f.evidence, f.first_seen, "
-        "f.occurrences, f.device_id, COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name "
+        "f.occurrences, f.device_id, COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS device_name, "
+        "d.ip AS device_ip, d.nickname AS device_nickname, d.hostname AS device_hostname, d.kind AS device_kind "
         "FROM findings f LEFT JOIN devices d ON d.id=f.device_id WHERE f.status='open' "
         f"ORDER BY {order}, f.first_seen ASC LIMIT ?",
         (limit,),
     )
+    api.label_subject_rows(conn, data)
     out = []
     for r in data:
         evidence = api.loads(r.get("evidence"), {})
@@ -226,6 +247,14 @@ def _open_worklist(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
                 "category": api.category_for(str(r["finding_id"])),
                 "remediation": remediation_steps(str(r["finding_id"]), evidence, str(r["subject"])),
                 "refs": _refs(str(r["finding_id"])),
+                # plain-language layer (additive)
+                "device_label": r.get("device_label"),
+                "device_ip": r.get("device_ip"),
+                "link_device_id": r.get("link_device_id"),
+                "severity_word": api.sev_word(r["severity"]),
+                "plain_title": api.catalog_plain_title(str(r["finding_id"]), evidence, str(r["subject"] or "")),
+                "age_text": ("Found today" if (age or 0.0) < 24
+                             else f"Open for {api.span_words((age or 0.0) * 3600)}"),
             }
         )
     return out
@@ -240,12 +269,15 @@ def _time_to_remediate(remediated: list[dict]) -> dict:
     def trim(r: dict | None) -> dict | None:
         return None if r is None else {k: r[k] for k in ("finding_id", "title", "severity", "hours_open")}
 
+    median, p90 = _median(hours), _percentile(hours, 0.9)
     return {
-        "median_hours": _median(hours),
-        "p90_hours": _percentile(hours, 0.9),
+        "median_hours": median,
+        "p90_hours": p90,
         "count": len(hours),
         "fastest": trim(fastest),
         "slowest": trim(slowest),
+        # "Usually fixed within 12 hours; almost always within 3 days", honest about tiny samples.
+        "text": api.time_to_fix_text(median, p90, len(hours)),
     }
 
 
@@ -253,6 +285,7 @@ def _top_devices(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
     data = api.rows(
         conn,
         "SELECT d.id, COALESCE(d.nickname, d.hostname, d.ip, d.mac) AS name, d.ip, "
+        "d.nickname, d.hostname, d.kind, "
         "sum(CASE WHEN f.status='open' THEN 1 ELSE 0 END) AS open_n, "
         "sum(CASE WHEN f.status='resolved' THEN 1 ELSE 0 END) AS resolved_n "
         "FROM devices d JOIN findings f ON f.device_id=d.id GROUP BY d.id "
@@ -261,7 +294,9 @@ def _top_devices(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
     )
     return [
         {"device_id": int(r["id"]), "name": r.get("name"), "ip": r.get("ip"),
-         "open": int(r.get("open_n") or 0), "resolved": int(r.get("resolved_n") or 0)}
+         "open": int(r.get("open_n") or 0), "resolved": int(r.get("resolved_n") or 0),
+         "device_label": api.device_label({"nickname": r.get("nickname"), "hostname": r.get("hostname"),
+                                           "kind": r.get("kind"), "device_id": r.get("id")})}
         for r in data
     ]
 
@@ -347,14 +382,35 @@ def _notes(conn: sqlite3.Connection) -> list[str]:
 # --------------------------------------------------------------------------- public API
 
 
-def build_summary(conn: sqlite3.Connection, *, days: int = 30) -> dict:
-    """Everything found and everything remediated, in one dict (Addendum A3.1)."""
+def build_summary(conn: sqlite3.Connection, *, days: int = 30, cfg: Any = None, plain: bool = False) -> dict:
+    """Everything found and everything remediated, in one dict (Addendum A3.1).
+
+    ``plain=True`` (the /summary page) adds the top-level plain-language fields: ``status_line``,
+    ``status_tone``, ``status_link``, ``unfinished_checks``, ``staleness`` and ``score_word``,
+    computed by the same :func:`api.status_summary` / :func:`api.staleness` as the overview and the
+    shell's banner. They are opt-in because the exported report's key set is a published schema
+    (``SCHEMA_VERSION``). ``cfg`` supplies ``schedule.discovery_minutes``; without it the running
+    app's config is used, then the stock schedule.
+    """
     days = max(1, min(int(days or 30), 3650))
     cutoff = api.cutoff_iso(days * 24)
     score = api.security_score(conn)
     totals, _ = _totals(conn, cutoff)
     remediated = _remediated(conn, cutoff)
+    extra: dict[str, Any] = {}
+    if plain:
+        stale = api.staleness(conn, cfg)
+        status = api.status_summary(conn, cfg, stale=stale)
+        extra = {
+            "status_line": status["status_line"],
+            "status_tone": status["status_tone"],
+            "status_link": status["status_link"],
+            "unfinished_checks": status["unfinished"],
+            "staleness": stale,
+            "score_word": api.score_word(score),
+        }
     return {
+        **extra,
         "generated_at": api.now_iso(),
         "window_days": days,
         "score": {"current": score, "grade": api.grade(score), "trend": api.score_trend(conn, days)},
@@ -484,7 +540,7 @@ def remediation_report_markdown(conn: sqlite3.Connection, *, days: int = 30) -> 
             [
                 r["title"],
                 r["severity"],
-                r.get("device_name") or r["subject"],
+                r.get("device_label") or r.get("device_name") or r["subject"],
                 r["first_seen"],
                 r["resolved_at"],
                 _hours_words(r["hours_open"]),
@@ -502,7 +558,7 @@ def remediation_report_markdown(conn: sqlite3.Connection, *, days: int = 30) -> 
     for i, item in enumerate(s["open_worklist"], start=1):
         # Every value below can carry text a LAN device chose (see _md_text); only the structure
         # around it — headings, list markers, "How to fix it" — is this module's own.
-        where = _md_text(item.get("device_name") or item["subject"])
+        where = _md_text(item.get("device_label") or item.get("device_name") or item["subject"])
         severity = _md_text(str(item["severity"]).upper())
         finding_id = re.sub(r"[^A-Za-z0-9._-]", "", str(item["finding_id"]))
         lines.append(f"### {i}. [{severity}] {_md_text(item['title'])}")

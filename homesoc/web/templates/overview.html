@@ -1,39 +1,159 @@
 {% extends "base.html" %}
-{% block content %}
+{% import "_macros.html" as ui %}
+{#- Home: the page a non-technical person lives on, and the wall screen.
+    Plain words sit BESIDE the technical ones; the technical detail is one click away.
+    Everything here is autoescaped; nothing from the database is marked safe. -#}
+
+{#- "8 days ago" (the |ago filter already speaks in words). -#}
+{% macro when(ts) -%}{{ ts|ago }}{%- endmacro %}
+
+{#- Numbers up to ten as words ("two things"), larger ones as digits. -#}
+{% macro number(n) -%}
+{{ ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'][n] if 0 <= n <= 10 else n }}
+{%- endmacro %}
+{% macro things(n, noun='thing') -%}
+{{ number(n) }} {{ noun if n == 1 else noun ~ 's' }}
+{%- endmacro %}
+
+{#- What was open at the last check, for when that check is old. The banner already says the
+    check is old; this says what it found, in the past tense, without claiming it is current. -#}
+{% macro at_last_check(open) -%}
+{%- set crit = open.critical or 0 -%}{%- set high = open.high or 0 -%}
+{%- set small = (open.medium or 0) + (open.low or 0) -%}
+At that check,
+{%- if crit and high %} {{ things(crit) }} needed fixing right away and {{ number(high) }} more this week.
+{%- elif crit %} {{ things(crit) }} needed fixing right away.
+{%- elif high %} {{ things(high) }} needed fixing this week.
+{%- elif small %} nothing urgent was open; {{ things(small, 'smaller thing') }} {{ 'was' if small == 1 else 'were' }} worth fixing when you have time.
+{%- else %} nothing needed your attention.
+{%- endif -%}
+{%- endmacro %}
+
+{% set JOB_WORDS = {'discovery': 'device check', 'services': 'open-port check', 'vulns': 'software-flaw check',
+    'host': 'check of this computer', 'exposure': 'internet-exposure check', 'feeds': 'threat-list update',
+    'files': 'downloads check', 'wifi': 'Wi-Fi check', 'quick': 'quick check', 'full': 'full check',
+    'score': 'safety score update', 'topology': 'dependency map update', 'dns_rollup': 'web blocking summary',
+    'dns_retry': 'web blocking restart', 'digest': 'daily summary', 'housekeeping': 'tidy-up',
+    'device_scan': 'single-device check'} %}
+
+{% block head %}
+{# A wall screen stays up for days. The numbers in the chips and charts refresh themselves every
+   few seconds; the sentences on this page (the status line, "Devices that need attention", the
+   working line) are written by the server, so the page reloads itself every five minutes to keep
+   them true. A plain meta refresh: no script, nothing CSP has to allow. #}
+<meta http-equiv="refresh" content="300">
+{% endblock %}
+
 {% set s = summary %}
+{% set open = s.counts.open %}
+
+{#- The overview's own stale banner: the same element (ids and all) that app.js keeps current on a
+    wall screen, plus what was open at that check, so the warning appears once, not twice. -#}
+{% block stale_banner %}
+<div class="status-banner is-stale stale-banner" id="stale-banner" role="status"{% if not staleness.stale %} hidden{% endif %}>
+  <span><span class="stale-text" id="stale-text">Home SOC last checked your network <b>{{ staleness.age_text or 'a while ago' }}</b> — what you see may be out of date.</span>
+  {% if staleness.stale %}<span>{{ at_last_check(open) }}</span>{% endif %}</span>
+  {#- No "Check now" here: the Quick check button sits directly below, and a second one wrapped
+      onto its own line at 1920, adding a dead band to the wall screen. -#}
+</div>
+{% endblock %}
+
+{% block content %}
 <script type="application/json" id="initial-summary">{{ s|tojson }}</script>
+
+{#- The one sentence about the whole network. When the data is stale the banner above already
+    carries it, so it is not repeated here. -#}
+{% if not staleness.stale %}
+{% set link = s.status_link or '/findings?status=open' %}
+<div class="status-banner status-line-main is-{{ (s.status_tone or 'healthy')|css_token }}" role="status">
+  <span>{{ s.status_line or 'Home SOC could not work out a summary right now.' }}</span>
+  {% if staleness.never %}
+  <button class="btn btn-sm btn-primary" type="button" data-action="scan" data-kind="quick" title="Looks for devices on your network, then their open doors (ports). Takes a minute or two.">Check for devices now</button>
+  {% elif link.startswith('/findings') %}
+  <a class="link" href="{{ link }}">See what to fix →</a>
+  {% elif link.startswith('/telemetry') %}
+  <a class="link" href="{{ link }}">System health →</a>
+  {% else %}
+  <a class="link" href="{{ link }}">Checks →</a>
+  {% endif %}
+</div>
+{% endif %}
+
+{#- Feed freshness, Jobs and Last scans, as one line. It turns amber only when a job, a threat
+    list or a check has actually failed. It never says "working normally" while the network check
+    is old: that would be an overclaim, and the banner explains why. -#}
+{% set failed_jobs = s.jobs|selectattr('last_status', 'in', ['error', 'failed'])|list %}
+{% set failed_feeds = s.feeds|selectattr('enabled')|selectattr('status', 'in', ['error', 'failed'])|list %}
+{% set unfinished = s.unfinished_checks or [] %}
+{% set overdue = s.overdue_checks or [] %}
+{% set old_feeds = s.overdue_feeds or [] %}
+{% set newest_feed = s.feeds|map(attribute='last_updated')|select|list|max if s.feeds|map(attribute='last_updated')|select|list else none %}
+{% set trouble = failed_jobs or failed_feeds or unfinished %}
+{#- "Working normally" also needs every core check to have run within its window and every
+    threat list to be within its refresh interval: a job that never ran has not failed, but it
+    has not worked either. -#}
+{% set behind = overdue or old_feeds %}
 <div class="toolbar">
-  <button class="btn btn-primary" data-action="scan" data-kind="quick">Run quick scan</button>
-  <button class="btn" data-action="scan" data-kind="full">Full scan</button>
-  <button class="btn" data-action="scan" data-kind="feeds">Update feeds</button>
-  <span class="muted small">{{ 'scans run through the scheduler' if has_scheduler else 'scans run in a background thread' }}</span>
+  <button class="btn btn-primary" data-action="scan" data-kind="quick" title="Looks for devices, then their open doors (ports). Takes a minute or two. (quick scan)">Quick check</button>
+  <button class="btn" data-action="scan" data-kind="full" title="Everything in the quick check, plus every port and known software flaws. Can take a while. (full scan)">Full check</button>
+  <button class="btn" data-action="scan" data-kind="feeds" title="Downloads the latest lists of dangerous websites and known software flaws (feeds)">Update threat lists</button>
+  <span class="status-line{% if trouble or behind %} is-stale{% endif %}" id="working-line">
+    {%- if trouble -%}
+      Something needs a look:
+      {%- for j in failed_jobs %} the {{ JOB_WORDS.get(j.name, j.name) }} <span class="tech-word">{{ j.name }}</span> failed {{ when(j.last_run) }}{{ ';' if not loop.last or failed_feeds or unfinished else '.' }}{% endfor %}
+      {%- for f in failed_feeds %} the <span class="mono">{{ f.name }}</span> threat list did not download{{ ';' if not loop.last or unfinished else '.' }}{% endfor %}
+      {%- for u in unfinished %} the last {{ u.word }} did not finish{{ ';' if not loop.last else '.' }}{% endfor %}
+    {%- elif staleness.never and not s.jobs|selectattr('last_run')|list -%}
+      Home SOC hasn't run any checks yet.
+    {%- elif staleness.stale -%}
+      No check has reported an error, but none has finished recently.
+    {%- elif behind -%}
+      Some checks are behind:
+      {%- for o in overdue %} the {{ o.word }} {% if o.never %}has not run yet{% else %}last finished {{ o.age_text }}{% endif %}{{ ';' if not loop.last or old_feeds else '.' }}{% endfor %}
+      {%- if old_feeds %} {{ old_feeds|length }} threat list{{ '' if old_feeds|length == 1 else 's' }} {{ 'is' if old_feeds|length == 1 else 'are' }} older than {{ 'its' if old_feeds|length == 1 else 'their' }} refresh interval.{% endif %}
+    {%- elif s.dns.enabled and not s.dns.running -%}
+      Home SOC's checks are running normally, but web blocking is not running.
+    {%- else -%}
+      Home SOC is working normally.
+    {%- endif %}
+    {% if newest_feed %}Threat lists updated {{ when(newest_feed) }}.{% else %}Threat lists not downloaded yet.{% endif %}
+    <a class="link" href="/telemetry">System health →</a>
+  </span>
 </div>
 
 <div class="grid grid-4">
   <section class="card card-fill">
-    <h2>Security score</h2>
+    <h2>How safe is your network?</h2>
     <div class="chart chart-gauge" id="chart-gauge"></div>
     <div class="chart chart-spark" id="chart-trend"></div>
-    <div class="muted small push-down">30-day trend · grade <b>{{ s.grade }}</b> ({{ s.score }}/100)</div>
+    {% set trend = s.trend or [] %}
+    <div class="muted small push-down" title="Safety score {{ s.score }} out of 100, grade {{ s.grade }}. Higher is safer.">
+      {%- if trend|length > 1 -%}
+        {%- set first = trend[0][1]|float -%}{%- set diff = (s.score|float) - first -%}
+        {%- if diff >= 1 %}Getting better: up from {{ first|round|int }}, {{ when(trend[0][0]) }}
+        {%- elif diff <= -1 %}Getting worse: down from {{ first|round|int }}, {{ when(trend[0][0]) }}
+        {%- else %}About the same as {{ when(trend[0][0]) }}{% endif %}
+      {%- endif %}{% if staleness.never %}{% if trend|length > 1 %} · {% endif %}Nothing has been checked yet, so this only means nothing has been found — not that all is well.{% elif (s.overdue_checks or [])|selectattr('never')|list %}{% if trend|length > 1 %} · {% endif %}Some checks have not run yet, so this score only counts what Home SOC has looked at.{% else %}{% if trend|length > 1 %} · {% endif %}grade <b class="grade-{{ s.grade }}">{{ s.grade }}</b> ({{ s.score }}/100){% endif %}</div>
   </section>
   <section class="card card-fill">
-    <h2>Open findings</h2>
+    <div class="card-head"><h2>What needs fixing</h2><a class="link" href="/findings?status=open">All →</a></div>
     <div class="chart chart-donut" id="chart-severity"></div>
-    <div class="sev-counts push-down">
-      {% for sv in severities %}<a href="/findings?status=open&severity={{ sv }}">{{ badge(sv, s.counts.open[sv] ~ ' ' ~ sv) }}</a>{% endfor %}
-    </div>
   </section>
   <section class="card card-fill">
-    <h2>Devices</h2>
-    <div class="kpi"><b data-bind="devices-online">{{ s.devices.online }}</b><span class="muted">/ <span data-bind="devices-total">{{ s.devices.total }}</span> online</span></div>
-    <div class="kpi-sub">last discovery {{ s.last_scans.get('discovery')|ago }} · last service scan {{ s.last_scans.get('services')|ago }}</div>
-    <p class="push-down"><a href="/devices" class="link">Inventory →</a></p>
+    <div class="card-head"><h2>Devices at home</h2><a class="link" href="/devices">All →</a></div>
+    <div class="kpi"><b data-bind="devices-online">{{ s.devices.online }}</b><span class="muted">of <span data-bind="devices-total">{{ s.devices.total }}</span> seen</span></div>
+    <div class="kpi-sub">
+      {%- if staleness.never %}Home SOC hasn't looked for devices yet.
+      {%- else %}As seen at the last device check, {{ staleness.age_text or when(s.last_scans.get('discovery')) }}.{% endif %}
+      {% if s.devices.total > s.devices.online %}{{ s.devices.total - s.devices.online }} {{ 'was' if s.devices.total - s.devices.online == 1 else 'were' }} not seen then.{% endif %}
+      {% if s.last_scans.get('services') %}Open doors ({{ ui.term('port', 'ports') }}) last checked {{ when(s.last_scans.get('services')) }}.{% endif %}</div>
   </section>
   <section class="card card-fill">
-    <h2>DNS filter · 24 h</h2>
-    <div class="kpi"><b data-bind="dns-total">{{ s.dns.total24h|num }}</b><span class="muted">queries</span></div>
-    <div class="kpi-sub"><span data-bind="dns-blocked">{{ s.dns.blocked24h|num }}</span> blocked (<span data-bind="dns-pct">{{ s.dns.blocked_pct }}</span>%) · <span data-bind="dns-clients">{{ s.dns.clients24h }}</span> clients ·
-      {{ badge('ok' if s.dns.running else 'off', 'running' if s.dns.running else ('enabled, not running' if s.dns.enabled else 'off')) }}</div>
+    <div class="card-head"><h2>Web blocking</h2><span class="muted small" title="Home SOC's DNS filter">ads, trackers, scams · last 24 h</span></div>
+    <div class="kpi"><b data-bind="dns-total">{{ s.dns.total24h|num }}</b><span class="muted">website look-ups ({{ ui.term('DNS') }})</span></div>
+    <div class="kpi-sub"><span data-bind="dns-blocked">{{ s.dns.blocked24h|num }}</span> blocked (<span data-bind="dns-pct">{{ s.dns.blocked_pct }}</span>%) · <span data-bind="dns-clients">{{ s.dns.clients24h }}</span> devices using it</div>
+    {% if s.dns_note %}<p class="status-line is-stale small">{{ s.dns_note }}</p>
+    {% elif not s.dns.enabled %}<p class="muted small">Web blocking is switched off, so nothing is being filtered.</p>{% endif %}
     <div class="chart chart-bars push-down" id="chart-dns"></div>
   </section>
 </div>
@@ -42,95 +162,122 @@
   <section class="card card-fill">
     <div class="card-head">
       <h2>Fix these first</h2>
-      <a class="link" href="/summary">Full worklist →</a>
+      <a class="link" href="/summary">Every step, in the report →</a>
     </div>
     <ol class="cost-list" id="score-breakdown">
       {% for b in s.score_breakdown %}
+      {% set what = b.plain_title or b.title %}
       <li class="cost">
-        <span class="tl-dot sev-dot-{{ b.severity }}" title="{{ b.severity }}"></span>
-        <a class="cost-title" href="/findings?status=open&q={{ b.finding_id }}" title="{{ b.finding_id }} — {{ b.title }}">{{ b.title }}</a>
-        {% if b.count > 1 %}<span class="cost-count" title="{{ b.count }} findings of this type are open">×{{ b.count }}</span>{% endif %}
-        <span class="cost-gain" title="the score would rise by about {{ b.gain }} once every finding of this type is cleared">+{{ b.gain }}</span>
+        <span class="tl-dot sev-dot-{{ b.severity|css_token }}" title="{{ b.severity }} · {{ b.severity|sev_word }}"></span>
+        <span class="cost-title"><a href="/findings?status=open&q={{ b.finding_id }}" title="{{ b.finding_id }} — {{ b.title }}">{{ what }}</a><br>
+          <span class="muted small">
+            {%- if b.link_device_id is not none and b.device_label %}<a href="/devices/{{ b.link_device_id }}">{{ b.device_label }}</a>
+            {%- elif b.where_text %}{{ b.where_text }}{% endif %}
+            {%- if b.link_device_id is not none or b.where_text %} · {% endif %}{{ b.severity_word or b.severity|sev_word }}</span></span>
+        {% if b.count > 1 %}<span class="cost-count" title="{{ b.count }} problems of this type are open">×{{ b.count }}</span>{% else %}<span></span>{% endif %}
+        <span class="cost-gain" title="The safety score would rise by about this much once every problem of this type is fixed">{{ b.gain_text or ('+' ~ b.gain) }}</span>
       </li>
       {% else %}
-      <li class="empty">Nothing is costing you points. Either everything found is fixed, acknowledged or
-        suppressed, or no scan has run yet.</li>
+      <li class="empty">
+        {%- if staleness.never %}Nothing yet: Home SOC hasn't checked your network.
+        {%- else %}Nothing is costing you points. Everything found is fixed, marked as seen, or ignored.{% endif %}</li>
       {% endfor %}
     </ol>
     <p class="muted small push-down" id="score-breakdown-note"{% if not s.score_breakdown %} hidden{% endif %}>
-      <b>+N</b> is roughly how far the security score rises once every finding of that type is cleared.</p>
+      <b>+N points</b> is roughly how far the safety score rises once every problem of that type is fixed.</p>
   </section>
+
+  {#- Devices that need attention. The overview is handed no device list, so this is worked out from
+      the problems costing the most points, and says so. If the page is ever handed
+      `devices_attention` (device rows with open_findings), that is used instead. -#}
   <section class="card card-fill">
-    <h2>Feed freshness</h2>
-    <div class="tbl-wrap tbl-scroll">
-    <table class="tbl">
-      <thead><tr><th>Feed</th><th>Status</th><th class="num">Entries</th><th>Updated</th><th>Error</th></tr></thead>
-      <tbody id="feeds-body">
-        {% for f in s.feeds %}
-        <tr>
-          <td class="mono">{{ f.name }}</td>
-          <td>{{ badge(f.status or 'never') }}</td>
-          <td class="num">{{ f.entries|num }}</td>
-          <td title="{{ f.last_updated|ts }}">{{ f.last_updated|ago }}</td>
-          <td class="muted small wrap">{{ f.error or '' }}</td>
-        </tr>
-        {% else %}<tr><td colspan="5" class="empty">No feeds recorded yet. Use <b>Update feeds</b> above to download the
-          blocklists and the CISA KEV catalogue.</td></tr>{% endfor %}
-      </tbody>
-    </table>
-    </div>
+    <div class="card-head"><h2>Devices that need attention</h2><a class="link" href="/devices">All devices →</a></div>
+    {% if devices_attention is defined and devices_attention is not none %}
+    <ol class="cost-list" id="devices-attention">
+      {% for d in devices_attention %}
+      <li class="cost">
+        {% set n = d.to_fix if d.to_fix is defined else (d.open_findings or 0) %}
+        <span class="tl-dot{% if d.worst_severity %} sev-dot-{{ d.worst_severity|css_token }}{% endif %}"{% if d.worst_severity %} title="{{ d.worst_severity }} · {{ d.worst_severity|sev_word }}"{% endif %}></span>
+        <span class="cost-title">{{ ui.device_name(d) }}<br><span class="muted small">
+          {%- if n %}{{ n }} thing{{ '' if n == 1 else 's' }} to fix{% endif %}
+          {%- if n and d.trusted is defined and not d.trusted %} · {% endif %}
+          {%- if d.trusted is defined and not d.trusted %}not marked as yours yet{% endif %}</span></span>
+        {% if d.worst_severity %}<span class="sev-word sev-word-{{ d.worst_severity|css_token }}">{{ d.worst_severity|sev_word }}</span>{% else %}<span></span>{% endif %}
+        <span></span>
+      </li>
+      {% else %}<li class="empty">No device has anything to fix right now.</li>{% endfor %}
+    </ol>
+    {% else %}
+    {% set sev_rank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4} %}
+    {% set placed = s.score_breakdown|selectattr('link_device_id')|list %}
+    <ol class="cost-list" id="devices-attention">
+      {#- One line per device, in the order its costliest problem appears above. -#}
+      {% set order = namespace(ids=[]) %}
+      {% for b in placed %}{% if b.link_device_id not in order.ids %}{% set order.ids = order.ids + [b.link_device_id] %}{% endif %}{% endfor %}
+      {% for device_id in order.ids %}
+      {% set mine = placed|selectattr('link_device_id', 'equalto', device_id)|list %}
+      {% set ns = namespace(sev='info') %}
+      {% for w in mine|map(attribute='severity')|map('lower') %}{% if sev_rank.get(w, 9) < sev_rank.get(ns.sev, 9) %}{% set ns.sev = w %}{% endif %}{% endfor %}
+      {% set first = mine[0] %}
+      <li class="cost">
+        <span class="tl-dot sev-dot-{{ ns.sev|css_token }}" title="{{ ns.sev }} · {{ ns.sev|sev_word }}"></span>
+        <span class="cost-title"><a href="/devices/{{ device_id }}">{{ first.device_label }}</a><br>
+          <span class="muted small">{{ first.plain_title or first.title }}{% if mine|length > 1 %} — and {{ mine|length - 1 }} more{% endif %}</span></span>
+        <span class="sev-word sev-word-{{ ns.sev|css_token }}">{{ ns.sev|sev_word }}</span>
+        <span></span>
+      </li>
+      {% else %}
+      <li class="empty">
+        {%- if staleness.never %}Nothing yet: Home SOC hasn't checked your network.
+        {%- elif s.score_breakdown %}The problems costing the most points are spread across several places — see <a class="link" href="/findings?status=open">Things to fix</a>.
+        {%- else %}No device has a problem that costs points right now.{% endif %}</li>
+      {% endfor %}
+    </ol>
+    {% if not staleness.never %}<p class="muted small push-down">Worked out from the problems that cost the most points above, so a device with
+      only small problems may not be listed. Every device, and what it has to fix, is on the
+      <a class="link" href="/devices">Devices</a> page.</p>{% endif %}
+    {% endif %}
   </section>
 </div>
 
-<div class="grid grid-2">
+<div class="grid grid-2 grid-top">
   <section class="card card-fill">
-    <h2>Jobs</h2>
-    <div class="chips" id="jobs-chips">
-      {% for j in s.jobs %}
-      <span class="chip chip-job" title="last run {{ j.last_run|ts }}{% if j.last_error %} — {{ j.last_error }}{% endif %}">
-        <span class="job-status {{ 'ok' if j.last_status == 'ok' else ('error' if j.last_status in ('error', 'failed') else '') }}"></span>
-        <b>{{ j.name }}</b><span>{{ j.last_status or 'never' }} · {{ j.last_run|ago }}</span>
-      </span>
-      {% else %}<span class="muted">No jobs recorded yet — start with <span class="kbd">python -m homesoc run</span>.</span>{% endfor %}
-    </div>
-    <h2 class="h-mt">Last scans</h2>
-    <div class="chips push-down">
-      {% for kind, ts in s.last_scans.items() %}<span class="chip"><b>{{ kind }}</b> {{ ts|ago }}</span>{% else %}<span class="muted">No scans yet.</span>{% endfor %}
-    </div>
-  </section>
-  <section class="card card-fill">
-    <div class="card-head"><h2>Load-bearing devices</h2><a class="link" href="/map">Dependency map →</a></div>
+    <div class="card-head"><h2>What your home relies on</h2><a class="link" href="/map" title="What depends on what (dependency map)">See the map →</a></div>
+    <p class="page-tech">Load-bearing devices: the ones other devices depend on</p>
     <div class="tbl-wrap">
     <table class="tbl">
-      <thead><tr><th>Device</th><th class="num">Depend on it</th><th>Why</th></tr></thead>
+      <thead><tr><th>Device</th><th class="num">Rely on it</th><th>Why</th></tr></thead>
       <tbody>
         {% for r in load_bearing %}
         <tr>
-          <td class="wrap"><a href="/devices/{{ r.device_id }}">{{ r.label }}</a></td>
-          <td class="num">{{ r.dependents }}</td>
+          <td class="nowrap"><a href="/devices/{{ r.device_id }}">{{ r.label }}</a></td>
+          <td class="num" title="How many other devices or services depend on it">{{ r.dependents }}</td>
           <td class="wrap muted small">{{ r.why or '' }}</td>
         </tr>
         {% else %}<tr><td colspan="3" class="empty">{% if topology_available %}Nothing on this network
-          has other devices depending on it yet.{% else %}No dependency graph yet — it is built by the
-          topology job, which runs after discovery.{% endif %}</td></tr>{% endfor %}
+          has other devices depending on it yet.{% else %}No dependency map yet — it is built by the
+          topology job, which runs after the device check (discovery).{% endif %}</td></tr>{% endfor %}
       </tbody>
     </table>
     </div>
-    <p class="muted small push-down">Home SOC cannot see traffic between devices — it has no packet visibility.
-      This ranking is built from what it observed or can reasonably infer —
+    <p class="muted small push-down">Home SOC cannot see devices talking to each other — it has no packet visibility.
+      This ranking comes from what it observed or can reasonably work out —
       <a class="link" href="/map">see the map</a>.</p>
   </section>
   <section class="card card-fill">
-    <div class="card-head"><h2>Latest events</h2><a class="link" href="/telemetry">All telemetry →</a></div>
-    <ul class="events" id="events-list">
-      {% for e in s.events %}
+    <div class="card-head"><h2>Recent activity</h2><a class="link" href="/telemetry" title="System health (telemetry)">All events →</a></div>
+    <p class="page-tech">Latest events from Home SOC itself</p>
+    {#- The latest six, whole rows: no inner scroll box that cuts the last row through its text on
+        a wall screen. Each row is a plain sentence; the raw log line is in its tooltip. -#}
+    <ul class="events events-plain" id="events-list" data-limit="6">
+      {% for e in s.events[:6] %}
+      {% set lvl = (e.level or 'info')|lower %}
       <li>
-        <span class="e-ts" title="{{ e.ts }}">{{ e.ts|ts }}</span>
-        <span class="e-src">{{ e.source }}</span>
-        <span class="e-msg">{{ badge('level-' ~ (e.level or 'info')|lower, e.level) }} {{ e.message }}</span>
+        <span class="e-ts" title="{{ e.ts|ts }}">{{ e.ts|ago }}</span>
+        <span class="e-msg" title="{{ e.source or 'Home SOC' }}: {{ e.message }}">{% if lvl not in ('info', 'debug') %}{{ badge('level-' ~ lvl, e.level) }} {% endif %}{{ e.plain or e.message }}{% if e.repeats and e.repeats > 1 %} <span class="muted small" title="Happened {{ e.repeats }} times in a row">×{{ e.repeats }}</span>{% endif %}</span>
       </li>
-      {% else %}<li class="empty">No events yet. Anything the agent does — a scan, a feed download, a finding
-        changing state — shows up here.</li>{% endfor %}
+      {% else %}<li class="empty">Nothing yet. Anything Home SOC does — a check, a threat-list download, a
+        problem changing state — shows up here.</li>{% endfor %}
     </ul>
   </section>
 </div>

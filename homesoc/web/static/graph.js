@@ -39,7 +39,21 @@
   var CORNER = 8, LANE = 7;
   var BARYCENTRE_PASSES = 4;
 
-  var COLUMN_TITLES = ['Internet', 'Gateway', 'Infrastructure', 'Devices', 'External services'];
+  /* Plain column names (DESIGN §8.3). The technical names stay in each heading's tooltip. */
+  var COLUMN_TITLES = ['The internet', 'Your router', 'Shared services', 'Your devices', 'Outside services'];
+  var COLUMN_TECH = ['internet', 'default gateway', 'infrastructure', 'devices', 'external services'];
+  /* A duplicated service label ("AirPlay" offered by two speakers) gets its host appended, so
+     the two rows can be told apart without a tooltip; it may use this much more room. */
+  var MAX_LABEL_WIDE = 290;
+  /* What a link means, in words. Never "connection": Home SOC cannot see devices talking to
+     each other (SPEC_TOPOLOGY C1); these are the reasons it believes one relies on another. The
+     edge_type token stays in the tooltip for the owner. */
+  var EDGE_WORDS = {
+    gateway: 'reaches the internet through it', internet: 'the way out to the internet',
+    dns: 'asks it to look up website names', cloud: 'looks up this online service',
+    uses: 'uses a service it announces', hosted_by: 'runs on it',
+    cloud_blocked: 'looked it up and web blocking refused'
+  };
   var SEV_LETTER = { critical: 'C', high: 'H', medium: 'M', low: 'L', info: 'i' };
   var KIND_WORD = {
     device: 'device', internet: 'the internet', resolver: 'DNS resolver',
@@ -118,7 +132,7 @@
      both lost its name to an ellipsis AND had nowhere to go if it had kept it. The suffix now
      carries its own room. */
   function drawnLabel(n) {
-    var name = fitText(n.label, LABEL_SIZE, MAX_LABEL);
+    var name = fitText(n.__shown || n.label, LABEL_SIZE, n.__shown ? MAX_LABEL_WIDE : MAX_LABEL);
     return n.online ? name : name + OFFLINE_SUFFIX;
   }
   function labelWidth(n) { return textWidth(drawnLabel(n), LABEL_SIZE); }
@@ -246,6 +260,21 @@
        before anything reads it, is what makes columnOf(), shape(), nodeTitle() and the C2.6
        hub note work — all four used to branch on a kind no payload has ever carried. */
     nodes.forEach(function (n) { byId[n.id] = n; n.__hub = n.kind === 'provider' && /:hub$/.test(String(n.id)); });
+    /* Two speakers both offering "AirPlay" drew two identical rows whose difference lived only
+       in the tooltip. A duplicated service label carries its host's name on the map itself. */
+    var providerLabels = {};
+    nodes.forEach(function (n) {
+      n.__shown = null;
+      if (n.kind === 'provider') providerLabels[n.label] = (providerLabels[n.label] || 0) + 1;
+    });
+    nodes.forEach(function (n) {
+      if (n.kind !== 'provider' || providerLabels[n.label] < 2) return;
+      var host = n.device_id != null ? byId['device:' + n.device_id] : null;
+      if (!host) {
+        edges.forEach(function (e) { if (!host && e.src === n.id && e.edge_type === 'hosted_by') host = byId[e.dst] || null; });
+      }
+      if (host && host.label) n.__shown = n.label + ' · ' + host.label;
+    });
 
     var indegree = {}, serves = {}, gateways = {}, neighbours = {}, askedBy = {}, blockedOnly = {};
     nodes.forEach(function (n) { indegree[n.id] = 0; serves[n.id] = 0; askedBy[n.id] = 0; neighbours[n.id] = []; });
@@ -448,9 +477,9 @@
   }
 
   function nodeTitle(node, lay) {
-    var bits = [node.label, (node.__hub ? KIND_WORD.hub : KIND_WORD[node.kind]) || node.kind];
+    var bits = [node.__shown || node.label, (node.__hub ? KIND_WORD.hub : KIND_WORD[node.kind]) || node.kind];
     if (node.severity) bits.push('worst open finding: ' + node.severity);
-    if (!node.online) bits.push('offline');
+    if (!node.online) bits.push('offline — not seen at the last network check');
     /* `serves`, not `__weight`: the weight that sizes a node counts every inbound edge, and a
        device's own offered services point at it with `hosted_by`. Reading that as dependents
        told a hover and a screen reader that "2 devices depend on" a printer nothing has ever
@@ -492,7 +521,9 @@
     // column headings, so the left-to-right order is stated and not just implied
     lay.columns.forEach(function (col, c) {
       if (!col.length) return;
-      svg.appendChild(svgEl('text', { x: lay.colX[c] - R_MAX, y: PAD_Y, 'class': 'map-col-title' }, COLUMN_TITLES[c]));
+      var heading = svgEl('text', { x: lay.colX[c] - R_MAX, y: PAD_Y, 'class': 'map-col-title' }, COLUMN_TITLES[c]);
+      heading.appendChild(svgEl('title', null, COLUMN_TITLES[c] + ' (' + COLUMN_TECH[c] + ')'));
+      svg.appendChild(heading);
     });
 
     var gEdges = svgEl('g', { 'class': 'map-edges' });
@@ -511,9 +542,10 @@
       });
       var a = lay.byId[e.src], b = lay.byId[e.dst];
       path.appendChild(svgEl('title', null,
-        a.label + ' → ' + b.label + ' · ' + (isBlockedEdge(e) ? 'asked for, blocked — not a dependency' : (e.edge_type || 'link')) +
-        (e.protocol ? ' (' + e.protocol + ')' : '') + ' · ' + (CONF_WORD[e.confidence] || e.confidence) +
-        (e.evidence ? ' — ' + e.evidence : '')));
+        (a.__shown || a.label) + ' → ' + (b.__shown || b.label) + ' · ' +
+        (isBlockedEdge(e) ? 'asked for, blocked — not a dependency' : (EDGE_WORDS[e.edge_type] || 'relies on it')) +
+        ' · ' + (CONF_WORD[e.confidence] || e.confidence) + (e.evidence ? ' — ' + e.evidence : '') +
+        ' [' + (e.edge_type || 'link') + (e.protocol ? ' · ' + e.protocol : '') + ']'));
       gEdges.appendChild(path);
     });
 
@@ -536,6 +568,9 @@
         height: Math.max(22, lay.rowStep - 2), 'class': 'map-hit'
       }));
       g.appendChild(svgEl('circle', { r: n.__r + 5, 'class': 'map-focus-ring' }));
+      /* A second, dashed ring drawn only while the node has keyboard focus, so focus differs
+         from the blast-radius rings in shape as well as colour (map.css). */
+      g.appendChild(svgEl('circle', { r: n.__r + 9, 'class': 'map-focus-outer' }));
       g.appendChild(shape(n));
       var letter = n.severity ? (SEV_LETTER[n.severity] || '') : '';
       if (letter) {
@@ -558,6 +593,16 @@
       /* The suffix is never the half that gets cut: "Nintendo Switch…" would leave the
          legend's claim about the word "offline" false for exactly the long names most likely
          to be truncated. drawnLabel() gives it its own room and the column reserves for it. */
+      /* A plate in the canvas colour behind the label (and its second line), drawn above the
+         edges: a link that passes a label goes behind it instead of striking through the words.
+         The width follows the drawn font (12.5px against the 11.5px the layout measures). */
+      var plateW = Math.max(labelW * 12.5 / LABEL_SIZE,
+                            twoLine ? textWidth(fitText(subText, 9, MAX_SUBLABEL), 10.5) : 0) + 8;
+      var plateH = Math.min(twoLine ? 26 : 17, lay.rowStep - 1);
+      g.appendChild(svgEl('rect', {
+        x: n.__r + 4, y: twoLine ? -Math.min(13, plateH / 2) : -plateH / 2 - 0.5,
+        width: plateW, height: plateH, rx: 3, 'class': 'map-label-plate'
+      }));
       g.appendChild(svgEl('text', { x: n.__r + 8, y: twoLine ? -1 : 4, 'class': 'map-label' },
                           drawnLabel(n)));
       if (twoLine) {
@@ -761,7 +806,7 @@
     items.forEach(function (d) {
       var li = el('li');
       if (d.device_id != null) {
-        var a = el('a', null, d.label || ('device ' + d.device_id));
+        var a = el('a', null, d.device_label || d.label || ('device ' + d.device_id));
         a.href = '/devices/' + encodeURIComponent(d.device_id);
         li.appendChild(a);
       } else {
@@ -786,7 +831,12 @@
     var kind = el('p', 'map-panel-kind');
     kind.appendChild(el('span', 'badge badge-kind', KIND_WORD[node.kind] || node.kind));
     if (node.severity) kind.appendChild(el('span', 'badge badge-' + node.severity, node.severity));
-    kind.appendChild(el('span', 'badge badge-' + (node.online ? 'online' : 'offline'), node.online ? 'online' : 'offline'));
+    /* "Seen at last check", never a live "online": the map is built from Home SOC's last
+       network check, which may be hours or days old (the banner says when). */
+    var seen = el('span', 'badge badge-' + (node.online ? 'online' : 'offline'),
+                  node.online ? 'seen at last check' : 'not seen at last check');
+    seen.title = node.online ? "Seen at Home SOC's last network check (online)" : "Not seen at Home SOC's last network check (offline)";
+    kind.appendChild(seen);
     body.appendChild(kind);
 
     var blast = state.blast;
@@ -796,7 +846,10 @@
       var counts = blast.counts || {};
       stats.appendChild(statTile(counts.offline != null ? counts.offline : (blast.offline || []).length, 'unreachable', 'lose their only path'));
       stats.appendChild(statTile(counts.degraded != null ? counts.degraded : (blast.degraded || []).length, 'degraded', 'keep working, lose a service'));
-      stats.appendChild(statTile(counts.unaffected != null ? counts.unaffected : (blast.unaffected || []).length, 'unaffected', 'carry on as before'));
+      /* Not "unaffected": Home SOC cannot see devices using each other, so all it can say is
+         that nothing it recorded depends on this one. */
+      stats.appendChild(statTile(counts.unaffected != null ? counts.unaffected : (blast.unaffected || []).length,
+                                 'not known to be affected', 'nothing recorded depends on it'));
       body.appendChild(stats);
       /* The three tiles count devices and nothing else. Without this line "0 unaffected" sat
          beside a picture with four dim nodes in it, and the reader had to guess which of the
@@ -875,10 +928,13 @@
     items.sort(function (a, b) { return String(a.node.label).localeCompare(String(b.node.label)); });
     items.forEach(function (it) {
       var li = el('li');
-      li.appendChild(el('span', 'map-link-name', it.node.label));
-      li.appendChild(el('span', 'map-conf conf-tag-' + it.edge.confidence, it.edge.confidence));
-      var detail = (it.edge.edge_type || 'link') + (it.edge.evidence ? ' — ' + it.edge.evidence : '');
-      li.appendChild(el('span', 'muted small', detail));
+      li.appendChild(el('span', 'map-link-name', it.node.__shown || it.node.label));
+      li.appendChild(el('span', 'map-conf conf-tag-' + it.edge.confidence, CONF_LABEL[it.edge.confidence] || it.edge.confidence));
+      var detail = (EDGE_WORDS[it.edge.edge_type] || 'relies on it') + (it.edge.evidence ? ' — ' + it.edge.evidence : '');
+      var span = el('span', 'muted small', detail);
+      span.title = 'Technical: ' + (it.edge.edge_type || 'link') + (it.edge.protocol ? ' · ' + it.edge.protocol : '') +
+                   ' · ' + it.edge.confidence;
+      li.appendChild(span);
       ul.appendChild(li);
     });
     frag.appendChild(ul);
@@ -1031,8 +1087,9 @@
     if (exit) exit.addEventListener('click', exitBlast);
     var cloud = $('#map-cloud-toggle');
     if (cloud) cloud.addEventListener('click', toggleCloud);
-    var hours = $('#map-hours');
-    if (hours) hours.addEventListener('change', function () { var f = hours.form; if (f) f.submit(); });
+    /* No submit-on-change for the window picker: an arrow key in a select fires "change", so a
+       keyboard user could only ever reach the next option before the page reloaded under them
+       (WCAG 3.2.2). The form's own Apply button submits it. */
   }
 
   function toggleCloud() {
@@ -1047,6 +1104,18 @@
     var seed = $('#initial-map');
     if (!seed) return;
     try { state.raw = JSON.parse(seed.textContent); } catch (e) { return; }
+    /* Devices are named, not numbered: when the server supplies device_label ("Unnamed camera")
+       and the node's own label is only its address, show the name and keep the IP in the
+       tooltip. */
+    if (state.raw && Array.isArray(state.raw.nodes)) {
+      state.raw.nodes.forEach(function (n) {
+        if (n && n.device_label && n.device_label !== n.label && (!n.label || n.label === n.device_ip || /^[0-9.]+$|^[0-9a-f:]+$/i.test(String(n.label)))) {
+          if (n.device_ip && !n.sublabel) n.sublabel = n.device_ip;
+          else if (n.device_ip && String(n.sublabel).indexOf(n.device_ip) < 0) n.sublabel = n.device_ip + ' · ' + n.sublabel;
+          n.label = n.device_label;
+        }
+      });
+    }
     if (!state.raw || !state.raw.nodes || !state.raw.nodes.length) return;
     var body = $('#map-panel-body');
     if (body) { idlePanel = document.createDocumentFragment(); while (body.firstChild) idlePanel.appendChild(body.firstChild); restoreIdlePanel(); }

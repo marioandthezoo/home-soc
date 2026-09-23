@@ -3,35 +3,62 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<title>{{ page_title }} · {{ app_name or 'Home SOC' }}</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e5e0d5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#3a332d" media="(prefers-color-scheme: dark)">
+<title>{{ page_title }}{% if page_tech %} ({{ page_tech }}){% endif %} · {{ app_name or 'Home SOC' }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+{# Not deferred on purpose: it puts data-theme on <html> before the first paint (no flash of
+   the wrong theme). External, because CSP forbids inline script. #}
+<script src="{{ url_for('static', filename='theme.js') }}"></script>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 {% block head %}{% endblock %}
 </head>
 <body data-page="{{ page }}" data-refresh="{{ refresh or 15 }}">
+<a class="skip-link" href="#main">Skip to page content</a>
 <div class="layout">
   <aside class="sidebar">
-    <a class="brand" href="/"><span class="brand-mark">◉</span><span class="brand-name">{{ app_name or 'Home SOC' }}</span></a>
+    <a class="brand" href="/"><span class="brand-mark" aria-hidden="true">◉</span><span class="brand-name">{{ app_name or 'Home SOC' }}<small class="brand-sub">Home network safety</small></span></a>
     <nav class="nav" aria-label="Main">
-      {% for key, href, label in nav %}
-      <a href="{{ href }}" class="nav-link{% if page == key %} active{% endif %}">{{ label }}</a>
+      {% for key, href, label, tech in nav %}
+      <a href="{{ href }}" class="nav-link{% if page == key %} active{% endif %}"{% if page == key %} aria-current="page"{% endif %}{% if tech != label %} title="{{ tech }}"{% endif %}>{{ label }}</a>
+      {% endfor %}
+      <div class="nav-divider" role="presentation">Advanced</div>
+      {% for key, href, label, tech in nav_advanced %}
+      <a href="{{ href }}" class="nav-link{% if page == key %} active{% endif %}"{% if page == key %} aria-current="page"{% endif %}{% if tech != label %} title="{{ tech }}"{% endif %}>{{ label }}</a>
       {% endfor %}
     </nav>
     <div class="sidebar-foot">
-      <div class="statusline"><span class="dot" id="dot-dns"></span> DNS filter: <span id="chip-dns-state" class="muted">{{ 'enabled' if dns_enabled else 'off' }}</span></div>
-      <div class="statusline"><span class="dot{% if has_scheduler %} on{% endif %}"></span> Scheduler: <span class="muted">{{ 'attached' if has_scheduler else 'not attached' }}</span></div>
-      <div class="statusline muted small" id="last-refresh">refresh every {{ refresh or 15 }}s</div>
-      <div class="statusline muted small"><a class="link" href="/feed.rss">activity RSS</a></div>
+      <div class="statusline status-line" title="Web blocking is Home SOC's DNS filter"><span class="dot" id="dot-dns"></span> Blocking: <span id="chip-dns-state" class="muted">{{ 'switched on' if dns_enabled else 'off' }}</span></div>
+      <div class="statusline status-line" title="{{ 'The scheduler is attached, so checks run on a timetable' if has_scheduler else 'No scheduler is attached, so checks only run when started by hand' }}"><span class="dot{% if has_scheduler %} on{% endif %}"></span> Automatic checks: <span class="muted">{{ 'on' if has_scheduler else 'off' }}</span></div>
+      <div class="statusline status-line{% if staleness.stale %} is-stale{% endif %}" id="network-check"
+           title="When Home SOC last finished looking for devices on your network (discovery). It is meant to look every {{ staleness.schedule_minutes }} minutes."
+           data-schedule-minutes="{{ staleness.schedule_minutes }}">
+        {%- if staleness.never -%}Network not checked yet{%- elif staleness.age_text -%}Network last checked {{ staleness.age_text }}{%- else -%}Network check time unknown{%- endif -%}
+      </div>
+      {# The time this SCREEN last refreshed its numbers — not a network check (that is the line above). #}
+      <div class="statusline status-line muted small" id="last-refresh" title="The time this screen last refreshed its numbers. It is not when the network was checked.">Screen refreshes every {{ refresh or 15 }} s</div>
+      <div class="statusline status-line muted small"><a class="link rss" href="/feed.rss">Activity as RSS</a></div>
+      <button type="button" class="btn btn-sm theme-toggle" id="theme-toggle" title="Colour theme">Theme: <span class="theme-mode">Auto</span></button>
     </div>
   </aside>
-  <main class="main">
+  <main class="main" id="main" tabindex="-1">
+    {% block stale_banner %}
+    <div class="status-banner is-stale stale-banner" id="stale-banner" role="status"{% if not staleness.stale %} hidden{% endif %}>
+      <span class="stale-text" id="stale-text">Home SOC last checked your network <b>{{ staleness.age_text or 'a while ago' }}</b> — what you see may be out of date.</span>
+      <button class="btn btn-sm" type="button" data-action="scan" data-kind="quick" title="Runs a quick check now: looks for devices, then their open doors (ports)">Check now</button>
+    </div>
+    {% endblock %}
     <header class="topbar">
-      <h1 class="page-title">{% block heading %}{{ page_title }}{% endblock %}</h1>
+      <div class="page-head">
+        <h1 class="page-title">{% block heading %}{{ page_title }}{% endblock %}</h1>
+        {% block heading_tech %}{% if page_tech %}<span class="page-tech">{{ page_tech }}</span>{% endif %}{% endblock %}
+      </div>
       <div class="topbar-stats">
-        <span class="chip" id="chip-score" title="Security score">score <b data-bind="score">–</b> <span data-bind="grade"></span></span>
-        <span class="chip" title="Open findings">open <b data-bind="open-total">–</b></span>
-        <span class="chip" title="Devices online / total"><b data-bind="devices-online">–</b>/<span data-bind="devices-total">–</span> devices</span>
-        <span class="chip" title="DNS queries in the last 24 h">dns <b data-bind="dns-total">–</b> · <span data-bind="dns-blocked">–</span> blocked</span>
+        <a class="chip" id="chip-score" href="/summary" title="Safety score out of 100; higher is safer">Safety <b data-bind="score">–</b>/100 <span class="chip-word" id="chip-score-word"></span></a>
+        <a class="chip" id="chip-open" href="/findings?status=open" title="Findings that still need attention"><b id="chip-open-total">–</b> <span id="chip-open-text">to fix</span><span class="chip-urgent" id="chip-urgent"></span></a>
+        <a class="chip" id="chip-devices" href="/devices" title="Devices seen at Home SOC's last network check (online), not live"><b data-bind="devices-online">–</b>&nbsp;of&nbsp;<span data-bind="devices-total">–</span> devices seen at last check</a>
+        <a class="chip" id="chip-dns" href="/dns" title="Web blocking (the DNS filter)"><span id="chip-dns-text">Blocking</span></a>
       </div>
     </header>
     <div id="toast" class="toast" hidden></div>
