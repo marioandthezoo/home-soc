@@ -3331,7 +3331,7 @@ def export_data(c: WebContext, full: bool = False) -> dict:
     conn = c.conn
     data = {
         "generated_at": now_iso(),
-        "version": "0.1.0",
+        "version": str(getattr(importlib.import_module("homesoc"), "__version__", "") or ""),
         "findings": findings_list(conn, limit=5000),
         "devices": devices_list(conn),
         "vulns": vulns_list(conn, limit=5000),

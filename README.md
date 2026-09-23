@@ -13,7 +13,7 @@ account to create, no cloud, no telemetry, and no admin rights are needed for th
 
 ![Home SOC dashboard](docs/images/01-overview.png)
 
-🎬 **[Watch the eight-minute walkthrough video](../../releases)** — the whole tool, end to end. It is published as an asset on the latest release.
+🎬 **[Watch the walkthrough video](../../releases/latest)** — *Meet the Household: one week with Home SOC*. Nine minutes, made for everyday people: a family discovers eighteen gadgets on their Wi-Fi and sorts them out one fix a day, with every technical idea explained in plain words (and a few jokes). The MP4 and its subtitles are assets on the latest release.
 
 > **👉 New here? Start with the [walkthrough](docs/WALKTHROUGH.md).**
 > It takes you from download to a dashboard you understand, in order, with the screenshots to match.

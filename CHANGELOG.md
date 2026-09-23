@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-23
+
+### Walkthrough video
+
+- **"Meet the Household: one week with Home SOC"** replaces the earlier technical tour. Nine minutes, aimed
+  at everyday people rather than IT staff: a fictional family finds out they have eighteen devices on the
+  Wi-Fi, not seven, and sorts them out one fix a day. The technical ideas (open ports, Telnet, known and
+  actively exploited flaws, updates, DNS blocking, what depends on what, Lens) are each explained with an
+  everyday analogy, and there are jokes, starting with the first line. Filmed against the redesigned
+  dashboard with web blocking genuinely running. Subtitles included. It is attached to the v0.2.0 release;
+  the pipeline in `video/` re-renders it (`python video/render.py`), and `--script technical` re-renders the
+  longer technical cut.
+
+
 ### Security
 
 Final web-layer pass (2026-09-22), done after the redesign landed and keeping its look and wording:
@@ -395,5 +409,6 @@ First public release. One Python process, one SQLite file, no cloud, no account 
   offline and fixture-driven: it needs no nmap, no administrator rights and no network access.
 - Verified on Python 3.12 (Linux), 3.13 (Windows) and 3.14 (Windows).
 
-[Unreleased]: ../../compare/v0.1.0...HEAD
+[Unreleased]: ../../compare/v0.2.0...HEAD
+[0.2.0]: ../../compare/v0.1.0...v0.2.0
 [0.1.0]: ../../releases/tag/v0.1.0

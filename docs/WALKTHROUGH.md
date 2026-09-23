@@ -167,14 +167,20 @@ in [section 7](#7-living-with-it).
 
 ## 3. Watch it instead
 
-If you would rather see it than read it, the walkthrough video covers the same ground: what the
-program is, the architecture, and a click-through of every dashboard page.
+If you would rather see it than read it, there is a walkthrough video made for people who are not
+technical. *Meet the Household: one week with Home SOC* follows a family who guess they have seven
+gadgets on the Wi-Fi, find out it is eighteen (one of them a camera nobody remembers buying), and sort
+things out one fix a day. Each technical idea this guide covers — open ports, Telnet, flaws attackers
+are actively using, updates, DNS blocking, what depends on what, Lens — gets an everyday analogy, and
+there are jokes along the way.
 
-[![Home SOC walkthrough video — click to watch](images/01-overview.png)](../../../releases)
+[![Home SOC walkthrough video — click to watch](images/01-overview.png)](../../../releases/latest)
 
-**[Watch the walkthrough](../../../releases)** — 8 minutes, narrated, with subtitles included. The MP4 and its subtitle track are assets on the latest release.
+**[Watch the walkthrough](../../../releases/latest)** — 9 minutes, narrated, with subtitles included. The MP4 and its subtitle track are assets on the latest release.
 
-The video was recorded against the same fictional demo network as the screenshots below.
+The video was recorded against the same fictional demo network as the screenshots below, with web
+blocking genuinely running. The first release's more technical tour of the earlier design is still
+attached to [v0.1.0](../../../releases/tag/v0.1.0).
 
 ---
 
@@ -1028,7 +1034,7 @@ database — hence the `--data video/demo_data` on each line. On your own instal
 
 ```
 $ python -m homesoc --config config.example.toml --data video/demo_data status
-Home SOC 0.1.0  data=video\demo_data  config=config.example.toml
+Home SOC 0.2.0  data=video\demo_data  config=config.example.toml
 score: 10 (F)   open findings: critical 2, high 6, medium 12, low 10, info 3
 costing the most points:
   NET-SVC-001   Telnet open on 192.168.1.142:23                   fixing it: +4
