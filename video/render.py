@@ -1,15 +1,29 @@
-"""End-to-end orchestrator for the Home SOC walkthrough video.
+"""End-to-end orchestrator for the Home SOC walkthrough films.
 
-    python video/render.py                 # the whole pipeline
-    python video/render.py --no-capture    # reuse build/shots, recompose
-    python video/render.py --only 06-findings
+    python video/render.py                          # the everyday film, end to end
+    python video/render.py --script technical       # the 16-minute technical cut
+    python video/render.py --no-capture             # reuse the shots, recompose
+    python video/render.py --only 06-tuesday-telnet
     python video/render.py --no-seed --no-narrate --no-capture --force
 
-Pipeline
+Two films (``--script``, default ``everyday``):
+
+    everyday   script_everyday.py + slides_everyday.py, build in build/everyday/,
+               -> out/HomeSOC-walkthrough.mp4 (+ .srt)
+    technical  script.py + slides.py, build in build/,
+               -> out/HomeSOC-walkthrough-technical.mp4 (+ .srt)
+
+Before the first everyday render, whatever ``out/HomeSOC-walkthrough.*`` held (the technical
+cut) is moved to ``out/archive/`` with its date - a previous film is never deleted.
+
+Pipeline (``<build>`` is the film's build directory)
 --------
 1. ``seed_demo.py``  builds ``video/demo_data/homesoc.db`` (never touches ``data/``)
-2. ``narrate.py``    edge-tts -> ``build/audio/*.mp3`` + ``build/timings.json`` + the SRT
-3. ``capture.py``    Playwright -> ``build/shots/*.png`` + ``build/geometry.json``
+2. ``narrate.py``    edge-tts, one segment per stretch between [beat] marks, joined with
+                     exact silences -> ``<build>/audio/scene_NN.wav`` + ``timings.json`` +
+                     ``beats.json`` + the SRT. The film's script is imported only after this,
+                     so actions timed with ``narrate.beat_at``/``phrase_at`` are current.
+3. ``capture.py``    Playwright -> ``<build>/shots/*.png`` + ``<build>/geometry.json``
                      + ``build/shots_manifest.json``.  For the Lens act this also drives
                      the phone context (``phone.py``), the illustrated scene and its
                      camera clip (``scene_render.py``), and the decode sidecar
@@ -35,9 +49,11 @@ database: only ``video/demo_data`` is ever written to.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -54,23 +70,47 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import compose as C  # noqa: E402  (needs HERE on sys.path)
+import narrate as N  # noqa: E402
 
 log = logging.getLogger("homesoc.video.render")
 
-BUILD = HERE / "build"
+OUT_DIR = HERE / "out"
+DEMO_DB = HERE / "demo_data" / "homesoc.db"
+
+# Per film, rebound by configure(). Defaults are the everyday film's.
+FILM: N.Film = N.film_profile("everyday")
+BUILD = FILM.build
 SHOTS = BUILD / "shots"
 CLIPS = BUILD / "clips"
 AUDIO = BUILD / "audio"
 PADDED = BUILD / "audio_padded"
-OUT_DIR = HERE / "out"
-OUT_MP4 = OUT_DIR / "HomeSOC-walkthrough.mp4"
-OUT_SRT = OUT_DIR / "HomeSOC-walkthrough.srt"
-
-DEMO_DB = HERE / "demo_data" / "homesoc.db"
+OUT_MP4 = FILM.out_mp4
+OUT_SRT = FILM.out_srt
 TIMINGS = BUILD / "timings.json"
 GEOMETRY = BUILD / "geometry.json"
 MANIFEST = BUILD / "shots_manifest.json"
 TIMELINE = BUILD / "timeline.json"
+
+
+def configure(film: N.Film) -> None:
+    """Point every path at ``film``'s build directory and deliverables, and pick its look."""
+    global FILM, BUILD, SHOTS, CLIPS, AUDIO, PADDED, OUT_MP4, OUT_SRT
+    global TIMINGS, GEOMETRY, MANIFEST, TIMELINE, TARGET_MIN_SECONDS, TARGET_MAX_SECONDS
+    FILM = film
+    BUILD = film.build
+    SHOTS = BUILD / "shots"
+    CLIPS = BUILD / "clips"
+    AUDIO = film.audio_dir
+    PADDED = BUILD / "audio_padded"
+    OUT_MP4 = film.out_mp4
+    OUT_SRT = film.out_srt
+    TIMINGS = film.timings
+    GEOMETRY = BUILD / "geometry.json"
+    MANIFEST = BUILD / "shots_manifest.json"
+    TIMELINE = BUILD / "timeline.json"
+    TARGET_MIN_SECONDS = film.target_min * 60
+    TARGET_MAX_SECONDS = film.target_max * 60
+    C.set_look(film.look)
 
 SEED_TIMEOUT = 900
 NARRATE_TIMEOUT = 1800
@@ -79,10 +119,9 @@ NARRATE_TIMEOUT = 1800
 CAPTURE_TIMEOUT = 3600
 FFMPEG_TIMEOUT = 1800
 
-#: CONTRACT_V2 V1: target length for the finished film.
-# CONTRACT_V2's preamble, raised from 11-14 when the dependency-map act arrived.
-TARGET_MIN_SECONDS = 15 * 60
-TARGET_MAX_SECONDS = 16 * 60
+#: Target length of the finished film, from the film profile (a note, never a failure).
+TARGET_MIN_SECONDS = FILM.target_min * 60
+TARGET_MAX_SECONDS = FILM.target_max * 60
 
 AUDIO_RATE = 48000
 AUDIO_CH = 2
@@ -103,6 +142,8 @@ def run_step(name: str, argv: Sequence[str], timeout: float, cwd: Path | None = 
     print("    " + " ".join(argv), flush=True)
     started = time.perf_counter()
     proc: subprocess.Popen[str] | None = None
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"   # the child's output is decoded as UTF-8 below
     try:
         proc = subprocess.Popen(
             list(argv),
@@ -113,6 +154,7 @@ def run_step(name: str, argv: Sequence[str], timeout: float, cwd: Path | None = 
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            env=env,
         )
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -124,13 +166,28 @@ def run_step(name: str, argv: Sequence[str], timeout: float, cwd: Path | None = 
         raise RenderError(f"{name} timed out after {timeout:.0f}s") from exc
     finally:
         if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+            _stop_tree(proc)
     print(f"    done in {time.perf_counter() - started:.1f}s", flush=True)
+
+
+def _stop_tree(proc: subprocess.Popen[Any]) -> None:
+    """Stop a step *and everything it started*.
+
+    ``capture.py`` owns a dashboard (with the resolver), a decode sidecar and Chrome. On
+    Windows ``terminate()`` ends only the python process, and those children survive it -
+    a render interrupted mid-capture left a demo dashboard serving on 8899 with a resolver on
+    53530. ``taskkill /T`` takes the whole tree.
+    """
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True, check=False, timeout=30)
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 def ffmpeg(args: Sequence[str], what: str, timeout: float = FFMPEG_TIMEOUT) -> None:
@@ -198,6 +255,11 @@ class SceneJob:
     stamp: Path
     last_png: Path
 
+    #: film graphics the script asks for over this scene (``script.OVERLAYS``)
+    overlays: tuple[Any, ...] = ()
+    #: the last scene: seconds of fade to the canvas colour at its very end
+    fade_out: float = 0.0
+
     plan: C.ScenePlan | None = None
     reused: bool = False
     elapsed: float = 0.0
@@ -205,14 +267,24 @@ class SceneJob:
     seconds: float = 0.0
 
 
-def load_script() -> Any:
+def load_script(*, fresh: bool = False) -> Any:
+    """The film's scene script. ``fresh`` re-imports it after narration, because a script may
+    time its actions with ``narrate.beat_at``/``phrase_at``, which read the beats narration
+    has just measured - the copy imported before narration ran would carry stale ``at``s."""
+    import importlib
+
+    name = FILM.script_module
     try:
-        import script  # type: ignore
+        module = sys.modules.get(name)
+        if module is not None and fresh:
+            module = importlib.reload(module)
+        elif module is None:
+            module = importlib.import_module(name)
     except Exception as exc:  # noqa: BLE001
-        raise RenderError(f"cannot import video/script.py: {type(exc).__name__}: {exc}") from exc
-    if not getattr(script, "SCENES", None):
-        raise RenderError("video/script.py defines no SCENES")
-    return script
+        raise RenderError(f"cannot import video/{name}.py: {type(exc).__name__}: {exc}") from exc
+    if not getattr(module, "SCENES", None):
+        raise RenderError(f"video/{name}.py defines no SCENES")
+    return module
 
 
 def load_json(path: Path, what: str, required: bool = True) -> dict[str, Any]:
@@ -334,7 +406,8 @@ def fingerprint(job: SceneJob, previous: str) -> str:
     for module in ("compose.py", "phone.py"):
         path = HERE / module
         h.update(f"{module}|{path.stat().st_mtime_ns if path.exists() else 0}".encode())
-    h.update(f"{job.narration_seconds:.4f}|{job.extra_tail:.3f}".encode())
+    h.update(f"look={C.LOOK}".encode())
+    h.update(f"{job.narration_seconds:.4f}|{job.extra_tail:.3f}|{job.fade_out:.3f}".encode())
     for st in job.states:
         for png in (st.png, getattr(st, "scene_png", None)):
             if png is None:
@@ -351,7 +424,8 @@ def fingerprint(job: SceneJob, previous: str) -> str:
     if plan is not None:
         h.update(repr((plan.n_frames, plan.caption, plan.moves, plan.clicks, plan.taps,
                        plan.swaps, plan.highlights, plan.cameras, plan.fixed,
-                       sorted(plan.phone_states))).encode())
+                       sorted(plan.phone_states), plan.overlays, plan.caption_until,
+                       plan.fade_out)).encode())
     return h.hexdigest()
 
 
@@ -467,6 +541,7 @@ def retime_srt(jobs: Sequence[SceneJob], timings: dict[str, Any]) -> str | None:
             out.append(f"{n}\n{_srt_ts(t0 + delta)} --> {_srt_ts(t1 + delta)}\n{body}\n")
     payload = "\n".join(out)
     OUT_SRT.write_text(payload, encoding="utf-8")
+    N.record_deliverable(FILM, OUT_SRT)
     return payload
 
 
@@ -475,9 +550,26 @@ def retime_srt(jobs: Sequence[SceneJob], timings: dict[str, Any]) -> str | None:
 # --------------------------------------------------------------------------
 
 
+def check_narration_current(script: Any) -> None:
+    """Refuse to compose against narration recorded for different words (``--no-narrate``)."""
+    timings = load_json(TIMINGS, f"{TIMINGS.relative_to(HERE)}")
+    stale = []
+    for scene in script.SCENES:
+        row = timings.get(str(scene.id)) or {}
+        recorded = row.get("text_hash")
+        if recorded and recorded != N.text_hash(" ".join(str(scene.narration).split())):
+            stale.append(str(scene.id))
+    if stale:
+        raise RenderError(
+            f"the narration on disk was recorded for different words in: {', '.join(stale)}. "
+            "Run without --no-narrate (cached segments are reused, so it is quick)."
+        )
+
+
 def collect_jobs(script: Any, only: set[str] | None) -> list[SceneJob]:
     timings = load_json(TIMINGS, "build/timings.json")
     scenes = list(script.SCENES)
+    overlays = dict(getattr(script, "OVERLAYS", {}) or {})
     jobs: list[SceneJob] = []
     for i, scene in enumerate(scenes, start=1):
         sid = str(scene.id)
@@ -488,7 +580,7 @@ def collect_jobs(script: Any, only: set[str] | None) -> list[SceneJob]:
                 f"[{sid}] timings.json has no narration duration - run narrate.py "
                 f"(or pass --no-narrate only when build/timings.json is complete)"
             )
-        audio = Path(row["audio"]) if row.get("audio") else AUDIO / f"scene_{i:02d}.mp3"
+        audio = Path(row["audio"]) if row.get("audio") else AUDIO / f"scene_{i:02d}.wav"
         if not audio.is_absolute():
             audio = (HERE / audio).resolve()
         jobs.append(
@@ -499,7 +591,10 @@ def collect_jobs(script: Any, only: set[str] | None) -> list[SceneJob]:
                 states=C.load_states(BUILD, sid, scene),
                 narration_seconds=seconds,
                 audio=audio if audio.exists() else None,
-                extra_tail=C.END_ROOM_TONE if i == len(scenes) else 0.0,
+                # the last scene holds its end card, then fades (C.END_HOLD, C.END_FADE)
+                extra_tail=(C.END_ROOM_TONE + C.END_HOLD) if i == len(scenes) else 0.0,
+                fade_out=C.END_FADE if i == len(scenes) else 0.0,
+                overlays=tuple(overlays.get(sid, ())),
                 clip=CLIPS / f"{i:02d}-{sid}.mp4",
                 stamp=CLIPS / f"{i:02d}-{sid}.json",
                 last_png=CLIPS / f"{i:02d}-{sid}.last.png",
@@ -536,6 +631,7 @@ def compose_all(
     done_frames = 0
     wall = time.perf_counter()
 
+    prev_job: SceneJob | None = None
     for job in jobs:
         job.plan = C.build_plan(
             job.scene,
@@ -545,7 +641,11 @@ def compose_all(
             cursor_start=cursor,
             strict=True,
             extra_tail=job.extra_tail,
+            overlays=job.overlays,
+            drift_from=_carried_drift(prev_job, job),
+            fade_out=job.fade_out,
         )
+        prev_job = job
         job.seconds = job.plan.n_frames / C.FPS
         want = fingerprint(job, previous_hash)
         selected = only is None or job.scene_id in only
@@ -632,6 +732,24 @@ def compose_all(
         t += job.seconds
 
 
+def _carried_drift(prev: SceneJob | None, job: SceneJob) -> float | None:
+    """The slide drift a scene inherits when it opens on the slide the last one ended on.
+
+    Scene 07 ends on the umbrella and scene 08 opens on it. Restarting the push at 1.0x under
+    the head dissolve blended two framings of the same drawing - every line of text doubled.
+    Carrying the previous scene's scale on makes the dissolve a dissolve between identical
+    frames, which is to say invisible.
+    """
+    if prev is None or prev.plan is None or prev.plan.drift_end is None:
+        return None
+    if not job.states or job.states[0].kind != "slide" or not prev.states:
+        return None
+    before = C.plan_transitions(prev.scene)
+    last_key = before[-1].key if before else C._target_key(C._seq_members(prev.scene.shot)[0], None)
+    first_key = C._target_key(C._seq_members(job.scene.shot)[0], None)
+    return prev.plan.drift_end if last_key == first_key else None
+
+
 def concat_clips(jobs: Sequence[SceneJob], dest: Path) -> None:
     listing = CLIPS / "concat.txt"
     listing.write_text(
@@ -650,7 +768,10 @@ def mux(video: Path, audio: Path, dest: Path) -> None:
             "-i", str(video), "-i", str(audio),
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", "-shortest",
+            # No -shortest: build_audio pads the narration to exactly the video's length, and
+            # -shortest still trimmed the last frames of an equal-length video (16543 of 16546,
+            # even with max_interleave_delta 0) - here, the last tenth of the end card's fade.
+            "-movflags", "+faststart", "-max_interleave_delta", "0",
             str(dest),
         ],
         "mux narration onto the video",
@@ -705,8 +826,9 @@ def verify(dest: Path, jobs: Sequence[SceneJob]) -> list[str]:
     # Length is a target, not a contract check: say so, do not fail the render for it.
     if dur and not TARGET_MIN_SECONDS <= dur <= TARGET_MAX_SECONDS:
         print(
-            f"  note      {dur / 60:.1f} min is outside CONTRACT_V2's 15-16 minute target - "
-            f"trim or extend the narration in script.py"
+            f"  note      {dur / 60:.1f} min is outside the {FILM.name} film's "
+            f"{FILM.target_min:g}-{FILM.target_max:g} minute target - trim or extend the "
+            f"narration in {FILM.script_module}.py"
         )
     return problems
 
@@ -734,9 +856,12 @@ def write_timeline(jobs: Sequence[SceneJob]) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="Render the Home SOC walkthrough video end to end.",
+        description="Render a Home SOC walkthrough film end to end.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    ap.add_argument("--script", default=N.DEFAULT_FILM, metavar="FILM",
+                    help="which film: everyday (out/HomeSOC-walkthrough.mp4) or technical "
+                         "(out/HomeSOC-walkthrough-technical.mp4)")
     ap.add_argument("--only", metavar="ID[,ID]", help="recompose only these scene ids")
     ap.add_argument("--no-seed", action="store_true", help="reuse video/demo_data")
     ap.add_argument(
@@ -761,6 +886,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
+    # A child's line may carry any character (U+FFFD from a replaced byte, a curly quote from
+    # a page title); a cp1252 console must not crash the render over printing it.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.reconfigure(errors="replace")  # type: ignore[attr-defined]
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
@@ -771,17 +901,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
 
     started = time.perf_counter()
-    script = load_script()
+    try:
+        configure(N.select_film(args.script))
+    except N.NarrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
+    print(f"film: {FILM.name}  ({FILM.script_module}.py, {FILM.slides_module}.py, "
+          f"look {FILM.look})  build {BUILD}  ->  {OUT_MP4}", flush=True)
 
     if args.list:
+        try:
+            script = load_script()
+        except RenderError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
         for i, sc in enumerate(script.SCENES, 1):
-            print(f"  {i:02d}  {sc.id:<22} {len(sc.narration.split()):4d} words  "
+            spoken = N.strip_marks(sc.narration)
+            beats = len(N.BEAT_RE.findall(sc.narration))
+            print(f"  {i:02d}  {sc.id:<28} {len(spoken.split()):4d} words  {beats:2d} beats  "
                   f"caption={sc.caption!r}")
         return 0
 
     try:
         py = sys.executable
+        film_arg = ["--script", FILM.name]
         if not args.no_seed:
             seed = HERE / "seed_demo.py"
             if not seed.exists():
@@ -804,9 +948,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cmd.append("--force")
                 run_step("seed demo data", cmd, SEED_TIMEOUT)
         if not args.no_narrate:
-            run_step("narrate", [py, str(HERE / "narrate.py")], NARRATE_TIMEOUT)
+            run_step("narrate", [py, str(HERE / "narrate.py"), *film_arg], NARRATE_TIMEOUT)
+        # Imported only now: a script that times actions with narrate.beat_at()/phrase_at()
+        # must see the beats narration has just measured.
+        script = load_script(fresh=True)
+        check_narration_current(script)
         if not args.no_capture:
-            cmd = [py, str(HERE / "capture.py")]
+            cmd = [py, str(HERE / "capture.py"), *film_arg]
             if only:
                 cmd += ["--only", ",".join(sorted(only))]
             run_step("capture", cmd, CAPTURE_TIMEOUT)
@@ -837,8 +985,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         track = BUILD / "narration.wav"
         secs = build_audio(jobs, track)
         print(f"    audio track {secs:.2f}s", flush=True)
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        OUT_MP4.parent.mkdir(parents=True, exist_ok=True)
+        N.archive_previous(FILM)          # never overwrite a film this pipeline did not write
         mux(silent, track, OUT_MP4)
+        N.record_deliverable(FILM, OUT_MP4)
 
         write_timeline(jobs)
         srt = retime_srt(jobs, timings)
@@ -855,7 +1005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print("\n  OK - every ffprobe check passed.")
         return 0
-    except (RenderError, C.ComposeError, FileNotFoundError) as exc:
+    except (RenderError, N.NarrationError, C.ComposeError, FileNotFoundError) as exc:
         print(f"\nerror: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

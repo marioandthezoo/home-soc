@@ -117,18 +117,66 @@ PROJECT_ROOT: Final[Path] = HERE.parent
 if str(HERE) not in sys.path:  # so `python video/capture.py` finds script.py / slides.py
     sys.path.insert(0, str(HERE))
 
-BUILD: Final[Path] = HERE / "build"
-SHOTS_DIR: Final[Path] = BUILD / "shots"
+BUILD_ROOT: Final[Path] = HERE / "build"
 DEMO_DATA: Final[Path] = HERE / "demo_data"
-GEOMETRY_PATH: Final[Path] = BUILD / "geometry.json"
-MANIFEST_PATH: Final[Path] = BUILD / "shots_manifest.json"
-DASHBOARD_LOG: Final[Path] = BUILD / "dashboard.log"
-DEMO_CONFIG: Final[Path] = BUILD / "demo_config.toml"
+
+# Everything below is per film and is (re)bound by :func:`configure` - the everyday film
+# captures into build/everyday/, the technical cut into build/ as it always has. The defaults
+# are the everyday film's, so importing this module without configuring it is still coherent.
+BUILD: Path = BUILD_ROOT / "everyday"
+SHOTS_DIR: Path = BUILD / "shots"
+GEOMETRY_PATH: Path = BUILD / "geometry.json"
+MANIFEST_PATH: Path = BUILD / "shots_manifest.json"
+DASHBOARD_LOG: Path = BUILD / "dashboard.log"
+DEMO_CONFIG: Path = BUILD / "demo_config.toml"
 #: Throwaway copy of demo_data that the dashboard is allowed to write to.
-WORK_DATA: Final[Path] = BUILD / "demo_data_run"
+WORK_DATA: Path = BUILD / "demo_data_run"
 #: Generated wrapper that starts the dashboard with a fictional machine identity.
-SERVE_LAUNCHER: Final[Path] = BUILD / "serve_demo.py"
-SIDECAR_LOG: Final[Path] = BUILD / "decode_sidecar.log"
+SERVE_LAUNCHER: Path = BUILD / "serve_demo.py"
+SIDECAR_LOG: Path = BUILD / "decode_sidecar.log"
+#: The film's scene script and slide modules, and the colour scheme the browser reports.
+SCRIPT_MODULE: str = "script_everyday"
+SLIDES_MODULE: str = "slides_everyday"
+#: "light" is the dashboard's Stone & Sage day theme. The redesigned style.css follows
+#: prefers-color-scheme, so a "dark" browser is shown the cocoa Dusk theme instead.
+COLOR_SCHEME: str = "light"
+FILM_NAME: str = "everyday"
+#: Blur the film script's ``REDACTIONS`` (the unbranded router, real brand domains on Blocking)
+#: on every page it settles. A film rule, so ``shoot_docs.py`` switches it off for the docs.
+REDACT: bool = True
+
+
+def configure(film: Any) -> None:
+    """Point every per-film path and module at ``film`` (a ``narrate.Film``)."""
+    global BUILD, SHOTS_DIR, GEOMETRY_PATH, MANIFEST_PATH, DASHBOARD_LOG, DEMO_CONFIG
+    global WORK_DATA, SERVE_LAUNCHER, SIDECAR_LOG, PHONE_DIR
+    global SCRIPT_MODULE, SLIDES_MODULE, COLOR_SCHEME, FILM_NAME
+    BUILD = Path(film.build)
+    SHOTS_DIR = BUILD / "shots"
+    GEOMETRY_PATH = BUILD / "geometry.json"
+    MANIFEST_PATH = BUILD / "shots_manifest.json"
+    DASHBOARD_LOG = BUILD / "dashboard.log"
+    DEMO_CONFIG = BUILD / "demo_config.toml"
+    WORK_DATA = BUILD / "demo_data_run"
+    SERVE_LAUNCHER = BUILD / "serve_demo.py"
+    SIDECAR_LOG = BUILD / "decode_sidecar.log"
+    PHONE_DIR = SHOTS_DIR
+    SCRIPT_MODULE = str(film.script_module)
+    SLIDES_MODULE = str(film.slides_module)
+    COLOR_SCHEME = str(film.color_scheme)
+    FILM_NAME = str(film.name)
+    # scene_render.py draws a different object for each film (the everyday film's small white
+    # box, the technical cut's navy bullet camera) and reads which one from here at import.
+    import os  # noqa: PLC0415
+
+    os.environ["HOMESOC_VIDEO_FILM"] = FILM_NAME
+
+
+def _import(name: str) -> Any:
+    import importlib
+
+    return importlib.import_module(name)
+
 
 def _pick_port(preferred: int, *, tries: int = 24) -> int:
     """``preferred`` if loopback is free there, else the next free port above it.
@@ -180,8 +228,8 @@ SIDECAR_SCRIPT: Final[Path] = HERE / "decode_sidecar.py"
 SIDECAR_PORT: Final[int] = _pick_port(max(8901, PORT + 1))
 #: Scenes whose narration calls the identification a *scan*, so it has to be a real one.
 SCAN_SCENES: Final[frozenset[str]] = frozenset({"18-lens-scan"})
-#: Where the phone screens land, next to the desktop shots.
-PHONE_DIR: Final[Path] = BUILD / "shots"
+#: Where the phone screens land, next to the desktop shots (rebound by configure()).
+PHONE_DIR: Path = BUILD / "shots"
 
 VIEWPORT_W: Final[int] = 1600
 VIEWPORT_H: Final[int] = 900
@@ -263,39 +311,34 @@ FREEZE_JS: Final[str] = """
 }
 """
 
-#: The demo dashboard is started with `homesoc serve`, and `cmd_serve` deliberately passes
-#: ``with_dns=False`` — "dashboard only" never binds the resolver, whatever the config says.
-#: (`homesoc run`, which is what run.bat launches, does start it.) The consequence in the video
-#: was that every page reported the resolver STOPPED while the narration described a house
-#: resolving through it, and while the same pages showed twenty-four hours of query log, hourly
-#: bars and 774 blocks that only a running resolver could have produced. That contradiction is an
-#: artefact of the capture harness, not of the product, so the three places the page reports it
-#: are set to what a `run.bat` instance shows. Nothing else about the resolver is touched: the
-#: traffic, the block rate and the reputation cache all come from the seeded database.
-#: It re-applies on a timer because app.js rewrites the sidebar dot from /api/summary every
-#: refresh tick.
-RESOLVER_RUNNING_JS: Final[str] = """
-() => {
-  const fix = () => {
-    const dot = document.getElementById('dot-dns');
-    if (dot && dot.className !== 'dot on') dot.className = 'dot on';
-    const state = document.getElementById('chip-dns-state');
-    if (state && state.textContent !== 'running') state.textContent = 'running';
-    document.querySelectorAll('span.badge-off').forEach(el => {
-      const text = (el.textContent || '').trim();
-      if (text === 'stopped' || text === 'enabled, not running') {
-        el.className = 'badge badge-ok';
-        el.textContent = 'running';
-      }
-    });
-  };
-  fix();
-  if (!window.__homesocResolver) {
-    window.__homesocResolver = setInterval(fix, 250);
-  }
-  return true;
-}
-"""
+#: Web blocking is REALLY running in the film. `homesoc serve` ("dashboard only") never starts
+#: the resolver - `cmd_serve` passes ``with_dns=False`` - so a plain serve reports "Web blocking
+#: is switched on but not running" next to twenty-four hours of blocked look-ups. The v2 cut
+#: papered over that with a script that rewrote the three indicators to "running"; that script
+#: is gone. Instead the capture launcher (``build/serve_demo.py``) starts the product's own
+#: embedded resolver - ``Runtime.start_dns()``, exactly what `homesoc run` does - bound to
+#: 127.0.0.1 on a free high port (never 53, never the LAN), and :func:`verify_blocking_running`
+#: refuses to capture unless the dashboard, the Home banner, the sidebar chip and the Blocking
+#: page all say so on their own. Nothing queries the resolver during a capture, so the query
+#: log, the hourly bars and the block counts are still exactly what the seed wrote.
+DNS_PORT_PREFERRED: Final[int] = 53530
+
+
+def _pick_dns_port(preferred: int, *, tries: int = 40) -> int:
+    """A loopback port free for both UDP and TCP, at or above ``preferred``."""
+    for candidate in range(preferred, preferred + tries):
+        try:
+            with (socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp,
+                  socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp):
+                udp.bind(("127.0.0.1", candidate))
+                tcp.bind(("127.0.0.1", candidate))
+        except OSError:
+            continue
+        return candidate
+    raise RuntimeError(f"no free loopback port for the demo resolver in {preferred}-{preferred + tries}")
+
+
+DNS_PORT: Final[int] = _pick_dns_port(DNS_PORT_PREFERRED)
 
 #: The /feed "Kinds" box showed four whole rows and then a fifth sliced horizontally through
 #: the middle of its letters — the first thing the eye lands on for the whole Activity feed
@@ -543,8 +586,11 @@ port = {port}
 token = ""
 refresh_seconds = 15
 
+# The real resolver, on loopback and a free high port (see DNS_PORT_PREFERRED).
 [dns]
 enabled = true
+listen = "127.0.0.1"
+port = {dns_port}
 
 [feeds]
 enabled = false
@@ -600,6 +646,90 @@ def apply_lens_settings(data_dir: Path) -> None:
     finally:
         conn.close()
 
+def apply_dns_settings(data_dir: Path) -> None:
+    """Pin the working copy's resolver to 127.0.0.1:``DNS_PORT``.
+
+    The seed saves ``dns.listen = 0.0.0.0`` and ``dns.port = 53`` in the settings table (what a
+    household's Settings page would hold), and the settings table wins over any config file.
+    Left alone, the capture's resolver would try to answer the author's whole LAN on port 53.
+    Only the working copy is changed; ``video/demo_data`` is never written.
+    """
+    db_path = data_dir / "homesoc.db"
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn = sqlite3.connect(db_path, timeout=15)
+    try:
+        for key, value in (("dns.enabled", "true"), ("dns.listen", "127.0.0.1"),
+                           ("dns.port", str(DNS_PORT))):
+            conn.execute(
+                "INSERT OR REPLACE INTO settings(key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now),
+            )
+        # The harness's own plumbing: the seed saved web.port 8787 and a toast preference, the
+        # capture serves on PORT with toasts off, and the dashboard logs a *warning* that
+        # "Settings-page values are overriding config.toml" when the two disagree - which then
+        # heads the "What happened" feed in every shot of it. Only rows that already exist are
+        # brought into line; nothing a viewer is told about is changed.
+        for key, value in (("web.port", str(PORT)), ("notify.windows_toast", "false")):
+            conn.execute("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?",
+                         (value, now, key))
+        conn.commit()
+    except sqlite3.Error as exc:
+        raise CaptureError(f"could not point the demo resolver at 127.0.0.1:{DNS_PORT}: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def sync_blocklist_mtimes(data_dir: Path) -> None:
+    """Give every feed file the age the seeded ``feeds`` table says it has.
+
+    The running resolver judges a blocklist's age by its file's modification time
+    (NET-DNS-003 fires past three days). The files in ``video/demo_data/feeds`` carry whatever
+    date they were downloaded on, which is not the fiction the database tells; the database is
+    the authority, so the copy's files are dated to match it. If the seed itself is old, the
+    resolver will say so - truthfully - and :func:`report_resolver_findings` prints it.
+    """
+    db_path = data_dir / "homesoc.db"
+    feeds = data_dir / "feeds"
+    if not feeds.is_dir():
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        try:
+            rows = conn.execute("SELECT name, last_updated FROM feeds").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("could not read the feeds table to date the blocklists: %s", exc)
+        return
+    for name, stamp in rows:
+        if not stamp:
+            continue
+        try:
+            when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        for path in feeds.glob(f"{name}.*"):
+            if path.suffix == ".sha256" or not path.is_file():
+                continue
+            with suppress(OSError):
+                os.utime(path, (when, when))
+
+
+def open_findings(data_dir: Path) -> dict[str, tuple[str, str]]:
+    """``{dedupe_key: (finding_id, severity)}`` of every open finding in the working copy."""
+    try:
+        conn = sqlite3.connect(f"file:{data_dir / 'homesoc.db'}?mode=ro", uri=True, timeout=10)
+        try:
+            rows = conn.execute(
+                "SELECT dedupe_key, finding_id, severity FROM findings WHERE status = 'open'"
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {str(k): (str(f), str(s)) for k, f, s in rows}
+
+
 #: The wrapper the demo dashboard is started through. It patches nothing in the installed
 #: product — it rebinds two lookups *in its own process* before the CLI runs, so the
 #: certificate, the pairing URL and every "this machine" string in the dashboard describe
@@ -625,6 +755,28 @@ from homesoc import cli
 
 _record = cli.record_bind_state
 cli.record_bind_state = lambda conn, host, port: _record(conn, {lan_ip!r}, {lan_port!r})
+
+# Web blocking, for real. `serve` is "dashboard only" and passes with_dns=False; the film needs
+# the resolver running the way `homesoc run` runs it, so Runtime.start is asked for it here -
+# the product's own Runtime.start_dns() binds the product's own DnsServer, on the loopback
+# address and high port the demo config names. The scheduler stays manual-only (serve's
+# choice), so nothing is ever scanned. If the resolver cannot bind, the capture stops: the
+# film does not get to show "running" unless something is running.
+_start = cli.Runtime.start
+
+
+def _start_with_resolver(self, *, with_scheduler=True, with_dns=None, manual_only=False):
+    _start(self, with_scheduler=with_scheduler, with_dns=True, manual_only=manual_only)
+    server = self.dns_server
+    if server is None or not getattr(server, "running", False):
+        error = getattr(server, "last_error", None) or "see the log above"
+        sys.stderr.write(f"capture: the web-blocking resolver did not start: {{error}}\\n")
+        sys.stderr.flush()
+        raise SystemExit(3)
+    print(f"capture: web-blocking resolver running on {{server.listen}}:{{server.port}}", flush=True)
+
+
+cli.Runtime.start = _start_with_resolver
 
 sys.exit(cli.main(sys.argv[1:]))
 '''
@@ -703,6 +855,8 @@ def make_working_copy(source: Path) -> Path:
     # fictional identity regenerates a clean one on the first --tls start.
     shutil.rmtree(dest / "tls", ignore_errors=True)
     apply_lens_settings(dest)
+    apply_dns_settings(dest)
+    sync_blocklist_mtimes(dest)
     logger.info("serving a working copy of %s from %s", source, dest)
     return dest
 
@@ -745,7 +899,7 @@ class Dashboard:
         DEMO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
         lens = "\n".join(f"{key} = {_toml_value(value)}" for key, value in DEMO_LENS.items())
         DEMO_CONFIG.write_text(
-            DEMO_CONFIG_TOML.format(port=self.port, lens=lens), encoding="utf-8"
+            DEMO_CONFIG_TOML.format(port=self.port, lens=lens, dns_port=DNS_PORT), encoding="utf-8"
         )
         return DEMO_CONFIG
 
@@ -770,11 +924,68 @@ class Dashboard:
         DASHBOARD_LOG.parent.mkdir(parents=True, exist_ok=True)
         self._log = DASHBOARD_LOG.open("wb")
         logger.info("starting dashboard: %s", " ".join(cmd))
+        before = open_findings(self.data_dir)
         self.proc = subprocess.Popen(
             cmd, cwd=str(PROJECT_ROOT), env=env,
             stdout=self._log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         )
-        self._wait_ready()
+        try:
+            self._wait_ready()
+            self._wait_resolver(before)
+        except BaseException:
+            self.stop()
+            raise
+
+    def _summary(self) -> dict[str, Any]:
+        with urllib.request.urlopen(f"{BASE_URL}/api/summary", timeout=10, context=_TLS_CTX) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def _wait_resolver(self, before: dict[str, tuple[str, str]]) -> None:
+        """The dashboard must report the real resolver running, and its first health pass done.
+
+        The resolver checks its own health on its first housekeeping tick (5 s after it binds)
+        and files or resolves NET-DNS-00x findings from what it sees. That is part of what a
+        running Home SOC shows, so it is allowed to happen - but *before* the first shot, never
+        between two scenes, where it would change a number the voice has already spoken.
+        """
+        deadline = time.monotonic() + 20.0
+        running = False
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise CaptureError(
+                    f"the dashboard exited ({self.proc.returncode}) - the web-blocking resolver "
+                    f"could not start on 127.0.0.1:{DNS_PORT}.\n{self._tail_log()}"
+                )
+            with suppress(Exception):
+                running = bool((self._summary().get("dns") or {}).get("running"))
+            if running:
+                break
+            time.sleep(0.5)
+        if not running:
+            raise CaptureError(
+                "the dashboard does not report web blocking as running, so the film would say "
+                f"'switched on but not running'. Its log:\n{self._tail_log()}"
+            )
+        try:
+            if str(PROJECT_ROOT) not in sys.path:
+                sys.path.insert(0, str(PROJECT_ROOT))
+            from homesoc.dnsfilter import server as dns_server_mod  # noqa: PLC0415
+
+            tick = float(getattr(dns_server_mod, "HOUSEKEEPING_TICK", 5.0))
+        except Exception:  # noqa: BLE001 - the product is read, never required to import here
+            tick = 5.0
+        time.sleep(tick + 2.0)
+        after = open_findings(self.data_dir)
+        opened = sorted(set(after) - set(before))
+        closed = sorted(set(before) - set(after))
+        print(f"  web blocking: running on 127.0.0.1:{DNS_PORT} (the product's own resolver)",
+              flush=True)
+        for key in opened:
+            print(f"  NOTE the running resolver opened {after[key][0]} ({after[key][1]}) {key} - "
+                  "counts on screen include it", flush=True)
+        for key in closed:
+            print(f"  NOTE the running resolver resolved {before[key][0]} {key} - counts on "
+                  "screen no longer include it", flush=True)
 
     def _wait_ready(self) -> None:
         deadline = time.monotonic() + READY_TIMEOUT
@@ -857,9 +1068,7 @@ def demo_camera(data_dir: Path) -> DemoCamera:
     """
     wanted_ip = ""
     with suppress(Exception):
-        import script  # type: ignore[import-not-found]
-
-        wanted_ip = str(getattr(script, "CAMERA_IP", "") or "")
+        wanted_ip = str(getattr(_import(SCRIPT_MODULE), "CAMERA_IP", "") or "")
 
     db_path = data_dir / "homesoc.db"
     try:
@@ -1184,9 +1393,12 @@ def scene_assets(*, y4m: Path | None = None, png: Path | None = None) -> SceneAs
                                check=False, timeout=180)
 
     if found_y4m is None:
-        found_y4m = next(iter(sorted(BUILD.rglob("*.y4m"))), None)
+        # scene_render.py writes into video/build/ whichever film is being captured
+        found_y4m = next(iter(sorted(BUILD_ROOT.glob("*.y4m"))), None) or next(
+            iter(sorted(BUILD.rglob("*.y4m"))), None)
     if found_png is None:
-        found_png = next(iter(sorted(BUILD.rglob("scene*.png"))), None)
+        found_png = next(iter(sorted(BUILD_ROOT.glob("scene*.png"))), None) or next(
+            iter(sorted(BUILD.rglob("scene*.png"))), None)
     return SceneAssets(found_y4m if found_y4m and found_y4m.is_file() else None,
                        found_png if found_png and found_png.is_file() else None)
 
@@ -1222,9 +1434,10 @@ def resolve_scene_png(name: str, assets: SceneAssets) -> Path | None:
                 if found is not None:
                     return found
         for candidate in (f"scene_{name}.png", f"{name}.png", f"scene_camera_{name}.png"):
-            found = _as_path(BUILD / candidate)
-            if found is not None:
-                return found
+            for root in (BUILD, BUILD_ROOT):
+                found = _as_path(root / candidate)
+                if found is not None:
+                    return found
     # One illustration, many names for it: with a single render, the name is decoration.
     return assets.png
 
@@ -1282,10 +1495,41 @@ class Capturer:
         with suppress(Exception):
             self.page.evaluate(FREEZE_JS, self.frozen_label)
         with suppress(Exception):
-            self.page.evaluate(RESOLVER_RUNNING_JS)
-        with suppress(Exception):
             self.page.evaluate(WHOLE_ROWS_JS)
+        self.redact()
         self.page.wait_for_timeout(SETTLE_MS)
+
+    def redact(self) -> int:
+        """Blur the film's ``REDACTIONS`` on this page (SCRIPT.md capture checklist 2 and 5).
+
+        The film's script module may define ``redaction_js(path)``; its script blurs the
+        router's make and model and real brand domains in place, text only, layout untouched.
+        It is idempotent, so a second pass that still finds something to blur means the
+        first pass missed a match - that fails the capture rather than film it legibly.
+        """
+        path = self.current_path
+        if not path or not REDACT:
+            return 0
+        try:
+            module = _import(SCRIPT_MODULE)
+        except ImportError:
+            return 0
+        make_js = getattr(module, "redaction_js", None)
+        if make_js is None:
+            return 0
+        js = make_js(path)
+        if not js:
+            return 0
+        count = int(self.page.evaluate(js) or 0)
+        again = int(self.page.evaluate(js) or 0)
+        if again:
+            raise CaptureError(
+                f"redaction on {path!r} left {again} match(es) legible after its first pass"
+            )
+        if count:
+            logger.info("redacted %d string(s) on %s", count, path)
+            print(f"    redacted {count} string(s) on {path}", flush=True)
+        return count
 
     def scroll_to(self, y: int) -> None:
         self.page.evaluate("(y) => window.scrollTo(0, y)", int(y))
@@ -1301,7 +1545,28 @@ class Capturer:
     def shoot(self, dest: Path) -> Path:
         dest.parent.mkdir(parents=True, exist_ok=True)
         self.page.screenshot(path=str(dest), full_page=False, animations="disabled", caret="hide")
+        self._record_fingerprint(dest)
         return dest
+
+    def _record_fingerprint(self, dest: Path) -> None:
+        """Beside a shot of /lens/pair, the Security fingerprint exactly as that page shows it.
+
+        The compositor draws the tablet's side of "check the long code matches" from this file,
+        so the code on the drawn tablet is the code in the frame - never typed, never recomputed
+        from a certificate a later capture may have regenerated.
+        """
+        side = dest.with_suffix(".fingerprint.txt")
+        side.unlink(missing_ok=True)
+        if not (self.current_path or "").startswith("/lens/pair"):
+            return
+        text = ""
+        with suppress(Exception):
+            text = str(self.page.evaluate(
+                "() => { const f = document.querySelector('.fingerprint');"
+                " return f ? f.innerText : ''; }") or "")
+        text = " ".join(text.split())
+        if text:
+            side.write_text(text + "\n", encoding="utf-8")
 
     def set_content(self, html: str) -> None:
         self.page.set_content(html, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -1373,16 +1638,83 @@ class Capturer:
         self.page.mouse.click(x, y)
 
 
+# --------------------------------------------------------------------------- web blocking, on screen
+
+#: What the three places that report web blocking must say before a single shot is taken.
+_BLOCKING_STATE_JS: Final[str] = """
+() => {
+  const text = (document.body && document.body.innerText) || '';
+  const chip = document.getElementById('chip-dns');
+  const side = document.getElementById('chip-dns-state');
+  const theme = getComputedStyle(document.documentElement).colorScheme || '';
+  return {
+    notRunning: /not running/i.test(text),
+    chip: chip ? { off: chip.classList.contains('is-off'), text: chip.innerText.trim() } : null,
+    side: side ? side.textContent.trim() : null,
+    bodyBg: getComputedStyle(document.body).backgroundColor,
+    theme: theme,
+    dataTheme: document.documentElement.getAttribute('data-theme') || '',
+  };
+}
+"""
+
+
+def verify_blocking_running(cap: Capturer) -> None:
+    """Refuse to capture unless Home, the Blocking chip and the Blocking page say "running".
+
+    This reads the pages exactly as the film will photograph them - nothing is injected - and
+    leaves ``verify_blocking_home.png`` / ``verify_blocking_dns.png`` in the build directory
+    to look at.
+    """
+    problems: list[str] = []
+    for path, name in (("/", "home"), ("/dns", "dns")):
+        cap.goto(path)
+        try:
+            cap.page.wait_for_function(
+                "() => { const s = document.getElementById('chip-dns-state');"
+                " return !s || s.textContent.trim() === 'running'; }",
+                timeout=CHART_TIMEOUT_MS,
+            )
+        except Exception:  # noqa: BLE001 - reported below with what the page actually says
+            pass
+        state = cap.page.evaluate(_BLOCKING_STATE_JS)
+        cap.shoot(BUILD / f"verify_blocking_{name}.png")
+        if state.get("notRunning"):
+            problems.append(f"{path} says 'not running' somewhere on the page")
+        chip = state.get("chip")
+        if chip is None or chip.get("off"):
+            problems.append(f"{path}: the topbar Blocking chip is {chip!r}")
+        if state.get("side") not in (None, "running"):
+            problems.append(f"{path}: the sidebar says 'Blocking: {state.get('side')}'")
+        if path == "/dns":
+            badge = cap.page.locator(".kpi .badge").first
+            label = badge.inner_text().strip() if badge.count() else ""
+            if label.lower() != "running":
+                problems.append(f"/dns: the Blocking page's status badge reads {label!r}")
+        print(f"  on screen {path:<5} chip={chip} sidebar={state.get('side')!r} "
+              f"theme={state.get('theme') or '?'} body={state.get('bodyBg')}", flush=True)
+    if problems:
+        raise CaptureError(
+            "web blocking does not read as running on screen:\n  " + "\n  ".join(problems)
+            + f"\nLook at {BUILD / 'verify_blocking_home.png'} and verify_blocking_dns.png."
+        )
+
+
 # --------------------------------------------------------------------------- slides
 
 
 def load_slides() -> dict[str, Any]:
-    """``{name: callable_or_html}`` from ``video/slides.py``."""
+    """``{name: callable_or_html}`` from the film's slide module.
+
+    ``video/slides.py`` for the technical cut, ``video/slides_everyday.py`` for the everyday
+    film. Both expose ``SLIDES``, so both go through exactly the same path: the HTML is set as
+    the page content of the capture browser and screenshotted at 1600x900 @2x.
+    """
     try:
-        import slides  # type: ignore[import-not-found]
+        slides = _import(SLIDES_MODULE)
     except ImportError as exc:
         raise CaptureError(
-            f"cannot import {HERE / 'slides.py'} - slide HTML must exist before capture ({exc})"
+            f"cannot import {SLIDES_MODULE}.py - slide HTML must exist before capture ({exc})"
         ) from exc
     registry = getattr(slides, "SLIDES", None)
     if isinstance(registry, dict) and registry:
@@ -1395,7 +1727,7 @@ def load_slides() -> dict[str, Any]:
     if found:
         return found
     raise CaptureError(
-        f"{HERE / 'slides.py'} exposes neither a SLIDES dict nor any slide_* functions"
+        f"{SLIDES_MODULE}.py exposes neither a SLIDES dict nor any slide_* functions"
     )
 
 
@@ -1408,7 +1740,7 @@ def slide_html(registry: dict[str, Any], name: str, *, scene_id: str = "-") -> s
                 break
     if entry is None:
         raise CaptureError(
-            f"{scene_id}: slides.py has no slide named {name!r}. "
+            f"{scene_id}: {SLIDES_MODULE}.py has no slide named {name!r}. "
             f"Available: {', '.join(sorted(registry)) or '(none)'}"
         )
     try:
@@ -1447,14 +1779,14 @@ class SceneResult:
 
 def load_scenes() -> list[Any]:
     try:
-        import script  # type: ignore[import-not-found]
+        script = _import(SCRIPT_MODULE)
     except ImportError as exc:
         raise CaptureError(
-            f"cannot import {HERE / 'script.py'} - the scene script must exist before capture ({exc})"
+            f"cannot import {SCRIPT_MODULE}.py - the scene script must exist before capture ({exc})"
         ) from exc
     scenes = getattr(script, "SCENES", None)
     if not scenes:
-        raise CaptureError(f"{HERE / 'script.py'} defines no non-empty SCENES list")
+        raise CaptureError(f"{SCRIPT_MODULE}.py defines no non-empty SCENES list")
     return list(scenes)
 
 
@@ -2192,7 +2524,7 @@ def capture(
             context = browser.new_context(
                 viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
                 device_scale_factor=SCALE,
-                color_scheme="dark",
+                color_scheme=COLOR_SCHEME,
                 reduced_motion="reduce",
                 ignore_https_errors=True,   # the demo certificate is self-signed by design
                 base_url=BASE_URL,
@@ -2203,6 +2535,8 @@ def capture(
             _strip_csp(context)
             page = context.new_page()
             cap = Capturer(page, frozen_label=frozen_label)
+            if dashboard is not None:
+                verify_blocking_running(cap)
 
             if not no_slides:
                 slide_pngs = capture_slides(cap, registry, slide_names)
@@ -2312,6 +2646,8 @@ def _write_outputs(results: dict[str, SceneResult], slide_pngs: dict[str, Path])
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Capture the Home SOC dashboard for the walkthrough video.")
+    parser.add_argument("--script", default=None, metavar="FILM",
+                        help="which film: everyday (default) | technical")
     parser.add_argument("--only", metavar="ID[,ID]", help="only capture these scene ids")
     parser.add_argument("--slides-only", action="store_true", help="render the slides and stop")
     parser.add_argument("--no-slides", action="store_true", help="skip the slides, capture pages only")
@@ -2331,7 +2667,17 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s: %(message)s",
     )
     data_dir = Path(args.data).expanduser().resolve()
-    print(f"capture: data={data_dir} port={PORT} viewport={VIEWPORT_W}x{VIEWPORT_H}@{SCALE}x")
+    try:
+        from narrate import NarrationError, select_film  # noqa: PLC0415 - sibling module
+
+        configure(select_film(args.script))
+    except NarrationError as exc:
+        print(f"capture: {exc}", file=sys.stderr)
+        return 2
+    print(f"capture: film={FILM_NAME} ({SCRIPT_MODULE}.py, {SLIDES_MODULE}.py, {COLOR_SCHEME}) "
+          f"build={BUILD}")
+    print(f"capture: data={data_dir} port={PORT} resolver=127.0.0.1:{DNS_PORT} "
+          f"viewport={VIEWPORT_W}x{VIEWPORT_H}@{SCALE}x")
     try:
         capture(
             data_dir=data_dir,

@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -850,6 +851,10 @@ def capture_phone(
     }
 
 
+#: How many fresh decodes a recognition-flash shot may take to photograph its 600 ms window.
+HIT_ATTEMPTS = 4
+
+
 def _quietly(fn: Callable[[], Any]) -> None:
     with suppress(Exception):
         fn()
@@ -934,7 +939,43 @@ def _one_shot(phone: _Phone, shot: dict[str, Any], *, out_dir: Path, decoding: b
     # it, and a scroll (120 ms) plus the usual 420 ms settle would spend the whole window
     # before the shutter. There is nothing to scroll on the viewfinder anyway.
     if hit:
-        phone.page.wait_for_timeout(int(_shot_field(shot, "settle_ms", default=40) or 40))
+        # The shutter goes first and the geometry after it (the reticle does not move), and a
+        # missed window is retried with a fresh page and a fresh real decode rather than
+        # accepted: on a busy machine one 3x screenshot can outlast lens.js's 600 ms.
+        hit_settle = int(_shot_field(shot, "settle_ms", default=40) or 40)
+        png = out_dir / f"{shot_id}.png"
+        for attempt in range(1, HIT_ATTEMPTS + 1):
+            if attempt > 1:
+                phone.clear_latency()
+                phone.page.wait_for_timeout(700)
+                phone.reload()
+                phone.camera_ok = phone.wait_camera(required=True)
+                decoded = phone.go_hit(
+                    shot_id=shot_id, expect=str(code) if code else None,
+                    hold_ms=int(_shot_field(shot, "hit_ms", default=2600) or 2600),
+                )
+            phone.page.wait_for_timeout(hit_settle)
+            started = time.monotonic()
+            phone.page.screenshot(path=str(png), full_page=False, animations="disabled", caret="hide")
+            still_green = bool(phone.page.evaluate(
+                "() => { const r = document.getElementById('reticle');"
+                " return !!r && r.classList.contains('is-hit'); }"
+            ))
+            took = (time.monotonic() - started) * 1000
+            if still_green:
+                logger.info("  [phone] %s recognition flash caught on attempt %d (shutter %.0f ms)",
+                            shot_id, attempt, took)
+                break
+            logger.warning("  [phone] %s attempt %d: the green window closed during a %.0f ms "
+                           "shutter; retrying with a fresh decode", shot_id, attempt, took)
+        else:
+            phone.clear_latency()
+            raise PhoneError(
+                f"{shot_id}: the reticle's 600 ms green window closed before the shutter "
+                f"on all {HIT_ATTEMPTS} attempts. This shot exists to show the flash the "
+                "narration names, so a white reticle here would be a still frame pretending "
+                "to be a beat. Take it on a less busy machine."
+            )
     else:
         scroll = phone.scroll_to(scroll, state=state)
         for target in taps:
@@ -953,22 +994,11 @@ def _one_shot(phone: _Phone, shot: dict[str, Any], *, out_dir: Path, decoding: b
             geometry[str(target)] = rect
 
     png = out_dir / f"{shot_id}.png"
-    phone.page.screenshot(path=str(png), full_page=False, animations="disabled", caret="hide")
-    _check_size(png, shot_id)
-
     if hit:
-        still_green = bool(phone.page.evaluate(
-            "() => { const r = document.getElementById('reticle');"
-            " return !!r && r.classList.contains('is-hit'); }"
-        ))
-        phone.clear_latency()
-        if not still_green:
-            raise PhoneError(
-                f"{shot_id}: the reticle's 600 ms green window closed before the shutter. "
-                "This shot exists to show the flash the narration names, so a white "
-                "reticle here would be a still frame pretending to be a beat. Lower "
-                "settle_ms, or take it on a less busy machine."
-            )
+        phone.clear_latency()   # photographed above, inside the green window
+    else:
+        phone.page.screenshot(path=str(png), full_page=False, animations="disabled", caret="hide")
+    _check_size(png, shot_id)
 
     # A burst, for a state whose subject is *moving*. The viewfinder is a real video
     # element playing build/scene_camera.y4m, which carries the handheld drift CONTRACT_V2

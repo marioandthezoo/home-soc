@@ -12,13 +12,21 @@ real hostname, the data directory would be the thing at fault, not this script.
 
 How a shot is taken
 -------------------
-Viewport 1600x900 CSS at ``device_scale_factor=2``, dark theme, so Chrome renders a
+Viewport 1600x900 CSS at ``device_scale_factor=2``, day theme (the default), so Chrome renders a
 3200x1800 image; :mod:`PIL` then downsamples it to 1600x900 and writes an optimised PNG.
 Text ends up crisp and the files stay a few hundred kilobytes instead of a few megabytes.
 
 Between-run jitter is killed the same way :mod:`capture` kills it: its ``FREEZE_CSS`` (no
-animations, no scrollbars, no focus rings), its ``FREEZE_JS`` (pins the "updated hh:mm:ss"
-label), its resolver-state fix, and Playwright's fixed clock.
+animations, no scrollbars, no focus rings), its ``FREEZE_JS`` (pins the sidebar's "Screen
+refreshed h:mm" label), and Playwright's fixed clock. The working copy's timestamps are moved
+forward (:func:`freshen`) so the household reads as checked five minutes ago.
+
+Web blocking is really running, exactly as in the film: ``capture.Dashboard`` starts the demo
+dashboard through ``capture``'s launcher, which asks the product's own ``Runtime.start_dns()`` for
+the embedded resolver on 127.0.0.1 and a free high port (never 53, never the LAN). Before the first
+shot, ``capture.verify_blocking_running`` refuses to continue unless Home, the Blocking chip, the
+sidebar and the Blocking page all say it is running. Nothing is repainted. The film's redactions
+(the unbranded router, brand domains on Blocking) are a film rule and are not applied here.
 
 Scroll offsets are not hand-tuned pixel numbers. Each shot names the thing that has to be on
 screen (``reveal=``, or ``foot=True`` for "the last screenful") and the page is scrolled by
@@ -37,9 +45,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
+import sqlite3
 import sys
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
 
@@ -72,6 +82,61 @@ logger = logging.getLogger("homesoc.video.shoot_docs")
 
 class ShootError(RuntimeError):
     """Anything that stops the shoot, always naming the image at fault."""
+
+
+# --------------------------------------------------------------------------- fresh demo data
+
+_TS: Final = re.compile(r"^(\d{4}-\d{2}-\d{2})(T\d{2}(?::\d{2}(?::\d{2}(?:\.\d+)?)?)?)?(Z|[+-]\d{2}:\d{2})?$")
+
+
+def _shifter(delta: timedelta):
+    def shift(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        m = _TS.match(value)
+        if not m:
+            return value
+        date, tpart, tz = m.group(1), m.group(2) or "", m.group(3) or ""
+        if not tpart:
+            return (datetime.strptime(date, "%Y-%m-%d") + delta).strftime("%Y-%m-%d")
+        body = date + tpart
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H"):
+            try:
+                return (datetime.strptime(body, fmt) + delta).strftime(fmt) + tz
+            except ValueError:
+                continue
+        return value
+    return shift
+
+
+def freshen(db: Path) -> None:
+    """Move every timestamp in the WORKING COPY forward so its last network check was five
+    minutes ago. The seeded household is days old by the time anyone regenerates the docs, and a
+    stale picture would put the "last checked 8 days ago" banner (correctly) on every image.
+    Only ``video/build/`` is touched; ``video/demo_data`` stays exactly as seeded."""
+    conn = sqlite3.connect(db)
+    try:
+        last = conn.execute("SELECT max(finished_at) FROM scans WHERE kind='discovery'").fetchone()[0]
+        if not last:
+            return
+        then = datetime.strptime(str(last)[:19], "%Y-%m-%dT%H:%M:%S")
+        delta = datetime.now(timezone.utc).replace(tzinfo=None) - then - timedelta(minutes=5)
+        conn.create_function("shift_ts", 1, _shifter(delta), deterministic=True)
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for t in tables:
+            for col in [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")')]:
+                where = (f'WHERE typeof("{col}")=\'text\' AND '
+                         f'"{col}" GLOB \'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*\'')
+                try:
+                    conn.execute(f'UPDATE "{t}" SET "{col}"=shift_ts("{col}") {where}')
+                except sqlite3.IntegrityError:  # a unique key: step aside, then shift
+                    conn.execute(f'UPDATE "{t}" SET "{col}"=\'~\' || "{col}" {where}')
+                    conn.execute(f'UPDATE "{t}" SET "{col}"=shift_ts(substr("{col}", 2)) '
+                                 f'WHERE typeof("{col}")=\'text\' AND "{col}" GLOB \'~*\'')
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- injected JS
@@ -178,42 +243,42 @@ class Shot:
 SHOTS: Final[tuple[Shot, ...]] = (
     Shot(
         "01-overview", path="/",
-        shows="The Overview: security score and grade, open findings by severity, the device "
-              "count, 24 hours of DNS filtering and what to fix first.",
+        shows="Home (the overview): the one-sentence status, the safety score, what needs fixing "
+              "by urgency, the devices, web blocking over 24 hours and what to fix first.",
     ),
     Shot(
         "02-activity-feed", path="/feed",
-        shows="The activity feed — one timeline of everything that happened, with the kind "
-              "chips and filters that narrow it.",
+        shows="What happened (the activity feed): one timeline of everything that happened, with "
+              "each row's urgency in words, and the chips and filters that narrow it.",
     ),
     Shot(
         "03-summary", path="/summary", reveal="#chart-found-remediated",
-        shows="The security summary: score, found all time, remediated and still open, over "
-              "the found-versus-remediated-by-severity chart.",
+        shows="Your safety report (the security summary): score, found all time, fixed and still "
+              "to fix, over the found-and-fixed-by-urgency chart.",
     ),
     Shot(
         "04-findings", path="/findings?status=open",
-        shows="The findings list, open only and sorted by severity, so the criticals and "
-              "highs come first.",
+        shows="Things to fix (the findings list): what needs attention, most urgent first, each "
+              "with its plain headline, why it matters and the device it is on.",
     ),
     Shot(
         "05-finding-detail", path="/findings?status=open&severity=critical",
         click='#findings-table tbody tr.expandable[data-category="lan-services"]',
         reveal='#findings-table tr.expandable[data-category="lan-services"] + tr.detail-row',
-        shows="A critical finding expanded — the exposed Telnet service on the unknown "
-              "camera, with its evidence and its numbered remediation steps.",
+        shows="A \"Fix now\" finding opened: the exposed Telnet service on the unnamed camera, "
+              "with what Home SOC found, how to fix it, and the technical details one click away.",
     ),
     Shot(
         "06-devices", path="/devices",
-        shows="The device inventory: every address on the LAN with its vendor, kind, open "
-              "findings and when it was last seen.",
+        shows="Devices: every device by name with its address beside it, its kind, whether it "
+              "was seen at the last check, what it has to fix and whether it is yours.",
     ),
     Shot(
         # The identity card is as tall as the seven-day presence table beside it, so the last
         # screenful is the one worth showing: services, matched CVEs and findings together.
         "07-device-detail", path="/devices/18", foot=True,
-        shows="One device in detail — the unknown camera: its four open services, the CVE "
-              "matched against its web server, and the six findings raised on it.",
+        shows="One device in detail — the unnamed camera: its open doors (ports), the known "
+              "software flaw matched against its web server, and what depends on what.",
     ),
     Shot(
         # The table is only seven rows, so the frame would be two thirds empty. Expanding the
@@ -221,33 +286,34 @@ SHOTS: Final[tuple[Shot, ...]] = (
         # and what to do — while the KEV badge and the EPSS column stay in shot above it.
         "08-vulnerabilities", path="/vulns",
         click="#vulns-table tbody tr.expandable:first-child",
-        shows="The CVE table matched from service banners — the KEV badge and the EPSS column "
-              "that decide what gets fixed first, with the one KEV row opened.",
+        shows="Known software flaws (the CVE table): whether attackers are known to use each one "
+              "(KEV), how bad it could be (CVSS) and the chance it is exploited somewhere in the "
+              "next 30 days (EPSS), with the KEV row opened.",
     ),
     Shot(
         # Defender sits at the top (112-532) and the posture grid starts at 546, so the top of
         # the page is the only offset that gets both into one frame.
         "09-host-posture", path="/host",
-        shows="Host posture on Windows: the Defender panel, pending updates, and the posture "
-              "checks with their measured and expected values.",
+        shows="This computer (host posture on Windows): the antivirus panel, pending updates, and "
+              "the safety settings with what was found.",
     ),
     Shot(
         # /dns is 4700px tall and no single 900px frame holds all of it. The top gives the two
         # numbers the page exists for — queries and block rate — the per-hour chart and the top
         # blocked domains; the live query log is the same page, 1800px further down.
         "10-dns-filter", path="/dns",
-        shows="The DNS filter: queries and block rate over 24 hours, blocked requests per hour "
-              "in red, and the domains being blocked most.",
+        shows="Web blocking (the DNS filter): look-ups and blocks over 24 hours, the per-hour "
+              "chart, and the websites being blocked most, with the reason in words.",
     ),
     Shot(
-        "11-telemetry", path="/telemetry", reveal="card:Jobs", snap=".metrics-grid > *",
-        shows="Telemetry: the metrics the agent records about itself and the scheduler's job "
-              "table, with run counts, failures, durations and last errors.",
+        "11-telemetry", path="/telemetry", reveal="card:Background jobs", snap=".metrics-grid > *",
+        shows="System health (telemetry): whether each of Home SOC's background jobs is working, "
+              "in plain words, with the technical job table one click away.",
     ),
     Shot(
         "12-scans", path="/scans",
-        shows="Scan history — every scan the agent has run, what kind it was, how long it "
-              "took and what it found.",
+        shows="Checks (scan history): when each check last ran and how it went, with the full "
+              "history one click away.",
     ),
     Shot(
         "13-architecture", slide="architecture",
@@ -373,13 +439,21 @@ def shoot(
     capture.DEMO_CONFIG = DEMO_CONFIG
     capture.DASHBOARD_LOG = DASHBOARD_LOG
 
+    # The architecture diagram (13) is a slides.py slide; capture.py now defaults to the
+    # everyday film's slide module, which has no such slide.
+    capture.SLIDES_MODULE = "slides"
     registry = capture.load_slides()
     tmp_dir = capture.BUILD / "docs_shots_raw"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().replace(second=0, microsecond=0)
-    frozen_label = "updated " + now.strftime("%I:%M:%S %p").lstrip("0")
+    # The sidebar line is the SCREEN's refresh time, never a network check (app.js words it the
+    # same way); pinned so two runs of the same shoot give identical pixels.
+    frozen_label = "Screen refreshed " + now.strftime("%I:%M %p").lstrip("0")
+    # The film's REDACTIONS (unbranded router, blurred brand domains) are a film rule, not a
+    # documentation one: the docs show the demo household's pages as the product draws them.
+    capture.REDACT = False
 
     needs_dashboard = any(s.slide is None for s in wanted)
     written: list[tuple[str, int, int]] = []
@@ -389,8 +463,16 @@ def shoot(
     with sync_playwright() as p:
         try:
             if needs_dashboard:
+                work = capture.make_working_copy(data_dir)
+                freshen(work / "homesoc.db")
+                # freshen() moved feeds.last_updated forward; date the blocklist files to match,
+                # or the running resolver (rightly) reports them as stale.
+                capture.sync_blocklist_mtimes(work)
                 dashboard = capture.Dashboard(
-                    data_dir=capture.make_working_copy(data_dir), port=PORT
+                    data_dir=work, port=PORT,
+                    # Plain HTTP on loopback, matching BASE_URL above: no Lens page is shot here,
+                    # and capture.Dashboard now defaults to --tls for the video's Lens scenes.
+                    tls=False,
                 )
                 dashboard.start()
 
@@ -398,7 +480,7 @@ def shoot(
             context = browser.new_context(
                 viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
                 device_scale_factor=SCALE,
-                color_scheme="dark",
+                color_scheme="light",   # the day theme, which is what a new install shows
                 reduced_motion="reduce",
                 base_url=capture.BASE_URL,
             )
@@ -408,6 +490,9 @@ def shoot(
             capture._strip_csp(context)
             page = context.new_page()
             cap = capture.Capturer(page, frozen_label=frozen_label)
+            if needs_dashboard and not probe:
+                # The same gate the film passes: the real resolver, reading "running" on its own.
+                capture.verify_blocking_running(cap)
 
             for i, s in enumerate(wanted, start=1):
                 scroll = 0
@@ -489,8 +574,19 @@ python video/seed_demo.py --force     # only if video/demo_data/homesoc.db is mi
 python video/shoot_docs.py
 ```
 
-Each image is 1600x900, rendered in the dark theme at 2x and downsampled, so the text stays
-sharp on a high-DPI display.
+Each image is 1600x900, rendered in the day theme ("Stone & Sage", the default) at 2x and
+downsampled, so the text stays sharp on a high-DPI display. The dusk theme looks the same in
+a warm dark palette.
+
+Web blocking is genuinely running in these images. A plain `serve` never starts the resolver,
+so the demo server is started through the film's capture launcher, which runs the product's own
+embedded resolver (the same `Runtime.start_dns()` that `homesoc run` uses) on `127.0.0.1` at a
+free high port, never port 53 and never the LAN. Before the first shot the script checks that
+Home, the Blocking chip, the sidebar and the Blocking page all report it running; nothing is
+repainted. That is why the Blocking page's technical details show `127.0.0.1:<port>` rather
+than a household's `0.0.0.0:53`. No query is sent to it, so the look-up and block numbers are
+the seeded household's last 24 hours. The demo's timestamps are moved forward so it reads as
+checked a few minutes ago.
 
 | Image | What it shows |
 | --- | --- |

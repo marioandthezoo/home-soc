@@ -124,6 +124,56 @@ BG = (11, 15, 20)  # #0b0f14
 BORDER = (44, 52, 68)
 ACCENT = (91, 124, 255)
 CAPTION_FG = (232, 236, 246)
+CAPTION_BG = (12, 16, 23)
+CAPTION_DOT = ACCENT
+CAPTION_SHADOW = 150
+RIPPLE_RGB = (150, 175, 255)
+
+#: The two films' palettes. "classic" is the technical cut's near-black canvas and blue accent.
+#: "stone" is the everyday film's: the dashboard's Stone & Sage day theme (design tokens --bg
+#: #e5e0d5, --line-strong, --accent #46705d sage, --fg #1f2d29 ink), so the canvas the window
+#: sits on, the lower third, the cursor halo, the click ripple and the highlight glow all belong
+#: to the same calm world as the redesigned pages and slides_everyday.py's illustrations. Not a
+#: single near-black pixel of the old theme survives in a "stone" frame.
+LOOKS: Final[dict[str, dict[str, Any]]] = {
+    "classic": {
+        "BG": (11, 15, 20), "BORDER": (44, 52, 68), "ACCENT": (91, 124, 255),
+        "CAPTION_FG": (232, 236, 246), "CAPTION_BG": (12, 16, 23), "CAPTION_DOT": (91, 124, 255),
+        "CAPTION_SHADOW": 150, "SHADOW_ALPHA": 0.62, "RIPPLE_RGB": (150, 175, 255),
+        "_FOOTER_BAND_CSS": (0.0, 776.0, 212.0, 114.0), "_SIDEBAR_SAMPLE_CSS": (110.0, 700.0),
+    },
+    "stone": {
+        # a shade under the page's own stone, so the window reads as a window
+        "BG": (211, 204, 190), "BORDER": (186, 178, 163), "ACCENT": (70, 112, 93),
+        # the lower third is ink on stone with a pale-sage dot: the dashboard's own contrast pair
+        "CAPTION_FG": (245, 242, 234), "CAPTION_BG": (31, 45, 41), "CAPTION_DOT": (160, 196, 173),
+        "CAPTION_SHADOW": 70, "SHADOW_ALPHA": 0.26, "RIPPLE_RGB": (47, 90, 75),
+        # The redesigned sidebar is 244 CSS px wide and its footer runs from ~686 down past
+        # the fold: "Blocking: running", "Automatic checks", "Network last checked", then the
+        # refresh line, RSS and the theme toggle. The pill (CSS y 787-857) lands on the last
+        # three, so the band starts under the network line and the three status lines people
+        # read stay visible above the pill. Measured on the captured /, 2026-09-23. The sample
+        # point is the empty stretch between "Settings" and the footer's divider.
+        "_FOOTER_BAND_CSS": (0.0, 768.0, 243.0, 132.0), "_SIDEBAR_SAMPLE_CSS": (200.0, 652.0),
+    },
+}
+LOOK = "classic"
+
+
+def set_look(name: str) -> None:
+    """Switch every palette constant (and drop every sprite cached in the old one)."""
+    global LOOK
+    try:
+        values = LOOKS[name]
+    except KeyError:
+        raise ValueError(f"unknown look {name!r}; expected one of {', '.join(LOOKS)}") from None
+    globals().update(values)
+    LOOK = name
+    for cache_name in ("_chrome", "_caption_cache", "_cursor_cache", "_phone_backdrop_cache",
+                       "_overlay_cache"):
+        cache = globals().get(cache_name)
+        if hasattr(cache, "clear"):
+            cache.clear()
 
 CORNER_RADIUS = 12
 SHADOW_BLUR = 26
@@ -141,6 +191,12 @@ TAIL = 0.40
 #: another third of a second of its own padding after the last word, so 0.60 here measured
 #: 1.34 s of dead air on the close slide. 0.25 puts the added room tone at 0.65 s.
 END_ROOM_TONE = 0.25
+#: The film's last shot is its end card, and the last line is a joke: it holds this long after
+#: the narration's tail before the fade, so the button line gets its laugh and the title can be
+#: read (it used to end 0.96 s after the last word, on a hard stop).
+END_HOLD = 3.1
+#: ...then fades to the canvas colour over this long, inside the hold.
+END_FADE = 1.0
 
 DISSOLVE = 0.40  # scene-to-scene cross dissolve
 RIPPLE_SECONDS = 0.45
@@ -162,6 +218,13 @@ MAX_ZOOM = 1.6
 #: this to 1.0 to turn the drift off; it is the most expensive effect in the
 #: render (every drifting frame is a full-page resample).
 SLIDE_DRIFT = 1.03
+#: The drift of a *run* of slide key frames: constant speed, out and back. A single 1.03x push
+#: spread over a 30 s run (the cold open) moved so slowly that freezedetect called the first
+#: five seconds frozen, and the old title card froze for 13 s at 1.03x over 13 s. Scale per
+#: second, and the furthest it goes: 0.0055/s is ~10 px/s on the 1792 px window, and 1.045x
+#: keeps the cold open's counter card (right edge at x=1564 of 1600) inside the crop.
+SLIDE_WAVE_RATE = 0.0055
+SLIDE_WAVE_PEAK = 0.045
 #: The drift runs across the *whole* time the slide is on screen, at a constant rate.
 #: It used to settle after a fixed 11 s, which is why `ffmpeg -vf freezedetect` found 264 s
 #: of bit-identical frames in a 471 s film: the architecture slide sat motionless for 31 s,
@@ -472,9 +535,7 @@ def ripple_sprite(t: float) -> Sprite | None:
 
     a = np.clip(acc, 0.0, 1.0)[:, :, None]
     rgb = np.empty((_RIPPLE_TILE, _RIPPLE_TILE, 3), dtype=np.uint8)
-    rgb[:, :, 0] = 150
-    rgb[:, :, 1] = 175
-    rgb[:, :, 2] = 255
+    rgb[:, :] = RIPPLE_RGB
     return Sprite(rgb=rgb, alpha=np.ascontiguousarray(a.astype(np.float32)))
 
 
@@ -506,7 +567,7 @@ def caption_sprite(text: str) -> tuple[Sprite, int, int]:
     ImageDraw.Draw(shadow).rounded_rectangle(
         (margin, margin + 6, margin + pill_w, margin + pill_h + 6),
         radius=rad,
-        fill=(0, 0, 0, 150),
+        fill=(0, 0, 0, CAPTION_SHADOW),
     )
     im.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(12)))
 
@@ -520,11 +581,11 @@ def caption_sprite(text: str) -> tuple[Sprite, int, int]:
     d.rounded_rectangle(
         (margin, margin, margin + pill_w, margin + pill_h),
         radius=rad,
-        fill=(12, 16, 23, 255),
+        fill=(*CAPTION_BG, 255),
     )
     cy = margin + pill_h / 2
     dx = margin + pad_x
-    d.ellipse((dx, cy - dot_r, dx + dot_r * 2, cy + dot_r), fill=(*ACCENT, 255))
+    d.ellipse((dx, cy - dot_r, dx + dot_r * 2, cy + dot_r), fill=(*CAPTION_DOT, 255))
     d.text(
         (dx + dot_r * 2 + dot_gap, cy),
         text,
@@ -1656,6 +1717,26 @@ class CameraEvt:
     #: ease-in-out spread over a 40 s slide has a near-zero derivative at both ends, which
     #: is exactly the dead-still opening and closing seconds this drift exists to remove.
     linear: bool = False
+    #: Where the push starts, when it does not start from the untouched frame: a run of slide
+    #: key frames that carries on a drift the previous scene left at 1.03x. The pull-back after
+    #: ``hold_until`` always returns to the untouched frame.
+    rect_from: tuple[float, float, float, float] | None = None
+    #: A slide run's drift: the scale walks from ``base_scale`` at ``wave_rate`` per second,
+    #: out to ``base_scale + wave_peak`` and back, at constant speed, for the whole run (see
+    #: SLIDE_WAVE_*). Zero means an ordinary push.
+    wave_rate: float = 0.0
+    wave_peak: float = 0.0
+    base_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class OverlayEvt:
+    """Film graphics drawn over a state: a small tag, or the drawn tablet of scene 12."""
+
+    t0: float
+    t1: float
+    kind: str   # "tag" | "fingerprint_tablet"
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -1727,6 +1808,15 @@ class ScenePlan:
     #: the caption waits until a dashboard page is on screen; ``inf`` on an all-slide
     #: scene means it is never drawn at all.
     caption_from: float = 0.0
+    #: When the caption must be gone by (see _caption_until): before a highlight lands in the
+    #: pill's corner, or a scroll brings new rows under it. ``inf`` means CAPTION_HOLD decides.
+    caption_until: float = math.inf
+    overlays: list[OverlayEvt] = field(default_factory=list)
+    #: Seconds of fade to the canvas colour at the very end (the last scene only).
+    fade_out: float = 0.0
+    #: The slide drift's scale on the last frame, when the scene ends on a slide run - so a
+    #: next scene that opens on the same slide carries it on instead of snapping back to 1.0x.
+    drift_end: float | None = None
 
     @property
     def shots(self) -> list[Path]:
@@ -2100,6 +2190,9 @@ def build_plan(
     cursor_start: tuple[float, float] = DEFAULT_CURSOR_START,
     strict: bool = True,
     extra_tail: float = 0.0,
+    overlays: Sequence[Any] = (),
+    drift_from: float | None = None,
+    fade_out: float = 0.0,
 ) -> ScenePlan:
     """Turn a ``script.Scene`` (duck-typed) into a concrete, timed plan.
 
@@ -2326,25 +2419,48 @@ def build_plan(
     def _free(a: float, b: float) -> bool:
         return not any(t0 < b and a < t1 for t0, t1 in busy)
 
+    # Slides: one push per *run* of consecutive slide states, not one per state. A run is an
+    # illustration and its key-frame variants (the dinner table, the umbrella opening): each
+    # variant used to restart the push at 1.0x, so every key-frame cut jumped in scale and the
+    # 220 ms swap dissolved two framings of the same drawing into a doubled one. Now the push
+    # runs straight through the run and only the changed pixels fade.
+    spans = []
+    for i in range(min(len(plan.swaps) + 1, len(states))):
+        start = plan.swaps[i - 1].t1 if i > 0 else 0.0
+        if i < len(plan.swaps):
+            spans.append((start, plan.swaps[i].t0, plan.swaps[i].t1))
+        else:
+            spans.append((start, plan.duration, plan.duration))
+    i = 0
+    while i < len(spans):
+        if states[i].kind != "slide":
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(spans) and states[j + 1].kind == "slide":
+            j += 1
+        start = spans[i][0]
+        hold_until, t_out = spans[j][1], spans[j][2]
+        run = hold_until - start
+        s0 = drift_from if (i == 0 and drift_from) else 1.0
+        if SLIDE_DRIFT > 1.001 and run >= 0.5 and _free(start, t_out):
+            cam = CameraEvt(start, hold_until, hold_until, t_out, _drift_rect(s0),
+                            hires=False, linear=True, wave_rate=SLIDE_WAVE_RATE,
+                            wave_peak=SLIDE_WAVE_PEAK, base_scale=s0)
+            plan.cameras.append(cam)
+            if t_out >= plan.duration - 1e-6:
+                plan.drift_end = _wave_scale(cam, (plan.n_frames - 1) / FPS)
+        i = j + 1
+
     for i, st in enumerate(states[: len(plan.swaps) + 1]):
-        slide = st.kind == "slide"
+        if st.kind == "slide":
+            continue
         start = plan.swaps[i - 1].t1 if i > 0 else 0.0
         if i < len(plan.swaps):
             hold_until, t_out = plan.swaps[i].t0, plan.swaps[i].t1
         else:
             hold_until = t_out = plan.duration
         span = hold_until - start
-        if slide:
-            if SLIDE_DRIFT <= 1.001 or span < 0.5 or not _free(start, t_out):
-                continue
-            # The push runs the whole time the slide is up, so no frame of it is a repeat
-            # of the one before. hold_until == t1 means there is no settle phase to hold,
-            # and the drift is still at full extent when the scene dissolves away from it.
-            plan.cameras.append(
-                CameraEvt(start, hold_until, hold_until, t_out, _drift_rect(SLIDE_DRIFT),
-                          hires=False, linear=True)
-            )
-            continue
         if IDLE_DRIFT_RATE <= 0.0 or span < IDLE_DRIFT_AFTER:
             continue
         # Burst states drift too. A `scan` burst moves the whole viewfinder and needs no
@@ -2377,7 +2493,71 @@ def build_plan(
                               hires=False, linear=True)
                 )
     plan.cameras.sort(key=lambda c: c.t0)
+
+    # ---- film graphics over the pages ---------------------------------------
+    for ov in overlays or ():
+        kind = str(_attr(ov, "kind", default="tag"))
+        t0 = LEAD_IN + float(_attr(ov, "at", default=0.0)) * narration
+        t1 = LEAD_IN + float(_attr(ov, "until", default=1.0)) * narration
+        text = str(_attr(ov, "text", default="") or "")
+        if kind == "fingerprint_tablet" and not text:
+            text = _pair_fingerprint(states, scene_id)
+        plan.overlays.append(OverlayEvt(t0, min(t1, plan.duration), kind, text))
+    plan.fade_out = max(0.0, float(fade_out))
+    plan.caption_until = _caption_until(plan)
     return plan
+
+
+def _pair_fingerprint(states: Sequence[ShotState], scene_id: str) -> str:
+    """The Security fingerprint exactly as the captured /lens/pair page showed it.
+
+    capture.py writes it beside the shot. Never typed, never recomputed: if it is not there,
+    the drawn tablet is not drawn.
+    """
+    for st in states:
+        if st.path.startswith("/lens/pair"):
+            side = st.png.with_suffix(".fingerprint.txt")
+            if side.is_file():
+                groups = re.findall(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2})+",
+                                    side.read_text(encoding="utf-8"))
+                if groups:
+                    return " ".join(groups)
+    raise ComposeError(f"[{scene_id}] the drawn tablet needs the pairing page's fingerprint, "
+                       "and capture.py recorded none - re-capture this scene")
+
+
+#: How long before a highlight lands in the caption's corner the caption has gone.
+CAPTION_CLEAR_LEAD = 0.45
+
+
+def _caption_until(plan: ScenePlan) -> float:
+    """The lower third leaves before it can cover what the scene is pointing at.
+
+    The pill sits bottom-left, ~60 px past the sidebar, so it can land on page rows: it clipped
+    the glow on the Nintendo Switch row, and hid a row of "Fix these first" in the one shot
+    filmed for it. It fades before the first highlight whose rect reaches its corner, and
+    before the first scroll (which brings unseen rows in under it).
+    """
+    if not plan.caption:
+        return math.inf
+    sp, cx0, cy0 = caption_sprite(plan.caption)
+    cw, ch = sp.size
+    margin = 26
+    box = (cx0 + margin - 14, cy0 + margin - 14, cx0 + cw - margin + 14, cy0 + ch - margin + 14)
+    start = max(LEAD_IN * 0.5, plan.caption_from)
+    until = math.inf
+    for hi in plan.highlights:
+        if hi.t0 <= start:
+            continue
+        x, y, w, h = hi.rect
+        rx0, ry0 = WIN_X + x - 12, WIN_Y + y - 12
+        rx1, ry1 = WIN_X + x + w + 12, WIN_Y + y + h + 12
+        if rx0 < box[2] and box[0] < rx1 and ry0 < box[3] and box[1] < ry1:
+            until = min(until, hi.t0 - CAPTION_CLEAR_LEAD)
+    for sw in plan.swaps:
+        if sw.kind == "scroll" and sw.t0 > start and sw.frm not in plan.slide_states:
+            until = min(until, sw.t0)
+    return until
 
 
 def _clamp_css_rect(
@@ -2579,6 +2759,158 @@ class Camera:
         return ((pt[0] - x) * (WIN_W / w), (pt[1] - y) * (WIN_H / h))
 
 
+
+# --------------------------------------------------------------------------
+# Film graphics over the pages: a small tag, and scene 12's drawn tablet
+# --------------------------------------------------------------------------
+
+OVERLAY_FADE = 0.28
+_overlay_cache: dict[tuple[str, str], tuple[Sprite, int, int]] = {}
+
+_MONO_CANDIDATES = (r"C:\Windows\Fonts\consola.ttf", r"C:\Windows\Fonts\cour.ttf")
+#: Stone & Sage, for drawings that sit on a day-theme page whatever the film's look
+_INK = (31, 45, 41)
+_INK_2 = (51, 67, 61)
+_MUTED = (77, 90, 84)
+_LINEN = (238, 234, 224)
+_LINEN_2 = (230, 226, 215)
+_SAGE = (70, 112, 93)
+_SAGE_INK = (47, 90, 75)
+_SAGE_TINT = (213, 223, 209)
+_HAIRLINE = (211, 205, 192)
+
+
+def _mono(size: int) -> ImageFont.FreeTypeFont:
+    for path in _MONO_CANDIDATES:
+        if Path(path).exists():
+            return ImageFont.truetype(path, size)
+    return _font(size, semibold=False)
+
+
+def tag_sprite(text: str) -> tuple[Sprite, int, int]:
+    """A small ink tab straddling the window's top edge: "Monday's screen"."""
+    key = ("tag", text)
+    hit = _overlay_cache.get(key)
+    if hit is not None:
+        return hit
+    font = _font(26, semibold=True)
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    bb = probe.textbbox((0, 0), text, font=font)
+    tw = bb[2] - bb[0]
+    pw, ph = tw + 56, 46
+    margin = 16
+    im = Image.new("RGBA", (pw + margin * 2, ph + margin * 2), (0, 0, 0, 0))
+    sh = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle((margin, margin + 4, margin + pw, margin + ph + 4),
+                                         radius=ph // 2, fill=(0, 0, 0, 60))
+    im.alpha_composite(sh.filter(ImageFilter.GaussianBlur(7)))
+    d = ImageDraw.Draw(im)
+    d.rounded_rectangle((margin, margin, margin + pw, margin + ph), radius=ph // 2,
+                        fill=(*CAPTION_BG, 255))
+    d.text((margin + pw / 2, margin + ph / 2), text, font=font, fill=(*CAPTION_FG, 255),
+           anchor="mm")
+    sp = sprite_from_image(im)
+    # over the gap between Home's title and its topbar chips, straddling the window's top edge
+    x = int(WIN_X + 640 * SCALE) - (pw + margin * 2) // 2
+    y = WIN_Y - ph // 2 - margin + 6
+    _overlay_cache[key] = (sp, x, y)
+    return sp, x, y
+
+
+#: Where the drawn tablet stands on /lens/pair, in CSS px: the empty right-hand column under
+#: "Scan this with the phone", beside the page's own Security fingerprint.
+TABLET_CSS = (930.0, 330.0, 420.0, 490.0)
+
+
+def fingerprint_tablet_sprite(fingerprint: str) -> tuple[Sprite, int, int]:
+    """The tablet's side of "check the long code matches the one on your PC", drawn.
+
+    Flat and plainly an illustration (a drawn device, a label saying so), carrying the very
+    groups the captured pairing page shows - read from that page by capture.py - with a tick.
+    Not a browser's certificate warning: that is browser chrome this pipeline cannot capture,
+    and a fake of it would be exactly the kind of screen the film must never invent.
+    """
+    key = ("tablet", fingerprint)
+    hit = _overlay_cache.get(key)
+    if hit is not None:
+        return hit
+    groups = fingerprint.split()
+    x0 = WIN_X + TABLET_CSS[0] * SCALE
+    y0 = WIN_Y + TABLET_CSS[1] * SCALE
+    w, h = int(TABLET_CSS[2] * SCALE), int(TABLET_CSS[3] * SCALE)
+    margin = 30
+    im = Image.new("RGBA", (w + margin * 2, h + margin * 2 + 40), (0, 0, 0, 0))
+    sh = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle((margin + 4, margin + 40 + 10, margin + w + 4,
+                                          margin + 40 + h + 10), radius=40, fill=(0, 0, 0, 55))
+    im.alpha_composite(sh.filter(ImageFilter.GaussianBlur(14)))
+    d = ImageDraw.Draw(im)
+    lab = _font(20, semibold=False)
+    d.text((margin + w / 2, margin + 18), "drawn: the tablet\u2019s side", font=lab,
+           fill=(*_MUTED, 255), anchor="mm")
+    top = margin + 40
+    d.rounded_rectangle((margin, top, margin + w, top + h), radius=40, fill=(*_INK_2, 255))
+    bez = 22
+    sx0, sy0, sx1, sy1 = margin + bez, top + bez + 8, margin + w - bez, top + h - bez - 8
+    d.rounded_rectangle((sx0, sy0, sx1, sy1), radius=22, fill=(*_LINEN, 255))
+    d.ellipse((margin + w / 2 - 4, top + 11, margin + w / 2 + 4, top + 19), fill=(90, 105, 99, 255))
+    cx = (sx0 + sx1) / 2
+    y = sy0 + 44
+    d.text((cx, y), "Check this code", font=_font(30, True), fill=(*_INK, 255), anchor="mm")
+    y += 38
+    d.text((cx, y), "certificate fingerprint", font=_font(21, False), fill=(*_MUTED, 255),
+           anchor="mm")
+    y += 36
+    mono = _mono(25)
+    col_w = (sx1 - sx0 - 48) / 2
+    for k, g in enumerate(groups[:8]):
+        # row-major, two to a row: read left to right it is the page's own order
+        col, row = k % 2, k // 2
+        gx = sx0 + 24 + col * col_w + col_w / 2
+        gy = y + row * 58 + 22
+        d.rounded_rectangle((gx - col_w / 2 + 8, gy - 22, gx + col_w / 2 - 8, gy + 22), radius=8,
+                            fill=(*_LINEN_2, 255), outline=(*_HAIRLINE, 255), width=2)
+        d.text((gx, gy), g, font=mono, fill=(*_INK, 255), anchor="mm")
+    y += 4 * 58 + 44
+    r = 20
+    tx = sx0 + 44
+    d.ellipse((tx - r, y - r, tx + r, y + r), fill=(*_SAGE, 255))
+    d.line([(tx - 9, y + 1), (tx - 2, y + 8), (tx + 10, y - 7)], fill=(245, 242, 234, 255), width=5)
+    d.text((tx + r + 14, y - 13), "Matches the PC", font=_font(26, True), fill=(*_SAGE_INK, 255),
+           anchor="lm")
+    d.text((tx + r + 14, y + 17), "so trust it", font=_font(22, False), fill=(*_MUTED, 255),
+           anchor="lm")
+    sp = sprite_from_image(im)
+    out = (sp, int(x0 - margin), int(y0 - margin - 40))
+    _overlay_cache[key] = out
+    return out
+
+
+def _draw_overlays(plan: ScenePlan, canvas: np.ndarray, t: float) -> None:
+    for ov in plan.overlays:
+        if not (ov.t0 <= t <= ov.t1):
+            continue
+        a = min(clamp((t - ov.t0) / OVERLAY_FADE, 0.0, 1.0), clamp((ov.t1 - t) / OVERLAY_FADE, 0.0, 1.0))
+        a = ease_in_out_cubic(a)
+        if a <= 0.002:
+            continue
+        if ov.kind == "fingerprint_tablet":
+            sp, x, y = fingerprint_tablet_sprite(ov.text)
+            blit(canvas, sp, x, y + (1.0 - a) * 18, a)
+        else:
+            sp, x, y = tag_sprite(ov.text)
+            blit(canvas, sp, x, y, a)
+
+
+def _fade_to_canvas(frame: np.ndarray, amount: float) -> np.ndarray:
+    """The film's last second: everything goes quietly to the canvas colour."""
+    if amount <= 0.0:
+        return frame
+    bg = np.empty_like(frame)
+    bg[:] = BG
+    return blend_frames(frame, bg, clamp(amount, 0.0, 1.0))
+
+
 # --------------------------------------------------------------------------
 # Frame generation
 # --------------------------------------------------------------------------
@@ -2611,6 +2943,14 @@ def _press_amount(plan: ScenePlan, t: float) -> float:
     return 0.0
 
 
+def _wave_scale(cam: CameraEvt, t: float) -> float:
+    """A slide run's scale at ``t``: a constant-speed walk out to the peak and back."""
+    x = max(0.0, cam.wave_rate * (min(t, cam.hold_until) - cam.t0))
+    p = max(1e-9, cam.wave_peak)
+    m = x % (2.0 * p)
+    return cam.base_scale + (m if m <= p else 2.0 * p - m)
+
+
 def _camera_rect(
     plan: ScenePlan, t: float
 ) -> tuple[tuple[float, float, float, float], bool] | None:
@@ -2618,7 +2958,20 @@ def _camera_rect(
     for cam in plan.cameras:
         if t < cam.t0 or t > cam.t_out + 0.001:
             continue
+        if cam.wave_rate > 0.0:
+            here = _drift_rect(_wave_scale(cam, t))
+            if t > cam.hold_until:
+                v = ease_in_out_cubic((t - cam.hold_until) / max(1e-6, cam.t_out - cam.hold_until))
+                here = tuple(_lerp(here[k], full[k], v) for k in range(4))  # type: ignore[assignment]
+            if here[2] >= WIN_W - 0.05:
+                return None
+            return here, cam.hires  # type: ignore[return-value]
         target = _clamp_zoom_rect(cam.rect)
+        if cam.rect_from is not None and t <= cam.hold_until:
+            base = _clamp_zoom_rect(cam.rect_from)
+            raw = clamp((t - cam.t0) / max(1e-6, cam.t1 - cam.t0), 0.0, 1.0)
+            return (tuple(_lerp(base[k], target[k], raw) for k in range(4)),  # type: ignore[return-value]
+                    cam.hires)
         if t <= cam.t1:
             raw = (t - cam.t0) / max(1e-6, cam.t1 - cam.t0)
             u = raw if cam.linear else ease_in_out_cubic(raw)
@@ -2815,6 +3168,10 @@ def render_scene(
             if prev_frame is not None and f < dissolve_frames:
                 u = ease_in_out_cubic((f + 1) / (dissolve_frames + 1))
                 frame = blend_frames(prev_frame, frame, u)
+            if plan.fade_out > 0.0:
+                left = plan.duration - (f + 1) / FPS
+                if left < plan.fade_out:
+                    frame = _fade_to_canvas(frame, ease_in_out_cubic(1.0 - left / plan.fade_out))
             if probe_dir is not None and probe_every and f % probe_every == 0:
                 probe_dir.mkdir(parents=True, exist_ok=True)
                 Image.fromarray(frame).save(probe_dir / f"{plan.scene_id}_f{f:04d}.png")
@@ -2903,6 +3260,8 @@ def _draw_caption(
     a_out = clamp((plan.duration - 0.25 - t) / CAPTION_FADE, 0.0, 1.0)
     # ...and it leaves of its own accord after CAPTION_HOLD, whichever comes first.
     a_hold = clamp((start + CAPTION_FADE + CAPTION_HOLD - t) / CAPTION_FADE, 0.0, 1.0)
+    if plan.caption_until < math.inf:
+        a_hold = min(a_hold, clamp((plan.caption_until - t) / CAPTION_FADE, 0.0, 1.0))
     a = ease_in_out_cubic(min(a_in, a_out, a_hold)) * scale
     if cover:
         # The cover is the pill's own backdrop, so it has to be opaque *before* the pill is
@@ -2975,6 +3334,8 @@ def _render_phone_frame(
 
     _draw_caption(plan, canvas, cap, t, cover=False,
                   scale=1.0 - _slide_mix(plan, frm, to, prog, swap))
+    if plan.overlays:
+        _draw_overlays(plan, canvas, t)
     return canvas
 
 
@@ -3138,6 +3499,8 @@ def _render_frame(
     )
     _draw_caption(plan, canvas, cap, t, cover=cover, cam_rect=cam_rect,
                   scale=1.0 - _slide_mix(plan, frm, to, prog, swap))
+    if plan.overlays:
+        _draw_overlays(plan, canvas, t)
     return canvas
 
 
@@ -3552,7 +3915,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path(__file__).resolve().parent / "build",
         help="build directory",
     )
+    ap.add_argument("--look", choices=sorted(LOOKS), default="classic",
+                    help="palette: classic (technical cut) or stone (everyday film)")
     args = ap.parse_args(argv)
+    set_look(args.look)
     ran = False
     if args.selftest:
         selftest(args.build)

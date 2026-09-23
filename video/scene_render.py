@@ -56,6 +56,12 @@ BUILD_DIR = VIDEO_DIR / "build"
 LENS_JSON = BUILD_DIR / "lens_demo.json"
 SCENE_PNG = BUILD_DIR / "scene_camera.png"
 SCENE_Y4M = BUILD_DIR / "scene_camera.y4m"
+import os as _os  # noqa: E402
+
+if _os.environ.get("HOMESOC_VIDEO_FILM", "").strip().lower() == "everyday":
+    # the everyday film's small white box (see _white_box_html); the technical cut keeps its own
+    SCENE_PNG = BUILD_DIR / "scene_camera_everyday.png"
+    SCENE_Y4M = BUILD_DIR / "scene_camera_everyday.y4m"
 
 #: The seeded demo database, which is the authority on the camera's sticker payload — the file
 #: ``capture.py`` reads it out of too. ``lens_demo.json`` is the fallback for when it is absent.
@@ -422,6 +428,8 @@ def scene_html(code: str, *, bleed: float = 0.0) -> str:
     ``bleed`` widens the drawing beyond the frame on every side so a moving crop window never
     runs off the edge of the wall; the coordinate system is untouched, so nothing is rescaled.
     """
+    if everyday_style():
+        return _white_box_html(code, bleed=bleed)
     sticker_svg, qr_side = _qr_svg(code)
     sx, sy, sw, sh = sticker_box(qr_side)
     bx, by, bw, bh = BODY
@@ -449,6 +457,99 @@ def scene_html(code: str, *, bleed: float = 0.0) -> str:
 <svg xmlns="http://www.w3.org/2000/svg" width="{width:g}" height="{height:g}"
      viewBox="{-bleed:g} {-bleed:g} {width:g} {height:g}" shape-rendering="geometricPrecision">
 {_defs()}
+{body}
+</svg>
+</body></html>"""
+
+
+# --------------------------------------------------------------------------- the everyday film's box
+#
+# The everyday film (video/everyday/SCRIPT.md, scene 12) sets the scan up with "a shelf of identical
+# white boxes" and the joke that every gadget maker agreed on one design, "small white box". Scanning
+# the technical cut's navy bullet camera straight after that joke broke it, so for that film the
+# thing on the shelf is the same small white box as slides_everyday.white_box_shelf, close up,
+# in the Stone & Sage palette, with the same genuine QR sticker on its front. Everything about the
+# recording rig is unchanged: the sticker is the product's own QR of the camera's real token, the
+# still becomes the Y4M the fake webcam plays, and the decode is done from those pixels.
+
+#: ``capture.py`` sets this to the film it is capturing ("everyday" or "technical").
+FILM_ENV = "HOMESOC_VIDEO_FILM"
+
+WB_STONE = "#e5e0d5"
+WB_STONE_DEEP = "#d9d3c5"
+WB_LINE = "#767164"
+WB_WHITE = "#f5f2ea"
+WB_INK = "#33433d"
+WB_WOOD = "#87684a"
+WB_WOOD_LIGHT = "#b5a48d"
+WB_LED = "#728b6b"
+WB_TINT = "#d5dfd1"
+#: the box: x, y, w, h, corner radius - wide enough that the ~333 px column lens.css shows is
+#: all box around the sticker, and low enough that it stands on the shelf
+WB_BOX = (300.0, 64.0, 680.0, 532.0, 64.0)
+WB_LENS = (420.0, 196.0, 74.0)   # cx, cy, r: left of the sticker, clear of the phone's column
+
+
+def everyday_style() -> bool:
+    import os
+
+    return os.environ.get(FILM_ENV, "").strip().lower() == "everyday"
+
+
+def _white_box_html(code: str, *, bleed: float = 0.0) -> str:
+    sticker_svg, qr_side = _qr_svg(code)
+    sx, sy, sw, sh = sticker_box(qr_side)
+    bx, by, bw, bh, br = WB_BOX
+    lx, ly, lr = WB_LENS
+    if sx < lx + lr + 20 or sx + sw > bx + bw - 40 or sy < by + 20 or sy + sh > by + bh - 90:
+        raise SceneError(f"the {sw:.0f}x{sh:.0f} px sticker does not fit the white box clear of "
+                         "its lens")
+    if sx < 480 or sx + sw > 800:
+        raise SceneError(f"the sticker spans {sx:.0f}..{sx + sw:.0f} px, outside the ~333 px "
+                         "column lens.css leaves on screen")
+    width, height = WIDTH + bleed * 2, HEIGHT + bleed * 2
+    left, top = -bleed, -bleed
+    qr_x = sx + (sw - qr_side) / 2.0
+    qr_y = sy + STICKER_PAD
+    caption_y = sy + sh - 14.0
+    grille = "".join(
+        f'<rect x="{bx + bw / 2 - 130 + k * 56:g}" y="{by + bh - 64:g}" width="36" height="12" '
+        f'rx="6" fill="{WB_STONE_DEEP}"/>' for k in range(5))
+    body = f"""
+  <rect x="{left:g}" y="{top:g}" width="{width:g}" height="{height:g}" fill="{WB_STONE}"/>
+  <rect x="{left:g}" y="42" width="{width:g}" height="4" fill="{WB_STONE_DEEP}"/>
+  <!-- the shelf, as on the white-box slide -->
+  <rect x="{left:g}" y="{SHELF_TOP:g}" width="{width:g}" height="{SHELF_FRONT - SHELF_TOP:g}"
+        fill="{WB_WOOD_LIGHT}" stroke="{WB_WOOD}" stroke-width="3"/>
+  <rect x="{left:g}" y="{SHELF_FRONT:g}" width="{width:g}" height="{top + height - SHELF_FRONT:g}"
+        fill="{WB_STONE_DEEP}"/>
+  <path d="M 900 {SHELF_FRONT:g} C 900 700 940 720 960 {top + height:g}" fill="none"
+        stroke="{WB_INK}" stroke-width="14" stroke-linecap="round"/>
+  <ellipse cx="{bx + bw / 2:g}" cy="{SHELF_TOP + 4:g}" rx="{bw / 2 + 10:g}" ry="12" fill="#d0c9b9"/>
+  <!-- the small white box, close up -->
+  <rect x="{bx:g}" y="{by:g}" width="{bw:g}" height="{bh:g}" rx="{br:g}" fill="{WB_WHITE}"
+        stroke="{WB_LINE}" stroke-width="7"/>
+  <circle cx="{lx:g}" cy="{ly:g}" r="{lr:g}" fill="{WB_INK}" stroke="{WB_LINE}" stroke-width="6"/>
+  <circle cx="{lx - 20:g}" cy="{ly - 20:g}" r="18" fill="#5c6b64"/>
+  <circle cx="{bx + bw - 60:g}" cy="{by + 60:g}" r="14" fill="{WB_LED}"/>
+  {grille}
+  <!-- the printed sticker: a real QR of the camera's real sticker token -->
+  <rect x="{sx + 4:g}" y="{sy + 7:g}" width="{sw:g}" height="{sh:g}" rx="16" fill="#cfc8b8"/>
+  <rect x="{sx:g}" y="{sy:g}" width="{sw:g}" height="{sh:g}" rx="16" fill="#ffffff"
+        stroke="{WB_TINT}" stroke-width="2"/>
+  {sticker_svg.replace('<svg ', f'<svg x="{qr_x:g}" y="{qr_y:g}" ', 1)}
+  <text x="{sx + sw / 2:g}" y="{caption_y:g}" fill="{STICKER_INK}" font-family="{SANS}"
+        font-size="15" font-weight="600" letter-spacing="1.6" text-anchor="middle"
+        opacity="0.72">{BRAND_MARK} HOME SOC</text>"""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Home SOC — scene</title>
+<style>
+  html, body {{ margin: 0; padding: 0; background: {WB_STONE}; }}
+  svg {{ display: block; }}
+</style></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width:g}" height="{height:g}"
+     viewBox="{-bleed:g} {-bleed:g} {width:g} {height:g}" shape-rendering="geometricPrecision">
 {body}
 </svg>
 </body></html>"""

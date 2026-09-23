@@ -19,10 +19,15 @@ Each image is 1600x900, rendered in the day theme ("Stone & Sage", the default) 
 downsampled, so the text stays sharp on a high-DPI display. The dusk theme looks the same in
 a warm dark palette.
 
-The demo dashboard is started with `serve`, which never starts the web-blocking resolver, so
-these images say (truthfully) that web blocking is switched on but not running; the look-up
-numbers beside it come from the seeded household. The demo's timestamps are moved forward so it
-reads as checked a few minutes ago.
+Web blocking is genuinely running in these images. A plain `serve` never starts the resolver,
+so the demo server is started through the film's capture launcher, which runs the product's own
+embedded resolver (the same `Runtime.start_dns()` that `homesoc run` uses) on `127.0.0.1` at a
+free high port, never port 53 and never the LAN. Before the first shot the script checks that
+Home, the Blocking chip, the sidebar and the Blocking page all report it running; nothing is
+repainted. That is why the Blocking page's technical details show `127.0.0.1:<port>` rather
+than a household's `0.0.0.0:53`. No query is sent to it, so the look-up and block numbers are
+the seeded household's last 24 hours. The demo's timestamps are moved forward so it reads as
+checked a few minutes ago.
 
 | Image | What it shows |
 | --- | --- |

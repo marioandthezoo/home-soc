@@ -44,3 +44,5 @@ desktop.ini
 video/build/
 video/demo_data/
 video/out/
+# Rendered illustration PNGs; regenerate with: python video/slides_everyday.py
+video/everyday/slides/
