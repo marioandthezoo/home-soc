@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tests that depended on the machine.** The live autostart-probe test no longer fails on machines that
   cannot verify Authenticode signatures (GitHub's Windows runners); the product lists and baselines such
   services rather than trusting them, and the test now says so. Two query-log budget tests pin their clock,
-  so filling a per-minute budget can no longer straddle a minute boundary under load.
+  so filling a per-minute budget can no longer straddle a minute boundary under load. The scheduler
+  watchdog test polls until the overrun is reported instead of sleeping a fixed 50 ms, which Python 3.12's
+  coarse Windows clock could read as zero.
 
 ## [0.2.0] — 2026-09-23
 

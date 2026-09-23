@@ -234,11 +234,14 @@ def test_watchdog_reports_an_overrunning_job_once(conn):
     worker = threading.Thread(target=sched.run_now, args=("slow",), daemon=True)
     worker.start()
     try:
-        deadline = time.time() + 2
-        while not sched.is_running("slow") and time.time() < deadline:
-            time.sleep(0.01)
-        time.sleep(0.05)
-        assert sched.check_overruns() == ["slow"]
+        # Poll rather than sleep a fixed time: running_for is rounded to 0.1 s, and on Python 3.12
+        # for Windows time.monotonic ticks every ~16 ms, so a 50 ms sleep can still read as 0.0.
+        deadline = time.time() + 5
+        reported: list[str] = []
+        while not reported and time.time() < deadline:
+            time.sleep(0.02)
+            reported = sched.check_overruns()
+        assert reported == ["slow"]
         assert sched.check_overruns() == []                       # once per run
         status = {j["name"]: j for j in sched.status()}["slow"]
         assert status["overrunning"] and status["running_for_sec"] is not None
