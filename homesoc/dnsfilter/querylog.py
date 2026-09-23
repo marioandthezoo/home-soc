@@ -126,6 +126,9 @@ class QueryLog:
         self._overflow_sample: list[str] = []
         self._overflow_event_at: float | None = None
         self.overflowed = 0
+        # Addresses quoted by the last overflow (kept after the event so the resolver's health check
+        # can put them in NET-DNS-007's evidence even when the hourly event was not written).
+        self.last_overflow_sample: list[str] = []
         self._last_cap_check = time.monotonic()
         self.total = 0
         self.dropped = 0
@@ -258,6 +261,8 @@ class QueryLog:
             self._overflow_rows, self._overflow_sample = 0, []
         now = time.monotonic()
         if overflow:
+            if sample:
+                self.last_overflow_sample = list(sample)
             self._report_overflow(overflow, sample, now)
         if not over:
             return

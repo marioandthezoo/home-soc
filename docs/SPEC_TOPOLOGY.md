@@ -21,7 +21,7 @@ Every edge carries a `confidence`, and the UI renders the three differently (sol
 
 | confidence | meaning | sources |
 |---|---|---|
-| `observed` | Home SOC saw this happen | a DNS query from that client; an mDNS/SSDP advertisement; a UPnP port mapping; devices that dropped together in a recorded outage |
+| `observed` | Home SOC recorded it | a DNS query from that client's address (forgeable by another LAN device); an mDNS/SSDP advertisement; a UPnP port mapping; devices that dropped together in a recorded outage |
 | `inferred` | follows from the network's shape with high confidence | every device reaching the internet via the default gateway; a device using the configured DNS server |
 | `assumed` | a reasonable default that has not been confirmed | a device on the LAN being reachable through the gateway when no route data exists |
 

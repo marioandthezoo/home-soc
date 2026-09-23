@@ -395,7 +395,9 @@ def test_settings_overrides_can_be_cleared_and_shadowing_is_flagged(web_conn, tm
     toml = tmp_path / "config.toml"
     toml.write_text('[notify]\ndiscord_webhook = "https://discord.com/api/webhooks/2/ROTATED"\n', encoding="utf-8")
     monkeypatch.setenv("HOMESOC_CONFIG", str(toml))
-    c = _web_client(web_conn)
+    # Signed in: a dashboard with no password refuses to change where alerts go (security round 3).
+    c = _web_client(web_conn, token=TOKEN)
+    c.get(f"/login?token={TOKEN}")
     leaked = "https://discord.com/api/webhooks/1/LEAKED"
     assert c.post("/api/settings", json={"notify.discord_webhook": leaked}, headers=FETCH).get_json()["saved"]
     # The PoC: config.toml was rotated, the database override still wins...

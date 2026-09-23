@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+Final web-layer pass (2026-09-22), done after the redesign landed and keeping its look and wording:
+
+- **A dashboard with no password** now refuses the settings that matter most (opening it to the network,
+  its password, DNS upstreams, switching web blocking or blocklists off, which addresses are scanned, where
+  and which alerts go) and answers only this computer. `python -m homesoc config set` and `config keep` are
+  new. A `web.host` / `web.token` saved some other way (for example planted before this release) is
+  reported at startup with the clean-up commands.
+- **Host header**: `<pc-name>` and `<pc-name>.local` are trusted only over HTTPS, so a LAN device answering
+  mDNS for that name can no longer make a web page same-origin with the dashboard, or lock you out.
+- **Lens**: a pairing code is single-use and the phone limit holds even when claims race; the claim rate
+  limit counts every attempt; a phone can no longer choose the code the sticker sheet prints.
+- **Honest wording**: DNS activity, the Home page, the DNS page, the map legend, `NET-DEP-003` and
+  `NET-DNS-004` say a lookup came *from a device's address*, which another device can fake. A changed
+  autostart entry is titled "changed", shows the old and new command and gets a "Changed" badge, with
+  "Mark as known" / "Mark all as known" on the host page. New `NET-DNS-007` for a query-log flood from
+  faked addresses, and flood counters on the DNS page. Finding titles use the shared text cleaner.
+
+Earlier in the day:
+
 A full security audit (2026-09-22) against the threat model in SECURITY.md. Every confirmed issue is fixed
 and its proof of concept re-run against the fixed code. Highlights:
 

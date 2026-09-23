@@ -54,6 +54,9 @@
     {% call ui.tech_details() %}
     <p class="small">{{ ui.term('resolver', 'Resolver') }} listening on <span class="mono">{{ dns.listen }}:{{ dns.port }}</span> · block mode <span class="mono">{{ dns.block_mode }}</span> · {{ 'enabled' if dns.enabled else 'disabled' }} in config<br>
       Asks upstream: {% for u in dns.upstreams %}<span class="mono">{{ u }}</span>{% if not loop.last %}, {% endif %}{% else %}<span class="muted">none set</span>{% endfor %}</p>
+    {% set pc = dns.protection %}
+    {% if pc %}<p class="small">Protection counters since it started: {{ pc.not_logged|num }} look-ups answered but not logged · {{ pc.connections_dropped|num }} connections dropped · {{ pc.lookups_shed|num }} look-ups shed · {{ pc.rate_limited|num }} slowed down · {{ pc.known_devices|num }} known devices · {{ pc.waiting_upstream|num }} waiting on the upstream now.
+      <span class="muted">Numbers above zero usually mean something on your network sent far more look-ups than a home needs, often from faked addresses.</span></p>{% endif %}
     {% endcall %}
   </section>
 </div>
@@ -104,6 +107,7 @@
       </tbody>
     </table>
     </div>
+    {% if top_clients and top_clients|selectattr('match_note')|list %}<p class="muted small">{{ (top_clients|selectattr('match_note')|first).match_note }}</p>{% endif %}
   </section>
   <section class="card">
     <h2>Sites you always allow or block <span class="muted small">(overrides)</span></h2>

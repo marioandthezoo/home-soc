@@ -28,6 +28,8 @@ from urllib.parse import quote
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
+from homesoc import config as configmod
+
 logger = logging.getLogger(__name__)
 
 bp = Blueprint("api", __name__, url_prefix="/api")
@@ -1463,10 +1465,32 @@ def _open_finding_facts(conn: sqlite3.Connection) -> dict[str, dict]:
             f["title"] = r["title"]
     for fid, f in facts.items():
         generic = _generic_title(getattr(catalog_spec(fid), "title", None))
+        if f["count"] > 1 and generic and fid.startswith("WIN-PER-"):
+            generic = _autostart_group_title(conn, fid, f["count"], generic)
         if f["count"] > 1 and generic:
             f["title"] = generic
         f["title"] = str(f["title"] or generic or fid)
     return facts
+
+
+def _autostart_group_title(conn: sqlite3.Connection, fid: str, count: int, generic: str) -> str:
+    """WIN-PER-* opens for new entries and for known entries whose command changed. A group
+    title must not call a hijacked, familiar entry "new", so say "changed" when any of them is."""
+    try:
+        changed = int(scalar(conn, "SELECT count(*) FROM findings WHERE status='open' AND finding_id=? "
+                                   "AND json_extract(evidence, '$.change') = 'modified'", (fid,)) or 0)
+    except sqlite3.Error:
+        return generic
+    if not changed:
+        return generic
+    try:
+        spec = importlib.import_module("homesoc.findings.catalog").spec_for(fid, {"change": "modified"})
+    except (ImportError, AttributeError):
+        spec = None
+    changed_title = _generic_title(getattr(spec, "title", None)) or generic
+    if changed >= count:
+        return changed_title
+    return f"{generic} or changed ({changed} changed)"
 
 
 def _score_breakdown_from_findings(conn: sqlite3.Connection) -> list[dict] | None:
@@ -1986,8 +2010,17 @@ def host_data(conn: sqlite3.Connection) -> dict:
         "(version IS NULL OR available<>version) ORDER BY name",
     )
     persistence = rows(conn, "SELECT * FROM persistence ORDER BY baseline ASC, last_seen DESC")
+    changes = loads(get_setting(conn, PERSISTENCE_CHANGES_SETTING), {}) or {}
+    if not isinstance(changes, dict):
+        changes = {}
     for p in persistence:
         p["baseline"] = _bool(p.get("baseline"))
+        info = changes.get(_persistence_entry_id(p.get("kind"), p.get("location"), p.get("name")))
+        if not p["baseline"] and isinstance(info, dict):
+            # A known program whose command changed: say so, and show what it ran before.
+            p["change"] = "modified"
+            p["previous_command"] = info.get("previous")
+            p["changed_at"] = info.get("changed_at")
     # SPEC-GAP: no table holds pending Windows updates / listeners. scanners.updates keeps its
     # probe JSON under updates.status_json ({pending, hotfix, history}) and scanners.host_* the
     # posture probe under host.posture_json ({listeners: [{port, address, pid, process}], hotfix}).
@@ -2025,9 +2058,56 @@ def host_data(conn: sqlite3.Connection) -> dict:
         "updates": updates,
         "software": software,
         "persistence": persistence,
+        "persistence_accept": True,
         "listeners": listeners,
         "platform": platform.system(),
     }
+
+
+#: persistence.CHANGES_SETTING / persistence._entry_id, repeated here so the host page does not
+#: import the Windows scanner package; a test keeps them equal.
+PERSISTENCE_CHANGES_SETTING = "persistence.changes_json"
+PERSISTENCE_ACCEPT_MAX = 500
+
+
+def _persistence_entry_id(kind: Any, location: Any, name: Any) -> str:
+    return json.dumps([kind, location, name], ensure_ascii=False)
+
+
+def persistence_accept(conn: sqlite3.Connection, entries: Any) -> dict:
+    """Mark autostart entries as known, each only if its command is still the one the owner saw.
+
+    ``entries`` is a list of ``{kind, location, name, command}`` taken from the host page. An entry
+    whose command changed after the page loaded is skipped, so a program swapped between reading
+    and clicking stays flagged. Never a blanket "accept everything": something that appeared after
+    the page loaded was not seen, so it is not accepted.
+    """
+    from homesoc.scanners import persistence as persistence_mod
+
+    accepted = skipped = 0
+    for item in list(entries or [])[:PERSISTENCE_ACCEPT_MAX]:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        kind, location, name = (str(item.get(k) or "") for k in ("kind", "location", "name"))
+        row = one(conn, "SELECT command, baseline FROM persistence WHERE kind=? AND location=? AND name=?",
+                  (kind, location, name))
+        if row is None or _bool(row["baseline"]):
+            skipped += 1
+            continue
+        shown = str(item.get("command") or "")
+        current = str(row["command"] or "")
+        if persistence_mod.command_fingerprint(shown) != persistence_mod.command_fingerprint(current):
+            skipped += 1
+            continue
+        if persistence_mod.accept_entry(conn, kind, location, name):
+            accepted += 1
+        else:
+            skipped += 1
+    if accepted:
+        _record_event(conn, "info", "web", f"{accepted} program(s) that start by themselves marked as known",
+                      {"accepted": accepted, "skipped": skipped})
+    return {"ok": True, "accepted": accepted, "skipped": skipped}
 
 
 def _as_list(value: Any) -> list:
@@ -2297,6 +2377,38 @@ def dns_summary(c: WebContext) -> dict:
             "limit": int(cfg_get(c.cfg, "dns.virustotal_daily_budget", 400) or 0),
             "key_set": bool(cfg_get(c.cfg, "dns.virustotal_api_key", "")),
         },
+        "protection": dns_protection_counters(c),
+    }
+
+
+def dns_protection_counters(c: WebContext) -> dict | None:
+    """The resolver's flood-guard counters since it started, or None when it is not running in
+    this process. Non-zero numbers usually mean something on the network is sending far more
+    lookups than a home needs, often from faked addresses."""
+    server = c.dns_server
+    if server is None or not dns_running(c):
+        return None
+    try:
+        stats = server.stats()
+    except Exception:
+        return None
+    if not isinstance(stats, dict):
+        return None
+
+    def num(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    guard = stats.get("upstream_guard") if isinstance(stats.get("upstream_guard"), dict) else {}
+    return {
+        "not_logged": num(stats.get("log_overflowed")),
+        "connections_dropped": num(stats.get("tcp_evicted")),
+        "lookups_shed": num(stats.get("udp_shed")),
+        "rate_limited": num(stats.get("rate_limited")),
+        "known_devices": num(stats.get("known_clients")),
+        "waiting_upstream": num(guard.get("inflight_udp")),
     }
 
 
@@ -2349,6 +2461,9 @@ def label_clients(conn: sqlite3.Connection, items: list[dict], key: str = "clien
         r["device_id"] = hit["device_id"] if hit else None
         r["device_label"] = hit["device_label"] if hit else "Unnamed device"
         r["device_ip"] = ip or None
+        # The name is an address match; any device on the network can send from this address.
+        r["matched_by"] = "address"
+        r["match_note"] = ADDRESS_MATCH_NOTE if hit else None
     return items
 
 
@@ -2625,7 +2740,7 @@ _EVENT_RULES: tuple[tuple[str, re.Pattern[str], Any], ...] = (
     ("scheduler", re.compile(r"^score recorded$", re.I), lambda m: "The safety score was updated."),
     ("dnsfilter", re.compile(r"^hourly rollup written$", re.I), lambda m: "Web blocking saved its hourly summary."),
     ("dnsfilter", re.compile(r"^blocked a known-malicious domain for (?P<who>.+)$", re.I),
-     lambda m: f"Web blocking stopped {m['who']} from reaching a known-dangerous website."),
+     lambda m: f"Web blocking stopped a look-up of a known-dangerous website from {m['who']}."),
     ("vulns", re.compile(r"^matched (?P<svc>[\d,]+) services? against .*?: (?P<cves>[\d,]+) CVEs?, (?P<kev>[\d,]+) KEV", re.I),
      lambda m: (f"Checked the software on your devices against lists of known flaws: {m['cves']} "
                 f"{_plural(_n(m['cves']), 'flaw')} matched, {m['kev']} on the list attackers are known to use.")),
@@ -2667,6 +2782,24 @@ _EVENT_RULES: tuple[tuple[str, re.Pattern[str], Any], ...] = (
 )
 
 
+#: Event sources whose addresses come off a DNS packet (the resolver and its query log).
+DNS_EVENT_SOURCES: tuple[str, ...] = ("dns",)  # also matches "dnsfilter"
+
+
+def address_of(label: str, ip: str) -> str:
+    """"Mum's iPhone's address (192.168.1.31)": a device named only by an address match.
+
+    For anything learned from where a DNS query *came from*. A UDP source address is the
+    sender's word, and any device on the network can use another one's, so the plain wording
+    says whose address it was rather than that the named device did it.
+    """
+    return f"{label}'s address ({ip})"
+
+
+#: The muted note beside DNS rows that name a device (feed, DNS page top clients).
+ADDRESS_MATCH_NOTE = "Matched by network address. Another device on your network can pretend to use it."
+
+
 def plain_events(conn: sqlite3.Connection, events: list[dict]) -> list[dict]:
     """Add ``plain`` (a sentence for the Home page) to each event; ``message`` is left as it was.
 
@@ -2678,11 +2811,13 @@ def plain_events(conn: sqlite3.Connection, events: list[dict]) -> list[dict]:
     except sqlite3.Error:
         names = {}
 
-    def named(text: str) -> str:
+    def named(text: str, by_address: bool = False) -> str:
         def swap(m: re.Match[str]) -> str:
             hit = names.get(m.group(0))
             label = hit.get("device_label") if hit else None
-            return f"{label} ({m.group(0)})" if label and label != m.group(0) else m.group(0)
+            if not label or label == m.group(0):
+                return m.group(0)
+            return address_of(label, m.group(0)) if by_address else f"{label} ({m.group(0)})"
         return _IPV4_IN_TEXT.sub(swap, text)
 
     for e in events:
@@ -2699,7 +2834,9 @@ def plain_events(conn: sqlite3.Connection, events: list[dict]) -> list[dict]:
                 except (KeyError, IndexError, ValueError):
                     plain = None
                 break
-        e["plain"] = named(plain or message)
+        # A DNS message names a query's source address, which any device on the network can
+        # fake: say whose address it was, not that the device itself did it.
+        e["plain"] = named(plain or message, by_address=source.startswith(DNS_EVENT_SOURCES))
     return events
 
 
@@ -2938,13 +3075,37 @@ def _display_value(kind: str, value: Any) -> Any:
     return "" if value is None else value
 
 
-#: Overrides that matter most when they silently beat config.toml: a credential, where the
-#: dashboard listens, and where the whole house's DNS goes.
-SHADOW_WARN_KEYS: frozenset[str] = frozenset({
-    "web.token", "web.host", "web.port", "notify.ntfy_url", "notify.discord_webhook", "notify.webhook_url",
-    "vulns.nvd_api_key", "dns.virustotal_api_key", "dns.urlhaus_auth_key", "dns.upstreams", "dns.doh_upstream",
-    "dns.listen", "dns.enabled",
+#: Settings-page overrides an intruder would plant: the dashboard's own bind and credential,
+#: where alerts go, where the house's DNS goes, which blocklists apply and who is scanned.
+#: The same list as the startup tamper warning uses (``config.TAMPER_SIGNAL_KEYS``).
+TAMPER_SIGNAL_KEYS: tuple[str, ...] = configmod.TAMPER_SIGNAL_KEYS
+
+#: Overrides that matter most when they silently beat config.toml: every tamper-signal key
+#: (bar two that only change timing), plus the API-key secrets (a rotated key that changes
+#: nothing is a leak that stays open).
+SHADOW_WARN_KEYS: frozenset[str] = frozenset(
+    {key for key, _kind in EDITABLE_SETTINGS
+     if key.startswith(TAMPER_SIGNAL_KEYS) and key not in ("web.refresh_seconds", "notify.digest_hour")}
+    | {"vulns.nvd_api_key", "dns.virustotal_api_key", "dns.urlhaus_auth_key"}
+)
+
+#: Settings that decide who can reach the dashboard, where the house's DNS goes, whether it
+#: is answered and filtered at all, who is scanned, and where (and which) alerts are sent. A
+#: dashboard with no password (web.token) cannot tell the owner apart from any other program or
+#: account on this PC, so it refuses to change these (web.host only when it is not a loopback
+#: address); they stay editable in config.toml or with ``python -m homesoc config set``, which
+#: needs the owner's own files rather than a connection to the dashboard.
+PASSWORD_ONLY_SETTINGS: frozenset[str] = frozenset({
+    "web.host", "web.token", "dns.upstreams", "dns.doh_upstream", "dns.listen",
+    "dns.enabled", "dns.port", "dns.lists", "network.exclude",
+    "notify.ntfy_url", "notify.discord_webhook", "notify.webhook_url", "notify.min_severity",
 })
+
+NEEDS_PASSWORD_MESSAGE = (
+    "This dashboard has no password, so it cannot tell you apart from any other program on this "
+    "computer. Change this in config.toml, or with: python -m homesoc config set <key> <value>. "
+    "Set a password (web.token) in config.toml before opening the dashboard to your network."
+)
 
 
 def _config_file_values() -> dict[str, Any]:
@@ -3040,23 +3201,68 @@ def settings_clear(c: WebContext, keys: Any) -> dict:
     allowed = dict(EDITABLE_SETTINGS)
     wanted = [keys] if isinstance(keys, str) else list(keys or [])
     cleared, errors = [], {}
+    needs_password = False
     for key in (str(k) for k in wanted):
         if key not in allowed:
             errors[key] = "not editable"
             continue
         if get_setting(c.conn, key) is None:
             continue
+        if not c.token and key in ("web.host", "web.token"):
+            # Clearing falls back to whatever config.toml says, which this request cannot vouch
+            # for; without a password that is the owner's call, not a web page's.
+            errors[key] = NEEDS_PASSWORD_MESSAGE
+            needs_password = True
+            continue
         write(c.conn, "DELETE FROM settings WHERE key=?", (key,))
         cleared.append(key)
         logger.info("config override %s cleared from the dashboard", key)
     if "web.token" in cleared:
         sessions_revoke_all(c.conn)
-    return {"ok": not errors, "cleared": cleared, "errors": errors, "restart_required": bool(cleared)}
+    out = {"ok": not errors, "cleared": cleared, "errors": errors, "restart_required": bool(cleared)}
+    if needs_password:
+        out["needs_password"] = True
+        out["error"] = NEEDS_PASSWORD_MESSAGE
+    return out
+
+
+def _current_setting(c: WebContext, key: str, kind: str) -> str | None:
+    """What ``key`` is now (a pending override first, else the running config), encoded."""
+    stored = get_setting(c.conn, key)
+    if stored is not None:
+        return str(stored)
+    try:
+        return _encode_setting(kind, cfg_get(c.cfg, key, None))
+    except (TypeError, ValueError):
+        return None
+
+
+def _password_only_refusal(c: WebContext, key: str, value: Any) -> str | None:
+    """Why this request may not write ``key``, or None.
+
+    Only a dashboard with no password refuses anything here, and only for
+    :data:`PASSWORD_ONLY_SETTINGS`; web.host is refused only for a non-loopback address.
+    """
+    if c.token or key not in PASSWORD_ONLY_SETTINGS:
+        return None
+    if key == "web.host" and configmod.is_loopback_host(str(value or "")):
+        return None
+    return NEEDS_PASSWORD_MESSAGE
 
 
 def settings_post(c: WebContext, payload: dict) -> dict:
+    """Save Settings-page overrides.
+
+    Without a password (web.token) the request could come from any program on this PC, so the
+    settings that open the dashboard to the network, set its password, redirect the house's
+    DNS or send alerts elsewhere are refused (see :data:`PASSWORD_ONLY_SETTINGS`). Posting the
+    value already in force is not a change (the Settings form sends every field) and is skipped.
+    A new web.token must be at least ``config.MIN_TOKEN_LENGTH`` characters: a shorter one
+    would make the next start on the network refuse to listen.
+    """
     allowed = dict(EDITABLE_SETTINGS)
     saved, errors = [], {}
+    needs_password = False
     for key, value in (payload or {}).items():
         kind = allowed.get(str(key))
         if kind is None:
@@ -3064,6 +3270,28 @@ def settings_post(c: WebContext, payload: dict) -> dict:
             continue
         if kind == "secret" and not value:
             continue  # blank secret field means "keep what is there"
+        if key == "web.host":
+            value = str(value or "").strip()
+            if not value:
+                errors[str(key)] = "enter an address, for example 127.0.0.1"
+                continue
+        if key == "web.token":
+            value = str(value).strip()
+            if len(value) < configmod.MIN_TOKEN_LENGTH:
+                errors[str(key)] = (f"too short: use at least {configmod.MIN_TOKEN_LENGTH} random characters, "
+                                    "or leave it blank to keep the current one")
+                continue
+        refusal = _password_only_refusal(c, str(key), value)
+        if refusal is not None:
+            try:
+                unchanged = kind != "secret" and _encode_setting(kind, value) == _current_setting(c, str(key), kind)
+            except (TypeError, ValueError):
+                unchanged = False
+            if unchanged:
+                continue
+            errors[str(key)] = refusal
+            needs_password = True
+            continue
         if key == "dns.lists":
             bad = _unknown_blocklists(value)
             if bad:
@@ -3074,7 +3302,16 @@ def settings_post(c: WebContext, payload: dict) -> dict:
             saved.append(str(key))
         except (TypeError, ValueError):
             errors[str(key)] = f"expected {kind}"
-    return {"ok": not errors, "saved": saved, "errors": errors, "restart_required": bool(saved)}
+    confirmed = [k for k in saved if k in ("web.host", "web.token")]
+    if confirmed and c.token:
+        # Saved by someone signed in with the password: record it as the owner's, so the next
+        # start on the network does not warn that these values came from an unknown source.
+        configmod.confirm_web_overrides(c.conn, confirmed)
+    out = {"ok": not errors, "saved": saved, "errors": errors, "restart_required": bool(saved)}
+    if needs_password:
+        out["needs_password"] = True
+        out["error"] = NEEDS_PASSWORD_MESSAGE
+    return out
 
 
 def notify_test(c: WebContext) -> dict:
@@ -3164,9 +3401,9 @@ _MAP_LEGEND_CONFIDENCE: tuple[dict[str, str], ...] = (
         "key": "observed",
         "label": "Observed",
         "style": "solid",
-        "line": "Home SOC saw this happen: a DNS query that arrived from this device at its own "
-                "resolver, a service the device advertised over mDNS, or devices that went offline "
-                "in the same discovery cycle.",
+        "line": "Home SOC recorded it: a DNS query that came from this device's address (another "
+                "device can fake that address), a service the device advertised over mDNS, or "
+                "devices that went offline in the same discovery cycle.",
     },
     {
         "key": "inferred",
@@ -3822,6 +4059,25 @@ def api_host():
     return jsonify(host_data(ctx().conn))
 
 
+@bp.post("/host/persistence/accept")
+def api_persistence_accept():
+    """Mark one autostart entry as known (the host page's "Mark as known")."""
+    body = _payload()
+    result = persistence_accept(ctx().conn, [body])
+    return jsonify({"ok": True, "accepted": result["accepted"] == 1})
+
+
+@bp.post("/host/persistence/accept-all")
+def api_persistence_accept_all():
+    """Mark the entries the owner was shown as known ("Mark all as known")."""
+    entries = _payload().get("entries")
+    if not isinstance(entries, list):
+        return jsonify({"ok": False, "error": "expected a list of entries"}), 400
+    if len(entries) > PERSISTENCE_ACCEPT_MAX:
+        return jsonify({"ok": False, "error": f"at most {PERSISTENCE_ACCEPT_MAX} entries at a time"}), 400
+    return jsonify(persistence_accept(ctx().conn, entries))
+
+
 @bp.post("/defender/quick-scan")
 def api_defender_quick_scan():
     result = defender_action(ctx().cfg, "quick-scan")
@@ -3935,20 +4191,20 @@ def api_settings_get():
 @bp.post("/settings")
 def api_settings_post():
     result = settings_post(ctx(), _payload())
-    return jsonify(result), (200 if result["ok"] else 400)
+    return jsonify(result), (200 if result["ok"] else 403 if result.get("needs_password") else 400)
 
 
 @bp.post("/settings/clear")
 def api_settings_clear():
     """``{"keys": [...]}``: forget Settings-page overrides so config.toml applies again."""
     result = settings_clear(ctx(), _payload().get("keys"))
-    return jsonify(result), (200 if result["ok"] else 400)
+    return jsonify(result), (200 if result["ok"] else 403 if result.get("needs_password") else 400)
 
 
 @bp.delete("/settings/<key>")
 def api_settings_clear_one(key: str):
     result = settings_clear(ctx(), [key])
-    return jsonify(result), (200 if result["ok"] else 400)
+    return jsonify(result), (200 if result["ok"] else 403 if result.get("needs_password") else 400)
 
 
 @bp.post("/notify/test")
@@ -4358,8 +4614,12 @@ def api_lens_learn():
     if kind not in ("learned", "sticker", "ignored"):
         return _json_no_store({"ok": False, "error": "kind must be learned, sticker or ignored"}, 400)
     owner = principal.get("kind") == "dashboard"
-    if kind == "sticker" and not owner:
-        # Sticker rows are what the printed sheet reuses (B9); only the dashboard mints them.
+    new_sticker_shape = (not owner and lens.looks_like_sticker_code(body.get("code"))
+                         and lens.tag_for_code(c.conn, lens.normalise_code(body.get("code"))) is None)
+    if (kind == "sticker" or new_sticker_shape) and not owner:
+        # Sticker rows are what the printed sheet reuses (B9); only the dashboard mints them. A
+        # new "hs1:" code from a phone, whatever kind it claims, would be picked up as that
+        # device's sticker. A printed one is already known and needs no learning.
         return _json_no_store(
             {"ok": False, "code": "sticker_kind", "error": "Only the dashboard creates sticker codes."}, 403
         )

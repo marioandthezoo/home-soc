@@ -166,23 +166,51 @@
 <div class="grid grid-2">
   <section class="card">
     <h2>Programs that start by themselves <span class="muted small">(autostarts)</span></h2>
-    {% set kind_words = {'run': 'Starts when you sign in', 'runonce': 'Starts once at next sign-in', 'startup': 'Startup folder', 'task': 'Scheduled task', 'service': 'Background service'} %}
+    {% set kind_words = {'run': 'Starts when you sign in', 'run_key': 'Starts when you sign in', 'runonce': 'Starts once at next sign-in',
+      'startup': 'Startup folder', 'startup_folder': 'Startup folder', 'task': 'Scheduled task', 'scheduled_task': 'Scheduled task',
+      'service': 'Background service'} %}
+    {#- Pending rows (baseline=0) are either new since Home SOC started watching, or known programs
+        whose command changed (change == 'modified', with the command they ran before). "Mark as
+        known" only appears once the server offers the accept routes (host.persistence_accept). -#}
     {% set added = h.persistence|rejectattr('baseline')|list %}
-    {% if h.persistence %}<p class="muted small">{% if added %}<b>{{ added|length }}</b> {{ 'was' if added|length == 1 else 'were' }} added after Home SOC started watching (marked New) — check you recognise {{ 'it' if added|length == 1 else 'them' }}.{% else %}Nothing new since Home SOC started watching.{% endif %} Select a row (or its name, with the keyboard) for the command it runs.</p>{% endif %}
+    {% set changed = added|selectattr('change', 'equalto', 'modified')|list %}
+    {% set n_new = added|length - changed|length %}
+    {% set can_accept = h.persistence_accept and added %}
+    {% if h.persistence %}<p class="muted small">
+      {%- if added -%}
+      {%- if n_new %}<b>{{ n_new }}</b> {{ 'was' if n_new == 1 else 'were' }} added after Home SOC started watching (marked New){% endif -%}
+      {%- if n_new and changed %}, and {% endif -%}
+      {%- if changed %}<b>{{ changed|length }}</b> {{ 'program Home SOC already knew now runs' if changed|length == 1 else 'programs Home SOC already knew now run' }} a different command (marked Changed){% endif -%}
+      {{- '' }} — check you recognise {{ 'it' if added|length == 1 else 'them' }}.
+      {%- else -%}Nothing new since Home SOC started watching.{%- endif %} Select a row (or its name, with the keyboard) for the command it runs.</p>{% endif %}
+    {% if can_accept %}
+    <div class="actions">
+      <button type="button" class="btn btn-sm" data-action="persistence-accept-all" title="Tells Home SOC you recognise every program marked New or Changed on this page, so it stops flagging them. It flags a program again if its command changes.">Mark all as known</button>
+    </div>
+    {% endif %}
     <div class="tbl-wrap">
-    <table class="tbl">
+    <table class="tbl" id="persistence-table">
       <thead><tr><th>Program</th><th>How it starts</th><th>Last seen</th></tr></thead>
       <tbody>
         {% for p in h.persistence %}
+        {%- set is_changed = (not p.baseline) and p.change == 'modified' -%}
         <tr class="expandable">
-          <td class="wrap"><button type="button" class="row-toggle" aria-expanded="false" aria-controls="persist-detail-{{ loop.index }}">{{ p.name }}</button>{% if not p.baseline %} {{ badge('new', 'New') }}{% endif %}</td>
+          <td class="wrap"><button type="button" class="row-toggle" aria-expanded="false" aria-controls="persist-detail-{{ loop.index }}">{{ p.name }}</button>{% if is_changed %} {{ badge('new', 'Changed') }}{% elif not p.baseline %} {{ badge('new', 'New') }}{% endif %}</td>
           <td class="wrap">{{ kind_words.get((p.kind or '')|lower, p.kind) }} <span class="tech-word">{{ p.kind }}</span></td>
           <td class="nowrap">{{ p.last_seen|ago }}</td>
         </tr>
         <tr class="detail-row" id="persist-detail-{{ loop.index }}" hidden>
           <td colspan="3">
-            <p class="small">Runs <span class="mono">{{ p.command or '(no command recorded)' }}</span></p>
+            <p class="small">{{ 'Now runs' if is_changed else 'Runs' }} <span class="mono">{{ p.command or '(no command recorded)' }}</span></p>
+            {% if is_changed %}{% set when = p.changed_at|ago if p.changed_at else 'never' %}<p class="small">Before it changed, it ran <span class="mono">{{ p.previous_command or '(no command recorded)' }}</span>{% if when != 'never' %} <span class="muted">(changed {{ when }})</span>{% endif %}</p>{% endif %}
             <p class="small muted">Registered in <span class="mono">{{ p.location }}</span></p>
+            {% if can_accept and not p.baseline %}
+            <div class="actions">
+              <button type="button" class="btn btn-sm" data-action="persistence-accept"
+                data-kind="{{ p.kind }}" data-location="{{ p.location }}" data-name="{{ p.name }}" data-command="{{ p.command or '' }}"
+                title="Tells Home SOC you recognise this program and the command above, so it stops flagging it. It flags it again if the command changes.">Mark as known</button>
+            </div>
+            {% endif %}
           </td>
         </tr>
         {% else %}<tr><td colspan="3" class="empty">No start-up programs recorded yet.</td></tr>{% endfor %}

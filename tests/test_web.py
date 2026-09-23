@@ -687,7 +687,14 @@ def test_settings_get_and_post(seeded_client, conn):
     assert items["web.refresh_seconds"]["value"] == "30" and items["web.refresh_seconds"]["source"] == "override"
     assert items["network.exclude"]["value"] == "192.168.1.9" and items["dns.enabled"]["value"] is True
     assert items["web.token"]["value"] == "" and items["web.token"]["set"] is False
-    r = seeded_client.post("/api/settings", json={"dns.enabled": False, "network.exclude": "10.0.0.1, 10.0.0.2", "scan.nmap_top_ports": 50, "web.token": ""}, headers=FETCH)
+    # Switching DNS off and hiding addresses from scans need a password since round three (a
+    # dashboard with none cannot tell the owner from another program on the PC), so sign in.
+    refused = seeded_client.post("/api/settings", json={"dns.enabled": False}, headers=FETCH)
+    assert refused.status_code == 403 and refused.get_json()["needs_password"] is True
+    app = create_app(make_cfg(token="settings-test-token-0123456789"), conn)
+    app.config["TESTING"] = True
+    signed = {**FETCH, "X-Token": "settings-test-token-0123456789"}
+    r = app.test_client().post("/api/settings", json={"dns.enabled": False, "network.exclude": "10.0.0.1, 10.0.0.2", "scan.nmap_top_ports": 50, "web.token": ""}, headers=signed)
     assert r.status_code == 200 and sorted(r.get_json()["saved"]) == ["dns.enabled", "network.exclude", "scan.nmap_top_ports"]
     get = lambda k: conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()["value"]
     assert get("dns.enabled") == "false" and get("network.exclude") == '["10.0.0.1", "10.0.0.2"]' and get("scan.nmap_top_ports") == "50"

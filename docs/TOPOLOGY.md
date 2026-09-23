@@ -99,7 +99,7 @@ resolver on, the cloud column will be thin or empty, and that is not a bug — i
 
 Every edge carries one, and the page draws each differently.
 
-**`observed` — solid line.** Home SOC saw this happen: a DNS query arriving from that device at its own resolver, a
+**`observed` — solid line.** Home SOC recorded it: a DNS query arriving from that device's address at its own resolver (another device on the network can fake that address), a
 service the device advertised over mDNS, or a set of devices that went offline in the same discovery cycle. Those
 three are the whole list — it is deliberately short, and section 9 covers what would lengthen it.
 
@@ -273,7 +273,7 @@ secondary DNS server, a tested hotspot, moving one role onto another box) and ab
 it happens again, which is the bit that actually saves you an evening. It also tells you to rehearse: unplug it for
 two minutes on a quiet afternoon and see whether reality matches the map.
 
-**`NET-DEP-003` (info) — *"{device} depends on {domain}, which is not answering it"*.** A device keeps asking for a
+**`NET-DEP-003` (info) — *"Lookups from {name}'s address keep trying to reach {domain} and never get through"*.** Lookups from a device's address keep asking for a
 cloud endpoint and keeps not getting a usable answer — either the filter blocked it or the name does not resolve.
 Consumer devices almost never tell you this. They keep their lights on and quietly stop doing something: notifications
 stop arriving, recordings stop uploading, schedules stop firing, firmware stops updating. This finding is a note that

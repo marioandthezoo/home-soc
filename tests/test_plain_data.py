@@ -501,7 +501,8 @@ def test_feed_items_name_devices_without_doubling_the_ip(conn):
     assert new_camera.device_label == "Unnamed camera"
     blocks = [i for i in items if i.kind == "dns_block"]
     phone = next(i for i in blocks if i.ref["client"] == "192.168.1.32")
-    assert "from Ellie's iPhone (192.168.1.32)" in phone.title and phone.device_label == "Ellie's iPhone"
+    # An address match, worded as one (security round 3): the source address can be faked.
+    assert "from Ellie's iPhone's address (192.168.1.32)" in phone.title and phone.device_label == "Ellie's iPhone"
     stranger = next(i for i in blocks if i.ref["client"] == "10.9.9.9")
     assert stranger.title.endswith("from 10.9.9.9") and stranger.device_label == "Unnamed device"
     # the item's JSON shape is pinned by the API contract: the label travels inside ref

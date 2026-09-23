@@ -260,6 +260,9 @@ EMITTER_EVIDENCE: dict[str, tuple[str, dict]] = {
     "NET-DNS-005": ("dns", {"failing_seconds": 120, "ok": False, "consecutive_failures": 9,
                             "last_error": "timeout", "last_upstream": "1.1.1.2", "upstreams": ["1.1.1.2"]}),
     "NET-DNS-006": ("dns", {"listen": "0.0.0.0", "port": 53}),
+    # dnsfilter/server.py _flood_draft
+    "NET-DNS-007": ("dns", {"not_logged": 5120, "sources_per_minute_limit": 4096,
+                            "sample_sources": ["10.9.8.7", "172.16.4.4"]}),
     # --- cli.soc_health_drafts / feeds.updater.health_findings / host_windows
     "SOC-FEED-001": ("feed:kev", {"key": "kev", "name": "kev", "error": "HTTP 500",
                                   "last_updated": "2026-09-01T00:00:00Z", "error_since": "2026-09-02T00:00:00Z",

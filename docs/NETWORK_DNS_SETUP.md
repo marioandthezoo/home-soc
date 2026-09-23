@@ -747,9 +747,10 @@ GET    /api/dns/overrides
 distracting site, a specific game's telemetry, or a domain you saw in a security advisory this
 morning. They are checked before everything except allow overrides, so they always win.
 
-When a **NET-DNS-004** finding appears ("a device tried to reach a malicious domain"), treat it as a
-lead, not a verdict. It names the client and the domain and links to the VirusTotal page. Identify
-the device on the Devices page, look at what else that client asked for in the query log, and — if
+When a **NET-DNS-004** finding appears ("malicious domain looked up from <address>"), treat it as a
+lead, not a verdict. It names the address the lookup came from and the domain, and links to the
+VirusTotal page. Another device on the network can fake a source address, so confirm the device
+made the lookup before acting on it. Identify the device on the Devices page, look at what else that client asked for in the query log, and — if
 it is a PC — run a Defender scan. If you are confident it is a false positive, an allow override
 clears it.
 

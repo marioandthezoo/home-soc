@@ -127,7 +127,7 @@ def test_recent_activity_is_plain_sentences_with_names():
     conn.commit()
     events = api.collapse_repeats(api.plain_events(conn, api.telemetry_events(conn, limit=10)))
     plain = [e["plain"] for e in events]
-    assert any("Ellie's iPhone (192.168.1.32)" in p for p in plain)
+    assert any("Ellie's iPhone's address (192.168.1.32)" in p for p in plain)  # DNS: an address match
     lens_rows = [e for e in events if e["source"] == "lens"]
     assert len(lens_rows) == 1 and lens_rows[0]["repeats"] == 2
     assert "not a new device on your network" in lens_rows[0]["plain"]

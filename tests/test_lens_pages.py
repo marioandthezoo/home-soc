@@ -944,13 +944,28 @@ def test_plain_http_lens_still_works_from_this_machine(seeded_client):
         assert seeded_client.get(path, base_url="http://127.0.0.1:8443").status_code == 200, path
 
 
-def test_the_desktop_lens_pages_survive_the_refusal(seeded_client):
+def test_the_desktop_lens_pages_survive_the_refusal(conn):
     """/lens/pair is where the fix is explained. Refusing to serve it over HTTP would hide
-    the instructions behind the very condition they exist to resolve."""
+    the instructions behind the very condition they exist to resolve. (Reaching the dashboard
+    from another address needs a web.token since round three; see the next test.)"""
+    seed(conn)
+    c = client_for(conn, token="desk-token-0123456789abcdef")
+    signed = {"X-Token": "desk-token-0123456789abcdef"}
     for path in DESK_PAGES:
-        r = seeded_client.get(path, base_url=HTTP_LAN, environ_base=PHONE_ENV)
+        r = c.get(path, base_url=HTTP_LAN, environ_base=PHONE_ENV, headers=signed)
         assert r.status_code == 200, path
-    assert seeded_client.get("/devices", base_url=HTTP_LAN, environ_base=PHONE_ENV).status_code == 200
+    assert c.get("/devices", base_url=HTTP_LAN, environ_base=PHONE_ENV, headers=signed).status_code == 200
+
+
+def test_a_dashboard_with_no_password_answers_only_this_computer(seeded_client):
+    """Deferred item 2: with no web.token, /lens/pair (which mints pairing codes), the Settings
+    page and every other dashboard page refuse a peer that is not this computer. The phone's
+    own routes keep their own checks (phone token, pairing code, HTTPS)."""
+    for path in DESK_PAGES + ["/devices", "/settings", "/api/settings"]:
+        r = seeded_client.get(path, base_url=HTTP_LAN, environ_base=PHONE_ENV)
+        assert r.status_code == 403, path
+        assert "no password" in r.get_data(as_text=True)
+    assert seeded_client.get("/lens/pair", base_url="http://127.0.0.1:8443").status_code == 200
 
 
 def test_require_https_false_lifts_the_refusal(conn):

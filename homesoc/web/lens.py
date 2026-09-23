@@ -25,9 +25,9 @@ import threading
 import time
 from contextlib import nullcontext as _nullcontext
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
+from homesoc import db as core_db
 from homesoc.web import api
 
 logger = logging.getLogger(__name__)
@@ -334,6 +334,21 @@ def is_sticker_code(code: str) -> bool:
     return code.startswith(STICKER_PREFIX)
 
 
+def looks_like_sticker_code(code: Any) -> bool:
+    """True for anything the sticker queries would treat as a printed sticker.
+
+    Those queries use SQL ``LIKE 'hs1:%'``, which ignores ASCII case, so ``HS1:...`` counts too.
+    """
+    normalised = normalise_code(code)
+    return normalised is not None and normalised[:len(STICKER_PREFIX)].lower() == STICKER_PREFIX
+
+
+#: Which of a device's sticker-shaped rows is *the* sticker: a row the dashboard minted
+#: (kind 'sticker') before anything else, then the oldest. Read with ``setdefault`` so the
+#: first row wins and a code learned later can never replace the one printed on the device.
+STICKER_ROW_ORDER = "ORDER BY (kind = 'sticker') DESC, id"
+
+
 def new_sticker_code() -> str:
     return STICKER_PREFIX + secrets.token_urlsafe(STICKER_ENTROPY_BYTES)
 
@@ -600,11 +615,12 @@ def existing_sticker_codes(conn: sqlite3.Connection, device_ids: list[int]) -> d
     out: dict[int, str] = {}
     for r in api.rows(
         conn,
-        f"SELECT device_id, code FROM lens_tags WHERE code LIKE ? AND device_id IN ({placeholders}) ORDER BY id",
+        f"SELECT device_id, code FROM lens_tags WHERE code LIKE ? AND device_id IN ({placeholders}) "
+        + STICKER_ROW_ORDER,
         [STICKER_PREFIX + "%"] + wanted,
     ):
         if r.get("device_id") is not None:
-            out[int(r["device_id"])] = str(r["code"])  # same row mint_sticker_codes reuses
+            out.setdefault(int(r["device_id"]), str(r["code"]))  # same row mint_sticker_codes reuses
     return out
 
 
@@ -632,18 +648,20 @@ def mint_sticker_codes(conn: sqlite3.Connection, device_ids: list[int]) -> dict[
     scope = dbmod.transaction(conn) if dbmod is not None and hasattr(dbmod, "transaction") else _nullcontext()
     with scope:
         known = {int(r["id"]) for r in api.rows(conn, f"SELECT id FROM devices WHERE id IN ({placeholders})", wanted)}
-        existing = {
-            int(r["device_id"]): str(r["code"])
-            for r in api.rows(
-                conn,
-                # Keyed on the payload shape, not on the mutable ``kind`` column: STICKER_PREFIX
-                # is what actually makes a code a printed sticker, so a row whose kind was moved
-                # still reuses its code and the sheet reprints the QR already on the device (B9).
-                f"SELECT device_id, code FROM lens_tags WHERE code LIKE ? AND device_id IN ({placeholders}) ORDER BY id",
-                [STICKER_PREFIX + "%"] + wanted,
-            )
-            if r.get("device_id") is not None
-        }
+        existing: dict[int, str] = {}
+        for r in api.rows(
+            conn,
+            # Keyed on the payload shape, not on the mutable ``kind`` column: STICKER_PREFIX
+            # is what actually makes a code a printed sticker, so a row whose kind was moved
+            # still reuses its code and the sheet reprints the QR already on the device (B9).
+            # The first row per device wins (STICKER_ROW_ORDER), so a later row can never
+            # replace the code already printed.
+            f"SELECT device_id, code FROM lens_tags WHERE code LIKE ? AND device_id IN ({placeholders}) "
+            + STICKER_ROW_ORDER,
+            [STICKER_PREFIX + "%"] + wanted,
+        ):
+            if r.get("device_id") is not None:
+                existing.setdefault(int(r["device_id"]), str(r["code"]))
         out: dict[int, str] = {}
         for device_id in wanted:
             if device_id not in known:
@@ -1716,52 +1734,18 @@ def reset_claim_limits(conn: sqlite3.Connection | None = None) -> None:
         api.write(conn, "DELETE FROM settings WHERE key=?", (str(row["key"]),))
 
 
-def _pairing_setting_key() -> str:
-    # SPEC-GAP: B4 says the pairing code lives in ``settings`` but does not name the key.
-    return "lens.pairing"
-
-
 def mint_pairing_code(conn: sqlite3.Connection, *, minutes: int = 5) -> str:
     """Single-use pairing code, returned once and stored only as a hash (B4/B10).
 
     The desktop ``/lens/pair`` page mints through the same helper, so a code shown there is
     exactly the code ``/api/lens/claim`` will accept.
     """
-    delegate = _l1("new_pairing_code", "mint_pairing_code", "create_pairing_code")
-    if delegate is not None:
-        try:
-            return str(delegate(conn))
-        except Exception:
-            logger.exception("pairing-code minting failed; using the local fallback")
-    alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"  # no look-alike characters
-    code = "".join(secrets.choice(alphabet) for _ in range(8))
-    expires = (api.utcnow() + timedelta(minutes=max(1, int(minutes)))).strftime("%Y-%m-%dT%H:%M:%SZ")
-    api.set_setting(conn, _pairing_setting_key(), json.dumps({"hash": token_hash(code), "expires_at": expires}))
-    return code
+    # One implementation only (homesoc.db): a code minted anywhere else would not be one the
+    # claim endpoint accepts.
+    return str(core_db.lens_new_pairing_code(conn))
 
 
 BAD_CODE_MESSAGE = "That pairing code is wrong, already used, or has expired. Generate a new one on the dashboard."
-
-
-def _consume_pairing_code(conn: sqlite3.Connection, presented: str) -> bool:
-    delegate = _l1("consume_pairing_code", "redeem_pairing_code")
-    if delegate is not None:
-        try:
-            return bool(delegate(conn, presented))
-        except Exception:
-            logger.exception("could not consume the pairing code")
-            return False
-    stored = api.loads(api.get_setting(conn, _pairing_setting_key()), None)
-    if not isinstance(stored, dict):
-        return False
-    expires_at = str(stored.get("expires_at") or "")
-    if expires_at and expires_at <= api.now_iso():
-        api.set_setting(conn, _pairing_setting_key(), "")
-        return False
-    if not secrets.compare_digest(str(stored.get("hash") or ""), token_hash(presented)):
-        return False
-    api.set_setting(conn, _pairing_setting_key(), "")  # single use
-    return True
 
 
 def claim(conn: sqlite3.Connection, code: Any, *, ip: str | None = None, label: str | None = None,
@@ -1777,42 +1761,35 @@ def claim(conn: sqlite3.Connection, code: Any, *, ip: str | None = None, label: 
         return {"ok": False, "error": BAD_CODE_MESSAGE}
     ensure_tables(conn)
     limit = max(1, int(max_tokens or 1))
+    full = {
+        "ok": False,
+        "error": f"{limit} phones are already paired; revoke one first "
+                 f"(python -m homesoc lens revoke <id>).",
+    }
     if active_token_count(conn) >= limit:
-        return {
-            "ok": False,
-            "error": f"{limit} phones are already paired; revoke one first "
-                     f"(python -m homesoc lens revoke <id>).",
-        }
-    if not _consume_pairing_code(conn, presented):
-        return {"ok": False, "error": BAD_CODE_MESSAGE}
-
+        return full
     name = (str(label or "").strip()[:60]) or "paired phone"
     scopes = "read,act" if allow_actions else "read"
-    mint = _l1("mint_token")
-    if mint is not None:
-        try:
-            row = mint(conn, label=name, scopes=scopes, ttl_days=int(ttl_days or 0), max_tokens=limit)
-        except Exception as exc:  # LensTokenLimit, and anything else the token layer refuses with
-            logger.warning("minting a Lens token was refused: %s", exc)
-            return {"ok": False, "error": str(exc)[:200]}
-        return {
-            "ok": True,
-            "token": row.get("token"),
-            "label": row.get("label") or name,
-            "scopes": parse_scopes(row.get("scopes")),
-            "expires_at": row.get("expires_at"),
-        }
-
-    token = secrets.token_urlsafe(32)
-    expiry = None
-    if int(ttl_days or 0) > 0:
-        expiry = (api.utcnow() + timedelta(days=int(ttl_days))).strftime("%Y-%m-%dT%H:%M:%SZ")
-    api.write(
-        conn,
-        "INSERT INTO lens_tokens(token_hash, label, scopes, created_at, last_ip, expires_at) VALUES(?,?,?,?,?,?)",
-        (token_hash(token), name, scopes, api.now_iso(), (str(ip or "")[:45]) or None, expiry),
-    )
-    return {"ok": True, "token": token, "label": name, "scopes": parse_scopes(scopes), "expires_at": expiry}
+    # One unit of work in the database layer: the ceiling check, spending the code and minting
+    # the token hold the write lock together, so two claims racing with one code cannot both
+    # get a token, the ceiling holds, and a claim refused at the ceiling keeps the code.
+    try:
+        row = core_db.lens_pair_with_code(conn, presented, label=name, scopes=scopes,
+                                          ttl_days=int(ttl_days or 0), max_tokens=limit)
+    except core_db.LensTokenLimit:
+        return full
+    except core_db.LensError:
+        return {"ok": False, "error": BAD_CODE_MESSAGE}
+    except Exception:
+        logger.exception("could not pair a Lens phone")
+        return {"ok": False, "error": BAD_CODE_MESSAGE}
+    return {
+        "ok": True,
+        "token": row.get("token"),
+        "label": row.get("label") or name,
+        "scopes": parse_scopes(row.get("scopes")),
+        "expires_at": row.get("expires_at"),
+    }
 
 
 __all__ = [

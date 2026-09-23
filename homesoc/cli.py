@@ -999,14 +999,11 @@ def make_dashboard_server(app: Any, host: str, port: int, *, ssl_context: Any = 
     return server
 
 
-#: Overrides an intruder on an open dashboard would plant (Settings page): where the house's DNS
-#: goes, which blocklists apply, where alerts go, who is scanned, and the dashboard's own
-#: bind and credential. Finding one when the policy has to generate a token means the
-#: dashboard may already have been used by someone else.
-TAMPER_SIGNAL_KEYS: tuple[str, ...] = (
-    "web.", "notify.", "dns.upstreams", "dns.doh_upstream", "dns.lists", "dns.listen", "dns.enabled",
-    "network.exclude",
-)
+#: Overrides an intruder on an open dashboard would plant (Settings page). Finding one when the
+#: policy has to generate a token, or when the dashboard is exposed with a web.host / web.token
+#: the owner is not known to have set, means it may already have been used by someone else.
+#: The list lives in config so the web layer uses the same one without importing the CLI.
+TAMPER_SIGNAL_KEYS: tuple[str, ...] = config.TAMPER_SIGNAL_KEYS
 
 
 def _tamper_signals(cfg: Config, conn: sqlite3.Connection) -> list[str]:
@@ -1034,6 +1031,48 @@ def _tamper_signals(cfg: Config, conn: sqlite3.Connection) -> list[str]:
     return reasons
 
 
+def _warn_unconfirmed_bind(cfg: Config, conn: sqlite3.Connection, bind: str, *, host_from_cli: bool) -> list[str]:
+    """Exposed with a strong token: say so loudly when that token (or the address it listens on)
+    came from a Settings-page value the owner is not known to have set.
+
+    Since this release a dashboard with no password refuses to save web.host or web.token, but a
+    value planted before the upgrade would otherwise pass silently: the dashboard would open to
+    the network with a password someone else chose. Returns the keys it warned about."""
+    try:
+        keys = config.unconfirmed_web_overrides(conn)
+    except sqlite3.Error:
+        return []
+    if host_from_cli:
+        keys = [k for k in keys if k != "web.host"]
+    if not keys:
+        return []
+    reasons = [r for r in _tamper_signals(cfg, conn) if not r.startswith("Settings-page overrides")]
+    emit("")
+    emit(f"WARNING: this dashboard is opening to your network ({bind or 'every interface'}) using "
+         + " and ".join(keys) + " saved on the Settings page,")
+    emit("and Home SOC has no record that you set them. Another program may have set them while the")
+    emit("dashboard had no password, so someone else may know the password, and the dashboard")
+    emit("may already have been open to the network." + (" Other signs:" if reasons else ""))
+    for reason in reasons:
+        emit(f"  - {reason}")
+    emit("If you did not set them, stop Home SOC and run:")
+    emit("  python -m homesoc config unset " + " ".join(keys))
+    emit("  python -m homesoc lens revoke --all")
+    emit("  python -m homesoc config overrides      (then: config unset <key> for anything you did not set)")
+    emit("If you did set them, run this once to stop this warning:")
+    emit("  python -m homesoc config keep")
+    emit("")
+    logger.warning("dashboard exposed on %s with unconfirmed Settings-page values for %s%s", bind, ", ".join(keys),
+                   " (" + "; ".join(reasons) + ")" if reasons else "")
+    try:
+        db.record_event(conn, "warning", "cli",
+                        "the dashboard opened to the network with a password or address Home SOC has no record "
+                        "of you setting", {"host": bind, "keys": keys, "signals": reasons})
+    except sqlite3.Error:
+        pass
+    return keys
+
+
 def enforce_bind_policy(cfg: Config, conn: sqlite3.Connection, host: str | None = None) -> Config | None:
     """The LAN exposure policy, applied before anything is built from ``cfg``.
 
@@ -1049,6 +1088,8 @@ def enforce_bind_policy(cfg: Config, conn: sqlite3.Connection, host: str | None 
     web = dataclasses.replace(cfg.web, host=bind)
     problem = config.lan_bind_problem(web)
     if problem is None:
+        if web.exposed:
+            _warn_unconfirmed_bind(cfg, conn, bind, host_from_cli=host is not None)
         return cfg
     if problem == "weak-token":
         emit(f"Refusing to listen on {bind or 'every interface'}: web.token is only {len(web.token)} characters, "
@@ -1067,6 +1108,7 @@ def enforce_bind_policy(cfg: Config, conn: sqlite3.Connection, host: str | None 
     token = secrets.token_urlsafe(32)
     try:
         config.set_override(conn, "web.token", token)
+        config.confirm_web_overrides(conn, ["web.token"])
         stored = True
     except (sqlite3.Error, ValueError):
         logger.exception("could not store the generated web.token; it lasts until this process stops")
@@ -2042,7 +2084,34 @@ def cmd_config(ctx: Context) -> int:
                     status = EXIT_ERROR
         db.record_event(ctx.conn, "info", "cli", "config overrides cleared", {"keys": keys})
         return status
-    emit("usage: python -m homesoc config {overrides|unset}")
+    if action == "set":
+        key = str(getattr(ctx.args, "key", "") or "")
+        value = getattr(ctx.args, "value", None)
+        if not config.is_config_key(key):
+            emit(f"{key}: not a setting Home SOC knows (see config.example.toml)")
+            return EXIT_USAGE
+        if key == "web.token" and value is not None and len(str(value).strip()) < config.MIN_TOKEN_LENGTH:
+            emit(f"web.token: use at least {config.MIN_TOKEN_LENGTH} random characters")
+            return EXIT_USAGE
+        try:
+            config.set_override(ctx.conn, key, str(value if value is not None else ""))
+        except ValueError as exc:
+            emit(f"{key}: {exc}")
+            return EXIT_USAGE
+        if key in ("web.host", "web.token"):
+            config.confirm_web_overrides(ctx.conn, [key])
+        emit(f"{key}: saved; it applies after a restart")
+        db.record_event(ctx.conn, "info", "cli", "config override set", {"key": key})
+        return EXIT_OK
+    if action == "keep":
+        config.confirm_web_overrides(ctx.conn)
+        kept = [k for k in ("web.host", "web.token") if k in stored]
+        emit("noted: " + (", ".join(kept) if kept else "no web.host or web.token override")
+             + " set by you; the startup warning about them stops")
+        db.record_event(ctx.conn, "info", "cli", "Settings-page web.host/web.token confirmed by the owner",
+                        {"keys": kept})
+        return EXIT_OK
+    emit("usage: python -m homesoc config {overrides|unset|set|keep}")
     return EXIT_USAGE
 
 
@@ -2165,13 +2234,18 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("id", nargs="?", type=int, help="token id from 'lens tokens'")
     q.add_argument("--all", action="store_true", help="revoke every paired phone")
 
-    p = sub.add_parser("config", help="list or remove Settings-page overrides of config.toml")
+    p = sub.add_parser("config", help="list, set or remove Settings-page overrides of config.toml")
     config_sub = p.add_subparsers(dest="config_command", metavar="action")
     config_sub.required = True
     config_sub.add_parser("overrides", help="list the values saved on the Settings page (secrets masked)")
     q = config_sub.add_parser("unset", help="remove Settings-page overrides so config.toml applies again")
     q.add_argument("keys", nargs="*", metavar="KEY", help="dotted key, e.g. web.token or notify.discord_webhook")
     q.add_argument("--all", action="store_true", help="remove every override")
+    q = config_sub.add_parser("set", help="save a value the way the Settings page does (it overrides config.toml)")
+    q.add_argument("key", metavar="KEY", help="dotted key, e.g. web.host or dns.upstreams")
+    q.add_argument("value", metavar="VALUE", help="the new value (lists as JSON, e.g. '[\"1.1.1.1\"]')")
+    config_sub.add_parser("keep", help="confirm that the saved web.host / web.token are yours "
+                                       "(stops the startup warning about them)")
 
     q = lens_sub.add_parser("cert", help="show or regenerate the HTTPS certificate")
     q.add_argument("--regenerate", action="store_true", help="replace the certificate even if it is still valid")

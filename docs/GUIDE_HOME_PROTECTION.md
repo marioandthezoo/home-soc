@@ -676,8 +676,8 @@ You can test any single domain against the policy without changing anything:
 
 > **Home SOC checks this automatically:** `NET-DNS-001` (devices are not actually using the filter),
 > `NET-DNS-002` (the resolver is not running, with the reason), `NET-DNS-003` (blocklists are stale),
-> `NET-DNS-004` (a specific client tried to reach a known-malicious domain — this one is a real
-> investigation lead, because it names the device), `NET-DNS-005` (upstream resolvers unreachable),
+> `NET-DNS-004` (a known-malicious domain was looked up from one device's address — a real
+> investigation lead, though another device can fake that address, so confirm before acting), `NET-DNS-005` (upstream resolvers unreachable),
 > `NET-DNS-006` (the resolver is bound to the LAN but the firewall does not allow DNS in).
 >
 > Changing your **router's** upstream DNS (level 1) is **Manual — Home SOC cannot verify this**; it can only
@@ -800,7 +800,7 @@ as the child gets older.
 > **Manual — Home SOC cannot verify this.** Home SOC has no concept of users, ages, or parental controls.
 >
 > Two indirect helps: `WIN-ACC-001` will tell you if the account they use is an administrator, and
-> `NET-DNS-004` will tell you if a device tried to reach a malicious domain, naming which device.
+> `NET-DNS-004` will tell you if a known-malicious domain was looked up from a device's address, naming that address.
 
 ---
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -86,6 +87,16 @@ def dedupe_key(draft: Any) -> str:
     return key
 
 
+# A lone surrogate cannot be encoded as UTF-8, so SQLite refuses the whole INSERT and the finding
+# is lost. Title and detail are cleaned by the catalog; the subject and the dedupe key (which can
+# carry evidence['key'], sometimes device text) are cleaned here, of that one character class only.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
+def _storable(text: Any) -> str:
+    return _LONE_SURROGATE.sub("?", str(text))
+
+
 def _row_to_dict(row: sqlite3.Row | None) -> dict:
     if row is None:
         return {}
@@ -139,7 +150,7 @@ def apply(conn: sqlite3.Connection, drafts: list[Any], source: str, *,
     now = _now()
     seen: set[str] = set()
     for draft in drafts:
-        key = dedupe_key(draft)
+        key = _storable(dedupe_key(draft))
         if key in seen:
             # SPEC-GAP: a scanner emitting the same key twice in one run counts once; first draft wins.
             continue
@@ -168,7 +179,7 @@ def _apply_one(conn: sqlite3.Connection, draft: Any, key: str, source: str, now:
             conn,
             "INSERT INTO findings(finding_id, subject, dedupe_key, severity, title, detail, evidence, status, "
             "source, first_seen, last_seen, occurrences, device_id) VALUES (?,?,?,?,?,?,?,'open',?,?,?,1,?)",
-            (draft.finding_id, draft.subject, key, severity, title, detail, evidence, source, now, now, device_id),
+            (draft.finding_id, _storable(draft.subject), key, severity, title, detail, evidence, source, now, now, device_id),
         )
         _event(conn, row_id, "opened")
         result.new.append(_fetch(conn, row_id))

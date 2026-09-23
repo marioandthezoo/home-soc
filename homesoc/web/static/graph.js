@@ -66,7 +66,7 @@
     cloud: 'an external service', provider: 'a service offered by a device', hub: 'a hub'
   };
   var CONF_WORD = {
-    observed: 'observed — Home SOC saw it happen',
+    observed: "observed — Home SOC recorded it (from this device's address)",
     inferred: 'inferred from the shape of the network',
     assumed: 'assumed; nothing has confirmed it'
   };

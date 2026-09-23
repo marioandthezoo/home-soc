@@ -87,6 +87,7 @@ UPSTREAM_INFLIGHT_TOTAL = 256
 GUARD_MAX_ENTRIES = 10000
 HOUSEKEEPING_TICK = 5.0
 HEALTH_INTERVAL = 60.0
+FLOOD_FINDING_SECONDS = 24 * 3600.0  # NET-DNS-007 stays open this long after the query log last overflowed
 METRIC_INTERVAL = 300.0       # dns.qps / dns.cache_size samples: every 5 min, or sooner when the value changed
 UPSTREAM_FAIL_SECONDS = 60.0
 CLIENTS_CHECK_MIN_UPTIME = 3600.0
@@ -673,6 +674,9 @@ class DnsServer:
         self._stop = threading.Event()
         self._started_at: float | None = None
         self._last_health = 0.0
+        self._overflow_seen = 0                 # querylog.overflowed at the previous health check
+        self._overflow_at: float | None = None  # monotonic time the overflow count last grew
+        self._overflow_not_logged = 0           # rows left out of the log since the flood began
         self._last_metric = 0.0
         self._last_metric_values: dict[str, float] = {}
         self.dropped_foreign = 0
@@ -1008,9 +1012,12 @@ class DnsServer:
             record_metric(self.conn, name, value)
 
     def health_findings(self, *, now: float | None = None) -> list:
-        """Drafts for NET-DNS-001/003/005/006 that currently apply (empty list = all healthy)."""
+        """Drafts for NET-DNS-001/003/005/006/007 that currently apply (empty list = all healthy)."""
         now = time.monotonic() if now is None else now
         drafts: list = []
+        flood = self._flood_draft(now)
+        if flood is not None:
+            drafts.append(flood)
         failing = self.upstream.failing_for(now)
         if failing >= UPSTREAM_FAIL_SECONDS:
             drafts.append(make_draft(
@@ -1053,6 +1060,33 @@ class DnsServer:
                 detail="Resolver is bound to the LAN but no inbound firewall rule for port 53 was found; run scripts/enable-lan-dns.ps1.",
             ))
         return drafts
+
+    def _flood_draft(self, now: float):
+        """NET-DNS-007 while the query log has overflowed within the last day.
+
+        The per-minute source table only overflows when thousands of different source addresses
+        send lookups inside one minute, which a home network only does when something forges them.
+        The query log writes an event for that; this turns it into a finding so it reaches the
+        score, 'Things to fix' and the notification channels."""
+        total = int(getattr(self.querylog, "overflowed", 0) or 0)
+        if total > self._overflow_seen:
+            if self._overflow_at is None or now - self._overflow_at >= FLOOD_FINDING_SECONDS:
+                self._overflow_not_logged = 0
+            self._overflow_not_logged += total - self._overflow_seen
+            self._overflow_at = now
+        self._overflow_seen = total
+        if self._overflow_at is None or now - self._overflow_at >= FLOOD_FINDING_SECONDS:
+            return None
+        from homesoc.dnsfilter.querylog import LOG_BUDGET_MAX_CLIENTS
+        sample = [str(s)[:64] for s in list(getattr(self.querylog, "last_overflow_sample", []) or [])[:8]]
+        return make_draft(
+            "NET-DNS-007", "dns",
+            evidence={"not_logged": self._overflow_not_logged,
+                      "sources_per_minute_limit": LOG_BUDGET_MAX_CLIENTS,
+                      "sample_sources": sample},
+            detail=(f"More than {LOG_BUDGET_MAX_CLIENTS} different source addresses sent lookups within one "
+                    f"minute; {self._overflow_not_logged} lookups from unknown addresses were answered but not logged."),
+        )
 
     def _apply_health(self, drafts: list) -> None:
         apply_findings(self.conn, drafts, SOURCE_HEALTH, scope="dns")

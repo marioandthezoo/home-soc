@@ -137,8 +137,11 @@ Dashboard: http://127.0.0.1:8787/login?token=<your-token>  (Ctrl-C to stop)
 ```
 
 Click that link (or paste it into a browser). The token is exchanged for a cookie, stripped from the address bar and
-remembered for 30 days, so from then on plain **<http://127.0.0.1:8787>** is enough. The token lives in `config.toml`
-under `[web] token`; set it to `""` if you want no login at all on a single-user machine, and see
+remembered for 7 days (renewed while you keep using it), so from then on plain **<http://127.0.0.1:8787>** is enough. The token lives in `config.toml`
+under `[web] token`. You can set it to `""` for no login at all on a single-user machine, but then any
+program running on this computer can open the dashboard and change every setting except the few that need a
+password (where it listens, its password, where the house's DNS and alerts go, and switching web blocking off);
+keeping the token is safer. See
 [Reaching the dashboard from another device](#the-dashboard-from-my-phone-or-another-pc) before you expose it.
 
 ## A tour of the dashboard
@@ -454,9 +457,12 @@ Startup-folder shortcut (no admin needed) so it comes back at every logon.
 
 <a id="the-dashboard-from-my-phone-or-another-pc"></a>
 **Reaching the dashboard from another device.** By default the dashboard listens on `127.0.0.1` and is reachable only
-from the machine it runs on. To reach it from your phone, set `[web] host = "0.0.0.0"`, **keep a non-empty
-`[web] token`** (Home SOC raises `SOC-SYS-003` if you don't), allow the port through your firewall, and browse to
-`http://<that-pc-lan-ip>:8787/login?token=<your-token>`. It is plain HTTP on your LAN, so do not do this on a network
+from the machine it runs on. To reach it from your phone, set `[web] host = "0.0.0.0"`, **keep the random
+`[web] token`** that `init` wrote, allow the port through your firewall, and browse to
+`http://<that-pc-lan-ip>:8787/login?token=<your-token>`. Home SOC will not listen on the network without a real
+token: if `[web] token` is empty it makes a strong one, saves it in its database and prints the sign-in link, and a
+token shorter than 16 characters makes it refuse to start (it tells you exactly what to change). See
+[SECURITY.md](SECURITY.md#the-dashboard-binds-to-localhost). It is plain HTTP on your LAN, so do not do this on a network
 you share with strangers.
 
 **Nothing appears on a page.** Check the System health page (Telemetry, `/telemetry`): it shows every job's last run, duration and failure count, plus

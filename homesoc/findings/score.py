@@ -202,7 +202,8 @@ def grade(score: int) -> str:
 
 # --------------------------------------------------------------------------- explaining the number
 
-_PLACEHOLDER = re.compile(r"\{[^{}]*\}")
+# A possessive goes with its placeholder ("from {name}'s address" -> "from address", not "from 's").
+_PLACEHOLDER = re.compile(r"\{[^{}]*\}(?:'s\b)?")
 _PARENTHETICAL = re.compile(r"\s*\([^()]*\{[^{}]*\}[^()]*\)")
 _TRAILING_JUNK = re.compile(r"[\s:,;\-–—]+$")
 _DANGLING_WORD = re.compile(r"\s+(on|for|in|at|to|of|from|with|by)$", re.IGNORECASE)
@@ -246,6 +247,30 @@ def _sample_titles(conn: sqlite3.Connection) -> dict[str, str]:
     return out
 
 
+def _group_title(conn: sqlite3.Connection, finding_id: str, count: int, sample: str) -> str:
+    """:func:`generic_title`, except that a WIN-PER-* group holding changed entries says so: a
+    familiar autostart entry whose command was swapped must not be summed up as "new"."""
+    generic = generic_title(finding_id, sample)
+    if not finding_id.startswith("WIN-PER-") or _catalog is None:
+        return generic
+    placeholders = ",".join("?" for _ in COUNTED_STATUSES)
+    try:
+        found = _query(conn, f"SELECT count(*) AS n FROM findings WHERE finding_id=? AND status IN ({placeholders}) "
+                             "AND json_extract(evidence, '$.change') = 'modified'", (finding_id, *COUNTED_STATUSES))
+        changed = int(found[0]["n"] or 0) if found else 0
+    except sqlite3.Error:
+        return generic
+    if not changed:
+        return generic
+    spec = _catalog.spec_for(finding_id, {"change": "modified"}) if hasattr(_catalog, "spec_for") else None
+    changed_title = generic_title(finding_id, "")
+    if spec is not None:
+        text = _PARENTHETICAL.sub("", str(spec.title))
+        text = re.sub(r"\s+", " ", _PLACEHOLDER.sub("", text)).strip()
+        changed_title = _TRAILING_JUNK.sub("", _DANGLING_WORD.sub("", _TRAILING_JUNK.sub("", text))).strip() or generic
+    return changed_title if changed >= count else f"{generic} or changed ({changed} changed)"
+
+
 def _worst_severity(rows: list[dict]) -> str:
     order = ("critical", "high", "medium", "low", "info")
     present = [r["severity"] for r in rows if r["severity"] in order]
@@ -285,7 +310,7 @@ def score_breakdown(conn: sqlite3.Connection) -> list[dict]:
         count = n_open + n_ack
         out.append({
             "finding_id": finding_id,
-            "title": sample if (count == 1 and sample) else generic_title(finding_id, sample),
+            "title": sample if (count == 1 and sample) else _group_title(conn, finding_id, count, sample),
             "count": count,
             "penalty": round(penalty, 1),
             "score_gain": max(0, gain),

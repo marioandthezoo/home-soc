@@ -628,15 +628,18 @@ def test_a_lens_token_does_not_open_the_dashboard_token_gate(seeded, monkeypatch
 
 @pytest.mark.parametrize("path", ["/api/map", "/api/map/blast/1", "/api/map/criticality", "/api/map/outages"])
 def test_a_lens_token_is_refused_on_the_map_even_with_no_dashboard_token(seeded, monkeypatch, path):
-    """The read-only phone is told where its answer lives instead of being handed the whole map."""
+    """The read-only phone is never handed the whole map.
+
+    Since round three a dashboard with no password answers only this computer, so a phone on
+    the LAN is refused before the map route's own "dashboard_only" answer is reached."""
     install_engine(monkeypatch, FakeEngine())
     token = paired(seeded)
     c = client_for(seeded)
     r = c.get(path, headers={"X-Lens-Token": token}, environ_base=LAN)
     assert r.status_code == 403
     data = body(r)
-    assert data["code"] == "dashboard_only"
-    assert "/api/lens/device/" in data["error"]
+    assert data.get("code") == "dashboard_only" or "no password" in data["error"]
+    assert "nodes" not in data and "edges" not in data
 
 
 def test_the_owner_at_the_desktop_may_read_the_map_while_carrying_a_lens_token(seeded, monkeypatch):

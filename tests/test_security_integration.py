@@ -33,6 +33,11 @@ from homesoc.web import create_app
 FETCH = {"X-Requested-With": "fetch"}
 
 
+# dns.lists needs a password since round three (it can switch the house's blocking off).
+SIGNED_TOKEN = "lists-test-token-0123456789"
+SIGNED = {**FETCH, "X-Token": SIGNED_TOKEN}
+
+
 def _client(conn, **web):
     app = create_app(web_tests.make_cfg(**web), conn)
     app.config["TESTING"] = True
@@ -46,7 +51,7 @@ def _client(conn, **web):
 def test_settings_refuse_list_names_that_are_not_feeds(bad):
     conn = web_tests.fresh_conn()
     try:
-        r = _client(conn).post("/api/settings", json={"dns.lists": bad}, headers=FETCH)
+        r = _client(conn, token=SIGNED_TOKEN).post("/api/settings", json={"dns.lists": bad}, headers=SIGNED)
         assert r.status_code in (200, 400)
         body = r.get_json()
         assert "dns.lists" in body["errors"] and "dns.lists" not in body["saved"]
@@ -58,7 +63,8 @@ def test_settings_refuse_list_names_that_are_not_feeds(bad):
 def test_settings_accept_real_feed_names():
     conn = web_tests.fresh_conn()
     try:
-        body = _client(conn).post("/api/settings", json={"dns.lists": "oisd_small"}, headers=FETCH).get_json()
+        body = _client(conn, token=SIGNED_TOKEN).post("/api/settings", json={"dns.lists": "oisd_small"},
+                                                     headers=SIGNED).get_json()
         assert body["saved"] == ["dns.lists"]
     finally:
         conn.close()

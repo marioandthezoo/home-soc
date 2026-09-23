@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import ipaddress
 import json
 import logging
 import re
@@ -26,6 +27,7 @@ from flask import (Flask, Response, abort, g, jsonify, make_response, redirect, 
                    request, send_from_directory)
 from markupsafe import Markup, escape
 
+from homesoc import config as configmod
 from homesoc import db
 from homesoc.web import api
 from homesoc.web import feed as feedmod
@@ -110,7 +112,10 @@ def create_app(cfg: Any, conn: sqlite3.Connection, scheduler: Any = None, dns_se
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
     token = str(api.cfg_get(cfg, "web.token", "") or "")
-    app.config["HOMESOC_TRUSTED_HOSTS"] = trusted_hosts(str(api.cfg_get(cfg, "web.host", "127.0.0.1") or "127.0.0.1"))
+    bind_host = str(api.cfg_get(cfg, "web.host", "127.0.0.1") or "127.0.0.1")
+    app.config["HOMESOC_TRUSTED_HOSTS"] = trusted_hosts(bind_host)
+    # This PC's own name (and <name>.local) only over HTTPS: see trusted_hosts.
+    app.config["HOMESOC_TLS_TRUSTED_HOSTS"] = trusted_hosts(bind_host, include_names=True)
     app.extensions["homesoc"] = api.WebContext(cfg=cfg, conn=conn, scheduler=scheduler, dns_server=dns_server, token=token)
     app.register_blueprint(api.bp)
     api.sessions_sync_token(conn, token)
@@ -127,12 +132,9 @@ def create_app(cfg: Any, conn: sqlite3.Connection, scheduler: Any = None, dns_se
     return app
 
 
-#: Shorter than this, a hand-picked token falls to guessing even at the rate-limited pace.
-MIN_TOKEN_LENGTH = 16
-
-
 def _warn_weak_token(token: str) -> None:
-    if token and len(token) < MIN_TOKEN_LENGTH:
+    # config.MIN_TOKEN_LENGTH is the one definition; the bind policy and Settings use it too.
+    if token and len(token) < configmod.MIN_TOKEN_LENGTH:
         logger.warning(
             "web.token is only %d characters long. Anyone who can reach the dashboard can guess a short "
             "token; replace it with a long random one (python -m homesoc init writes one).", len(token)
@@ -181,22 +183,54 @@ def _register_lens_blueprints(app: Flask) -> None:
 # --------------------------------------------------------------------------- security
 
 
-def trusted_hosts(bind_host: str) -> frozenset[str]:
+def _ip_literal(value: str) -> str | None:
+    """``value`` as a bare IP address (brackets and zone index dropped), or None for a name."""
+    literal = str(value or "").strip()
+    if literal.startswith("[") and literal.endswith("]"):
+        literal = literal[1:-1]
+    literal = literal.split("%", 1)[0]
+    try:
+        ipaddress.ip_address(literal)
+    except ValueError:
+        return None
+    return literal
+
+
+def trusted_hosts(bind_host: str, *, include_names: bool = False) -> frozenset[str]:
     """Host header values the dashboard answers to.
 
     A page on attacker.example that DNS-rebinds its own name to 127.0.0.1:8787 becomes same-origin
     with the dashboard in the browser; the only thing that still tells it apart is the Host header,
-    so anything outside this allowlist is refused with 400. SPEC-GAP: the spec has no such list;
-    loopback, the bind address, this PC's LAN address and hostname cover every legitimate URL.
+    so anything outside this allowlist is refused with 400.
+
+    So the list only holds names nobody else can answer for:
+
+    * Loopback bind: 127.0.0.1, localhost, ::1 and [::1]. Nothing else can reach the socket.
+    * LAN bind: those, plus the IP addresses this machine answers on.
+    * This PC's own name and ``<name>.local`` only with ``include_names`` (used for HTTPS
+      requests, where the certificate proves the name). Over plain HTTP any device on the
+      network can answer mDNS or LLMNR for ``<name>.local``, serve a page there, and then point
+      the name back at the dashboard: that page would be same-origin and pass every check.
     """
     hosts = {"127.0.0.1", "localhost", "::1", "[::1]"}
-    if bind_host and bind_host not in ("0.0.0.0", "::", "[::]"):
-        hosts.add(bind_host)
+    bind = str(bind_host or "").strip()
+    if configmod.is_loopback_host(bind):
+        literal = _ip_literal(bind)
+        if literal:
+            hosts.add(literal)
+        return frozenset(h.lower() for h in hosts if h)
+    literal = _ip_literal(bind)
+    if literal and bind not in ("0.0.0.0", "::", "[::]"):
+        hosts.add(literal)
+        if ":" in literal:
+            hosts.add(f"[{literal}]")
+    elif bind and not literal and include_names:
+        hosts.add(bind)  # web.host set to a name: trusted only where the certificate proves it
     name = ""
     try:
         from homesoc import util  # type: ignore
 
-        hosts.add(util.default_interface_ip())
+        hosts.add(str(util.default_interface_ip() or ""))
         name = util.local_hostname()
     except Exception:  # pragma: no cover - core package absent
         pass
@@ -206,8 +240,9 @@ def trusted_hosts(bind_host: str) -> frozenset[str]:
         except OSError:  # pragma: no cover - no hostname configured
             name = ""
     if name:
-        hosts.add(name)
-        hosts.add(f"{name}.local")
+        if include_names:
+            hosts.add(name)
+            hosts.add(f"{name}.local")
         # Every address this machine answers on, so a second NIC (Wi-Fi + Ethernet, or a VPN)
         # does not lock the owner out of their own dashboard. Resolved once, at startup.
         try:
@@ -217,7 +252,7 @@ def trusted_hosts(bind_host: str) -> frozenset[str]:
                     hosts.add(addr.split("%", 1)[0])  # drop any IPv6 zone index
         except OSError:
             logger.debug("could not enumerate local addresses for %r", name)
-    return frozenset(h.lower() for h in hosts if h)
+    return frozenset(h.lower() for h in hosts if h and (include_names or _ip_literal(h) or h == "localhost"))
 
 
 def _host_header_name() -> str:
@@ -404,12 +439,27 @@ def _register_security(app: Flask) -> None:
         if refusal is not None:
             return refusal
         allowed_hosts: frozenset[str] = app.config.get("HOMESOC_TRUSTED_HOSTS") or frozenset()
-        if allowed_hosts and _host_header_name().lower() not in allowed_hosts:
+        host_name = _host_header_name().lower()
+        if (allowed_hosts and host_name not in allowed_hosts
+                and not (request.is_secure and host_name in (app.config.get("HOMESOC_TLS_TRUSTED_HOSTS") or ()))):
             logger.warning("refused request with unexpected Host header %r", request.host)
             return jsonify({"ok": False, "error": "bad host header"}), 400  # type: ignore[return-value]
         foreign = _cross_site_refusal(path)
         if foreign is not None:
             return foreign
+        if (not c.token and not path.startswith("/static/") and path not in LENS_PHONE_PATHS
+                and not _lens_self_authenticating(c.cfg, path) and not _peer_is_loopback()):
+            # A dashboard with no password answers this computer only. The start-up bind policy
+            # never lets one listen on the network, so this only matters if something starts the
+            # app another way; then nothing (the Settings page, Lens pairing) is open to the LAN.
+            # Lens phone routes are left to their own checks: each carries its own phone token
+            # (or, for claim, a single-use pairing code), and they already refuse plain HTTP.
+            logger.warning("refused a request from %s: the dashboard has no web.token", request.remote_addr)
+            message = ("This dashboard has no password, so it only answers the computer it runs on. "
+                       "Set web.token in config.toml to open it to your network.")
+            if path.startswith("/api/"):
+                return jsonify({"ok": False, "error": message}), 403  # type: ignore[return-value]
+            return make_response(message, 403, {"Content-Type": "text/plain; charset=utf-8"})
         # SPEC-GAP: static assets and the login page are reachable without the token so the
         # login page can be styled; everything else is rejected with 401.
         if c.token and not (path == "/login" or path.startswith("/static/") or _lens_self_authenticating(c.cfg, path)):
@@ -1645,6 +1695,14 @@ def _lan_host(cfg: Any, conn: sqlite3.Connection | None = None) -> str:
 
 #: Bind addresses that mean "every interface". A socket listens on them; nothing dials them.
 WILDCARD_HOSTS: frozenset[str] = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
+
+def _peer_is_loopback() -> bool:
+    """The TCP peer (not a header) is this computer. IPv4-mapped loopback counts."""
+    peer = str(request.remote_addr or "").strip().lower()
+    if peer.startswith("::ffff:"):
+        peer = peer[7:]
+    return configmod.is_loopback_host(peer)
 
 
 def _is_loopback(host: str) -> bool:

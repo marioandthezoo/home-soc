@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from string import Formatter
 from typing import Any
 
+from homesoc import util
+
 logger = logging.getLogger(__name__)
 
 SEVERITIES: tuple[str, ...] = ("critical", "high", "medium", "low", "info")
@@ -27,8 +29,10 @@ MAX_LISTED_VALUES = 6
 # webhook alerts and the CLI. A newline in a device-chosen string would let it forge an extra
 # "[CRITICAL] ..." line inside Home SOC's own alert, and bidi overrides can reverse what the user
 # reads, so every string interpolated into a title is flattened to one line and length-capped.
+# The flattening is util.safe_one_line, the one sanitiser that device_text, the notification
+# channels and the topology labels already share. A private copy here drifted once (it missed
+# U+061C, lone surrogates and the invisible default-ignorable characters), so there is no second one.
 MAX_EVIDENCE_CHARS = 300
-_UNSAFE_TEXT = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]+")
 # When a list holds dicts (matcher's [{"cve", "epss"}], services' [{"port", "banner"}]) the title
 # wants one readable field per entry; these are tried in order.
 _PREFERRED_FIELDS: tuple[str, ...] = (
@@ -68,11 +72,24 @@ _PLACEHOLDER_DEFAULTS: dict[str, str] = {"hours": "48+"}
 
 
 def one_line(text: Any, limit: int | None = None) -> str:
-    """``text`` as a single printable line: control, line-separator and bidi characters become spaces."""
-    flat = _UNSAFE_TEXT.sub(" ", str(text))
+    """``text`` as a single printable line (``util.safe_one_line``): control, line-separator, bidi and
+    lone-surrogate characters become spaces and invisible characters are removed; then length-capped."""
+    flat = util.safe_one_line(text)
     if limit is not None and len(flat) > limit:
         flat = flat[: limit - 1] + "…"
     return flat
+
+
+def safe_detail(text: Any) -> str:
+    """A finding's detail made safe to store and show, keeping its line breaks.
+
+    The detail is written by the emitter and often quotes device text (a banner, a UPnP field, an
+    autostart command), so each line gets the same treatment as a title. Above all, a lone
+    surrogate must never reach SQLite or a UTF-8 encoder, where it raises UnicodeEncodeError and
+    the finding is lost.
+    """
+    lines = str(text).replace("\r\n", "\n").split("\n")
+    return "\n".join(util.safe_one_line(line) for line in lines)
 
 
 def _display(value: Any) -> Any:
@@ -1273,17 +1290,24 @@ _SPECS: list[FindingSpec] = [
         [], "dns", False,
     ),
     _spec(
-        "NET-DNS-004", "high", "{client} tried to reach a malicious domain: {domain}",
-        "A device looked up a website known for malware or scams: {domain}",
+        "NET-DNS-004", "high", "Malicious domain looked up from {client}: {domain}",
+        "Something on your network looked up a website known for malware or scams: {domain}",
         # The reputation check runs after the answer has gone out (it must never delay a lookup, and
         # only lookups that were answered are checked), so the lookup that raised this finding was
         # NOT blocked; the domain is blocked from then on (dnsfilter/server.py _on_malicious).
-        "A device on your network asked for a domain known for malware, phishing or botnet control. The check "
-        "runs after the answer is sent, so that first lookup went through; Home SOC blocks the domain from then "
-        "on, but the device may already be infected or a user clicked a phishing link.",
+        # {client} is the source address of a UDP lookup, which any LAN device can forge, so the
+        # wording names the address and asks for confirmation before anything is reset.
+        "A lookup from the address {client} asked for a domain known for malware, phishing or botnet control. The "
+        "check runs after the answer is sent, so that first lookup went through; Home SOC blocks the domain from "
+        "then on. Usually the device holding that address made the lookup, and then it may already be infected or "
+        "someone clicked a phishing link. But another device on your network can fake an address, so confirm which "
+        "device made the lookup before you wipe or reset anything.",
         [
-            "Identify the device {client} on the Devices page.",
-            "If it is a PC: run a full Defender scan and check recent downloads; if a phone/IoT device: update it, review installed apps, or factory-reset it.",
+            "Find which device has the address {client} on the Devices page.",
+            "Confirm that device made the lookup before you act: look in its own browser history, app list or "
+            "security app, and check the DNS query log for other lookups from {client} that match what that "
+            "device normally does. Another device on your network can fake its address.",
+            "If it is a PC: run a full Defender scan and check recent downloads; if a phone/IoT device: update it and review installed apps, and factory-reset it only if you find other signs of trouble.",
             "Look at the DNS query log for that client to see what else it contacted; check the domain at https://www.virustotal.com/gui/domain/{domain}",
             "If it is a false positive, add an 'allow' override on the DNS page.",
         ],
@@ -1310,6 +1334,36 @@ _SPECS: list[FindingSpec] = [
             "PowerShell (admin): New-NetFirewallRule -DisplayName \"Home SOC DNS\" -Direction Inbound -Protocol UDP -LocalPort 53 -Action Allow -Profile Private",
         ],
         [_FW_DOCS], "dns", False,
+    ),
+    # Evidence contract (the emitter lives in the DNS health job, not here): not_logged (int, lookups
+    # answered but left out of the query log), sources_per_minute_limit (int), sample_sources (list of
+    # addresses). It is raised when DNSServer.stats()["log_overflowed"] grew since the last run, which
+    # takes thousands of distinct source addresses in one minute. Nothing here can say which device
+    # did it: the addresses are the forged part.
+    _spec(
+        "NET-DNS-007", "medium",
+        "DNS query log flooded by lookups from too many source addresses ({not_logged} not logged, limit "
+        "{sources_per_minute_limit} a minute)",
+        "Something on your network seems to be faking addresses to flood web blocking's lookup log",
+        "Web blocking was sent lookups from more than {sources_per_minute_limit} different addresses within one "
+        "minute. A home network does not have that many devices, so something on it is most likely faking the "
+        "address its lookups come from. Lookups were still answered, and lookups from devices Home SOC already "
+        "knows are still logged, but {not_logged} lookups from unknown addresses were left out of the log. A flood "
+        "like this can bury a real device's lookups among fake ones, and the same trick can make a lookup look as "
+        "if it came from one of your devices. Some of the addresses seen (probably fake): {sample_sources}.",
+        [
+            "Nothing needs restarting: web blocking keeps answering lookups during a flood.",
+            "Do not block the addresses listed here on their own: they are most likely made up, and one of them may "
+            "belong to a real device.",
+            "Look for the device doing it: check the Devices page for anything that joined or changed recently, and "
+            "the 'What happened' page for when the warnings started. Then disconnect suspect devices one at a time "
+            "(smart plugs, cameras, a PC running unfamiliar software) until the warnings stop.",
+            "If your router has an 'anti-spoofing', 'IP source guard' or 'DHCP snooping' option, turn it on. Many "
+            "home routers do not have one.",
+            "Until it is found, treat findings that name a device only because of a lookup from its address "
+            "(NET-DNS-004, NET-DEP-003) as leads to check, not proof.",
+        ],
+        [_CISA_HOME], "dns", False,
     ),
     # ------------------------------------------------------------------ Dependencies / blast radius
     # These three are the only findings whose evidence is about *the rest of the network* rather
@@ -1378,10 +1432,16 @@ _SPECS: list[FindingSpec] = [
     ),
     _spec(
         "NET-DEP-003", "info",
-        "{name} keeps trying to reach {domain} and never gets through ({failures} lookups, every one blocked)",
-        "{name} keeps trying to look up {domain}, and web blocking stops it every time",
-        "This device depends on {domain} for something, and across the whole window every single lookup was blocked "
-        "and not one was ever answered. The device will not tell you that. Cameras, doorbells, plugs, televisions and "
+        # Home SOC credits a lookup to whichever device holds the address it came from, and any
+        # device on the LAN can send UDP lookups with another device's address. So every line says
+        # what was seen (lookups from this address), never that this device did it.
+        "Lookups from {name}'s address keep trying to reach {domain} and never get through ({failures} lookups, "
+        "every one blocked)",
+        "{name}, or something using its address, keeps looking up {domain}, and web blocking stops it every time",
+        "Something using this device's address keeps asking for {domain}, and across the whole window every single "
+        "lookup was blocked and not one was ever answered. Usually that is the device itself, but another device on "
+        "your network can fake its address, so treat this as a lead to check rather than proof. If it is the device, "
+        "it will not tell you that its lookups fail. Cameras, doorbells, plugs, televisions and "
         "speakers route their features through a vendor's cloud, and when that path is cut they usually keep their "
         "lights on and go quiet: the app still lists the device, but notifications stop arriving, recordings stop "
         "uploading, schedules stop firing, or it quietly stops fetching its own firmware updates. Often that is "
@@ -1507,9 +1567,97 @@ _SPECS: list[FindingSpec] = [
 CATALOG: dict[str, FindingSpec] = {s.id: s for s in _SPECS}
 assert len(CATALOG) == len(_SPECS), "duplicate finding IDs in catalog"
 
+# ------------------------------------------------------------------ changed autostart entries
+# scanners/persistence.py raises the same WIN-PER-* ID when an entry that was already known (often
+# one the owner acknowledged) starts running a different command, with evidence.change="modified"
+# and previous_command. That is the classic hijack: keep a familiar name, swap what it runs. The
+# "New ..." wording and its "if you recognise it, acknowledge this" step would talk the owner into
+# dismissing exactly that, so a changed entry is worded as a change, shows was/now, and tells the
+# reader to judge the command rather than the name. Same ID, severity and category as the base
+# entry; only the words differ.
+_CHANGED_WHY_TAIL = (
+    " Updaters do this legitimately, usually by moving to a new version folder of the same program. A command "
+    "that now points somewhere else, such as C:\\Users\\Public, a Temp or AppData folder, a script (.vbs, .ps1, "
+    ".bat, .js) or PowerShell with a long encoded argument, is how malware takes over an entry you already "
+    "trust, because the name you recognise stays the same."
+)
+_CHANGED_VARIANTS: dict[str, FindingSpec] = {
+    s.id: s
+    for s in (
+        _spec(
+            "WIN-PER-001", "medium", "Autostart entry changed: {name}",
+            "A program that starts with Windows was changed: {name}",
+            "An autostart entry you already had now runs a different command. Was: {previous_command}. "
+            "Now: {command}." + _CHANGED_WHY_TAIL,
+            [
+                "Check the new command, not just the name. '{name}' used to run {previous_command} and now runs "
+                "{command}. Recognising the name is not enough to acknowledge this finding.",
+                "If the new command is the same program in a newer version folder, or you just updated or "
+                "reinstalled it, that is normal: acknowledge this finding.",
+                "If the new command points somewhere unexpected: open Start > Settings > Apps > Startup and turn "
+                "'{name}' off, then right-click the file it now runs > 'Scan with Microsoft Defender'.",
+                "Then reinstall the real program so its own entry comes back, and run a full scan in Windows "
+                "Security > 'Virus & threat protection' > 'Scan options'.",
+                "PowerShell: Get-ItemProperty HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run; "
+                "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            ],
+            [_AUTORUNS], "persistence", True,
+        ),
+        _spec(
+            "WIN-PER-002", "medium", "Scheduled task changed: {name}",
+            "A task that runs automatically was changed: {name}",
+            "A scheduled task you already had now runs a different command. Was: {previous_command}. "
+            "Now: {command}." + _CHANGED_WHY_TAIL,
+            [
+                "Check the new command, not just the name. Task '{name}' used to run {previous_command} and now "
+                "runs {command}. Recognising the name is not enough to acknowledge this finding.",
+                "If the new command is the same program in a newer version folder, or you just updated or "
+                "reinstalled it, that is normal: acknowledge this finding.",
+                "If the new command points somewhere unexpected: open Start, type 'Task Scheduler', find '{name}', "
+                "right-click it > Disable, then scan the file it now runs with Microsoft Defender.",
+                "Then reinstall the real program so its own task is restored, and run a full Defender scan.",
+                "PowerShell: (Get-ScheduledTask -TaskName \"{name}\").Actions",
+            ],
+            [_TASKSCHD, _AUTORUNS], "persistence", True,
+        ),
+        _spec(
+            "WIN-PER-003", "medium", "Auto-start service changed: {name}",
+            "A background service was changed: {name}",
+            "A Windows service you already had now runs a different program, and services run with high "
+            "privileges before anyone logs in. Was: {previous_command}. Now: {command}." + _CHANGED_WHY_TAIL,
+            [
+                "Check the new program path, not just the name. Service '{name}' used to run {previous_command} "
+                "and now runs {command}. Recognising the name is not enough to acknowledge this finding.",
+                "If the new path is the same program in a newer version folder, or you just updated or "
+                "reinstalled it, that is normal: acknowledge this finding.",
+                "If the new path is unexpected: press Win+R, type 'services.msc', open '{name}', set 'Startup "
+                "type' to Disabled and click Stop, then scan the file it now runs with Microsoft Defender.",
+                "Then reinstall the real program so its service points at the right file again, and run a full "
+                "Defender scan.",
+                "PowerShell: Get-CimInstance Win32_Service -Filter \"Name='{name}'\" | Select-Object Name, StartMode, PathName",
+            ],
+            [_AUTORUNS], "persistence", True,
+        ),
+    )
+}
+# A changed entry whose emitter could not read one of the two commands still gets a sentence.
+_NOT_RECORDED = "(not recorded)"
+
 
 def get(finding_id: str) -> FindingSpec | None:
     return CATALOG.get(finding_id)
+
+
+def _is_changed(evidence: Any) -> bool:
+    return isinstance(evidence, dict) and str(evidence.get("change") or "").strip().lower() == "modified"
+
+
+def spec_for(finding_id: str, evidence: Any = None) -> FindingSpec | None:
+    """The catalog entry to word *this* finding with: ``get(finding_id)``, except that a WIN-PER-*
+    finding whose evidence says the entry was changed (not added) uses the changed wording."""
+    if _is_changed(evidence) and finding_id in _CHANGED_VARIANTS:
+        return _CHANGED_VARIANTS[finding_id]
+    return get(finding_id)
 
 
 def all_ids() -> list[str]:
@@ -1608,6 +1756,17 @@ def _values(evidence: Any, subject: str) -> SafeDict:
     return values
 
 
+def _resolve(finding_id: str, evidence: Any, subject: str) -> tuple[FindingSpec | None, SafeDict]:
+    """The entry that words this finding (see ``spec_for``) and the display values to fill it with."""
+    spec = spec_for(finding_id, evidence)
+    values = _values(evidence, subject)
+    if spec is not None and spec is _CHANGED_VARIANTS.get(finding_id):
+        for key in ("previous_command", "command"):
+            if values.get(key) in (None, ""):
+                values[key] = _NOT_RECORDED
+    return spec, values
+
+
 def _plain(spec: FindingSpec, values: SafeDict) -> str:
     text = one_line(_fmt(spec.plain_title, values))
     text = _EMPTY_PARENS.sub("", _EMPTY_QUOTES.sub("", text))
@@ -1619,20 +1778,20 @@ def render(draft: Any) -> Rendered:
 
     The result also carries ``.plain_title`` (see ``Rendered``); unpacking it as a pair still works.
     """
-    spec = get(getattr(draft, "finding_id", ""))
+    finding_id = str(getattr(draft, "finding_id", "") or "")
     subject = str(getattr(draft, "subject", "") or "")
-    values = _values(getattr(draft, "evidence", None), subject)
+    spec, values = _resolve(finding_id, getattr(draft, "evidence", None), subject)
     if spec is None:
         # SPEC-GAP: unknown IDs are tolerated (logged) so a typo in a scanner does not drop the finding.
         logger.warning("finding id %s is not in the catalog", getattr(draft, "finding_id", "?"))
         title = one_line(f"{getattr(draft, 'finding_id', 'UNKNOWN')} on {subject}")
         detail = getattr(draft, "detail", None) or json_evidence(values)
-        return Rendered(title, detail)
+        return Rendered(title, safe_detail(detail))
     # The title is always one line whatever the template or evidence holds: notifications and the
-    # CLI print one finding per line.
+    # CLI print one finding per line. The detail keeps its line breaks but not the rest.
     title = one_line(_fmt(spec.title, values))
     detail = getattr(draft, "detail", None) or _fmt(spec.rationale, values)
-    return Rendered(title, detail, _plain(spec, values))
+    return Rendered(title, safe_detail(detail), _plain(spec, values))
 
 
 def render_plain_title(finding_id: str, evidence: dict[str, Any] | None = None, subject: str = "") -> str:
@@ -1641,10 +1800,10 @@ def render_plain_title(finding_id: str, evidence: dict[str, Any] | None = None, 
     Same interpolation and the same SafeDict/one-line protection as the technical title. Returns ""
     for an unknown ID so the caller shows the technical title instead.
     """
-    spec = get(finding_id)
+    spec, values = _resolve(finding_id, evidence, subject)
     if spec is None:
         return ""
-    return _plain(spec, _values(evidence, subject))
+    return _plain(spec, values)
 
 
 def render_why(finding_id: str, evidence: dict[str, Any] | None = None, subject: str = "") -> str:
@@ -1653,24 +1812,24 @@ def render_why(finding_id: str, evidence: dict[str, Any] | None = None, subject:
     A few rationales carry placeholders (NET-DEP-*, NET-DEV-004), so the raw ``spec.rationale`` is
     not display-ready on its own. Returns "" for an unknown ID.
     """
-    spec = get(finding_id)
+    spec, values = _resolve(finding_id, evidence, subject)
     if spec is None:
         return ""
-    return _fmt(spec.rationale, _values(evidence, subject))
+    return _fmt(spec.rationale, values)
 
 
 def render_remediation(finding_id: str, evidence: dict[str, Any] | None, subject: str = "") -> list[str]:
     """Remediation steps with evidence interpolated, for the dashboard detail view."""
-    spec = get(finding_id)
+    spec, values = _resolve(finding_id, evidence, subject)
     if spec is None:
         return []
-    values = _values(evidence, subject)
     return [_fmt(step, values) for step in spec.remediation]
 
 
-def placeholders(finding_id: str) -> set[str]:
-    """Every ``{field}`` name used by this ID's title, plain title and remediation steps."""
-    spec = get(finding_id)
+def placeholders(finding_id: str, evidence: Any = None) -> set[str]:
+    """Every ``{field}`` name used by this ID's title, plain title and remediation steps (for the
+    wording this evidence selects, see ``spec_for``)."""
+    spec = spec_for(finding_id, evidence)
     if spec is None:
         return set()
     names: set[str] = set()
@@ -1693,7 +1852,7 @@ def unresolved_placeholders(finding_id: str, evidence: dict[str, Any] | None, su
     values = SafeDict(_subject_fields(subject))
     values.update(_clean_evidence(evidence))
     missing = []
-    for name in sorted(placeholders(finding_id)):
+    for name in sorted(placeholders(finding_id, evidence)):
         if values.get(name) not in (None, "") or name in _PLACEHOLDER_DEFAULTS:
             continue
         if any(values.get(alias) not in (None, "") for alias in _ALIASES.get(name, ())):

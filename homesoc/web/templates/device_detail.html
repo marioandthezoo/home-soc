@@ -21,7 +21,7 @@
   'cloud_blocked': 'keeps looking up a site Home SOC blocks'} %}
 {% set confidence_words = {'observed': 'Seen', 'inferred': 'Worked out', 'assumed': 'Assumed', 'mixed': 'Seen and worked out'} %}
 {% set confidence_tips = {
-  'observed': 'Home SOC saw this happen (observed)',
+  'observed': "Home SOC recorded this (observed). A look-up link only means it came from this device's address, which another device can fake",
   'inferred': 'Not seen; it follows from the shape of the network (inferred)',
   'assumed': 'A reasonable default that has not been confirmed (assumed)',
   'mixed': 'Partly seen, partly worked out (mixed)'} %}

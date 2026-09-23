@@ -500,16 +500,26 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
             params + [max(q.cap * 4, 200)],
         )
 
-    # Clients are addresses; say which device each one is. One lookup for the whole page.
+    # Clients are addresses; say whose address each one is. One lookup for the whole page.
     names = api.device_labels_by_ip(conn, [r.get("client") for r in threats + grouped])
 
     def who(client: Any) -> tuple[str, str | None, int | None]:
-        """("Ellie's iPhone (192.168.1.32)", label, device_id); the bare address when unknown."""
+        """("Ellie's iPhone's address (192.168.1.32)", label, device_id); the bare address when unknown.
+
+        A query's source address is the sender's word: any device on the network can send one
+        from another's address. So the title says whose address it came from, never that the
+        named device asked for it.
+        """
         ip = str(client or "")
         hit = names.get(ip)
         if hit is None:
             return ip or "an unknown device", ("Unnamed device" if ip else None), None
-        return f"{hit['device_label']} ({ip})", hit["device_label"], hit["device_id"]
+        return api.address_of(hit["device_label"], ip), hit["device_label"], hit["device_id"]
+
+    def with_note(detail: str, label: str | None, device_id: int | None) -> str:
+        if device_id is None:
+            return detail
+        return (detail + " · " if detail else "") + api.ADDRESS_MATCH_NOTE
 
     for r in threats:
         ts = _iso(r.get("ts"))
@@ -521,8 +531,8 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
                 ts=ts,
                 kind="dns_threat",
                 severity="high",
-                title=f"Blocked a known-malicious domain: {r.get('qname')} requested by {shown}",
-                detail=_block_reason_words(str(r.get("reason") or "")),
+                title=f"Blocked a known-malicious domain: {r.get('qname')} requested from {shown}",
+                detail=with_note(_block_reason_words(str(r.get("reason") or "")), label, device_id),
                 link=f"/dns?client={r.get('client') or ''}&q={r.get('qname') or ''}",
                 icon="threat",
                 ref={"client": r.get("client"), "domain": r.get("qname"), "reason": r.get("reason"),
@@ -558,7 +568,7 @@ def _dns_source(conn: sqlite3.Connection, q: _Query) -> list[FeedItem]:
                     kind="dns_block",
                     severity=severity,
                     title=f"Blocked {_plural(b['hits'], 'request')} to {domain or 'a domain'} from {shown}",
-                    detail=detail,
+                    detail=with_note(detail, label, device_id),
                     link=f"/dns?client={client}&q={domain}",
                     icon="dns",
                     ref={"client": client, "domain": domain, "hour": hour, "hits": b["hits"],

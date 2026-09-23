@@ -65,6 +65,13 @@
     return v >= 80 ? 'Good' : v >= 50 ? 'Fair' : 'Needs work';
   }
   function plural(n, one, many) { return n === 1 ? one : many; }
+  /* One plain line for a confirm() dialog: control, line-break, bidi and invisible characters
+     become spaces, and long text is cut with an ellipsis. */
+  var UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u00ad\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\ufff9-\ufffb]+/g;
+  function oneLine(text, max) {
+    var s = String(text === undefined || text === null ? '' : text).replace(UNSAFE_LINE, ' ').replace(/\s+/g, ' ').trim();
+    return s.length > max ? s.slice(0, max - 1) + '\u2026' : s;
+  }
   function humanAge(seconds) {
     var s = Math.max(0, Math.floor(seconds));
     if (s < 60) return 'just now';
@@ -257,6 +264,37 @@
       return postJSON('/api/defender/' + b.dataset.op).then(function (r) {
         toast('Defender: ' + b.dataset.op + ' ' + (r.status || 'started') + ' — this can take several minutes', 'ok');
         pollDefender(b.dataset.op);
+      });
+    },
+    /* "Mark as known" for programs that start by themselves. The command the owner was shown
+       travels with the request so the server can refuse to accept an entry whose command changed
+       after the page loaded (a program swapped between reading and clicking stays flagged). The
+       names and commands come from whatever registered the autostart, so the confirm text is
+       flattened to one capped line: a crafted name cannot add lines that look like our wording. */
+    'persistence-accept': function (b) {
+      var d = b.dataset;
+      var q = 'Mark "' + oneLine(d.name, 80) + '" as known?\n\nIt runs: ' + (oneLine(d.command, 200) || '(no command recorded)') +
+        '\n\nHome SOC will stop flagging it, and will flag it again if this command changes.';
+      if (!window.confirm(q)) return Promise.resolve();
+      return postJSON('/api/host/persistence/accept', { kind: d.kind, location: d.location, name: d.name, command: d.command || '' }).then(function (r) {
+        if (r && r.accepted === false) toast('Not marked: it changed since this page loaded. Reloading so you can check it again.', 'err');
+        else toast('Marked as known', 'ok');
+        setTimeout(function () { location.reload(); }, 700);
+      });
+    },
+    'persistence-accept-all': function () {
+      var entries = $$('#persistence-table [data-action="persistence-accept"]').map(function (x) {
+        return { kind: x.dataset.kind, location: x.dataset.location, name: x.dataset.name, command: x.dataset.command || '' };
+      });
+      if (!entries.length) { toast('Nothing here is marked New or Changed', 'ok'); return Promise.resolve(); }
+      var q = 'Mark all ' + entries.length + ' ' + plural(entries.length, 'program', 'programs') + ' marked New or Changed as known?\n\n' +
+        'Only do this if you recognise every one of them. Home SOC will flag a program again if its command changes.';
+      if (!window.confirm(q)) return Promise.resolve();
+      return postJSON('/api/host/persistence/accept-all', { entries: entries }).then(function (r) {
+        var n = r && typeof r.accepted === 'number' ? r.accepted : entries.length;
+        var skipped = r && typeof r.skipped === 'number' ? r.skipped : 0;
+        toast('Marked ' + n + ' as known' + (skipped ? '; ' + skipped + ' changed since this page loaded and still need a look' : ''), skipped ? 'err' : 'ok');
+        setTimeout(function () { location.reload(); }, 900);
       });
     },
     print: function () { window.print(); return Promise.resolve(); },

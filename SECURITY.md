@@ -94,6 +94,7 @@ it is stored.
 | The wider internet | Can send packets if a port is forwarded | The resolver drops every query from a non-private source address; the dashboard is not exposed unless you exposed it |
 | A compromised or hostile feed mirror | Controls the bytes of a blocklist or CVE file | TLS-verified, size-capped, atomically replaced; parsed by validating parsers that never execute anything |
 | A hostile device being scanned | Controls its banners, hostname, mDNS names, XML | All of it is treated as data — escaped in HTML, parameterised in SQL, never interpolated into a command line |
+| Another program or account on this computer | Can connect to `127.0.0.1` | With a `web.token` it needs the token like anyone else. Without one it cannot open the dashboard to the network, set its password, redirect DNS or alerts, or switch blocking off; a value planted before that rule is reported at startup |
 
 ---
 
@@ -118,14 +119,38 @@ run by `serve` and `run` before anything starts, plus a last check right before 
   `python -m homesoc config unset web.token`.
 - Exposed with a token **shorter than 16 characters**: refused (exit code 2) with the exact fix. On
   loopback a short token still only logs a warning.
+- On loopback with an **empty** `web.token` there is no login at all. Browsers still refuse
+  requests from other websites (see the CSRF guard below), but the dashboard cannot tell you apart
+  from any other program running on this computer, or another account on it. So without a password
+  it refuses to change the settings that matter most (`api.PASSWORD_ONLY_SETTINGS`): a non-loopback
+  `web.host`, `web.token`, `dns.upstreams`, `dns.doh_upstream`, `dns.listen`, `dns.enabled`,
+  `dns.port`, `dns.lists`, `network.exclude`, `notify.min_severity` and the three alert URLs, and it
+  will not clear a `web.host` or `web.token` override either. It answers HTTP 403 with one plain
+  sentence pointing to `config.toml` or `python -m homesoc config set <key> <value>`. Posting a
+  value that is already in force is not a change, so the Settings form still saves everything else.
+  Anyone who can reach it can change every other setting (scan schedules, allow/deny overrides,
+  acknowledging findings). Keep the token unless you are the only user and trust everything that
+  runs here.
+- A dashboard with no password also **answers only this computer**: any other peer address gets
+  HTTP 403 for every page and API route (`app._peer_is_loopback()`), so `/lens/pair` and the
+  Settings page are never reachable from the network without a token, even if something starts the
+  app without the bind policy. The phone's own Lens routes keep their own checks (a phone token or
+  a single-use pairing code, and HTTPS).
 - There is no "no token on the LAN" switch. For remote access keep the dashboard on loopback and use
   a VPN or Tailscale Serve.
 - If the startup message says the dashboard **"may already have been open to the network"** (an earlier
   non-loopback bind, active Lens tokens, or Settings overrides of `web.*`, `notify.*`,
   `dns.upstreams`, `dns.doh_upstream`, `dns.lists`, `dns.listen`, `dns.enabled` or
-  `network.exclude`), run `python -m homesoc lens revoke --all` and review
-  `python -m homesoc config overrides`. A LAN host that reached a token-less dashboard could have
-  planted its own token or redirected DNS and alerts, so a "token is set" check alone cannot tell.
+  `network.exclude`; the list is `config.TAMPER_SIGNAL_KEYS`), run `python -m homesoc lens revoke --all`
+  and review `python -m homesoc config overrides`. A LAN host that reached a token-less dashboard could
+  have planted its own token or redirected DNS and alerts, so a "token is set" check alone cannot tell.
+- **A password or address Home SOC has no record of you setting is reported too.** Home SOC records a
+  fingerprint (never the value) of each `web.host` / `web.token` override written by a trusted path:
+  the token it generates, `python -m homesoc config set`, or the Settings page while you are signed in
+  with a password (`config.confirm_web_overrides()`). When the dashboard opens to the network with an
+  override that does not match, for example a token another program planted before this release, the
+  start prints a WARNING with the same clean-up commands and records an event. It still starts: only
+  you can tell whether you set it. If you did, `python -m homesoc config keep` stops the warning.
 
 **`SOC-SYS-003` (high) — "Dashboard is reachable from the LAN without a token"** and `SOC-LENS-001`
 remain as defence in depth. They follow the address the server actually bound to (recorded by
@@ -162,11 +187,20 @@ A page on `attacker.example` can make its own hostname resolve to `127.0.0.1:878
 that is same-origin with your dashboard, and CORS will not save you. The one thing that still tells
 the two apart is the `Host` header.
 
-`app.trusted_hosts()` builds an allowlist at startup: loopback names and addresses, the configured
-bind address, this machine's hostname and `<hostname>.local`, and every address the machine answers
-on (so a second NIC or a VPN does not lock you out). Anything else is refused with HTTP 400
-`"bad host header"` before authentication is even considered. This check runs on every request,
-including `/static/` and `/login`.
+`app.trusted_hosts()` builds an allowlist at startup, and it only contains names an attacker cannot
+answer for:
+
+- On a **loopback** bind: `127.0.0.1`, `localhost`, `::1` and `[::1]`, nothing else.
+- On a **LAN** bind over plain HTTP: those, plus the IP addresses the machine answers on (so a second
+  NIC or a VPN does not lock you out). An IP literal cannot be rebound.
+- This PC's name, `<name>.local` and a name set as `web.host` are accepted **only over HTTPS**
+  (`--tls`). Any device on the LAN can answer mDNS for `<name>.local`, so over plain HTTP a page it
+  served could become same-origin with the dashboard; under TLS it cannot present the dashboard's
+  certificate without a new warning. Over plain HTTP, use the IP address.
+
+Anything else is refused with HTTP 400 `"bad host header"` before authentication is even considered.
+This check runs on every request, including `/static/` and `/login`, so a rebound page can neither
+use the dashboard nor send wrong sign-in attempts that lock you out at the desk.
 
 ### Content-Security-Policy and friends
 
@@ -304,7 +338,11 @@ T0–T3 — a value from config cannot turn into a different flag.
   budget are still answered, just not written), names are truncated, and the table is capped at
   2 million rows, oldest first. Devices in the inventory (seen in the last 30 days) have their own
   budget that forged source addresses cannot use up, and an overflow of the per-minute source table
-  is recorded as a warning event instead of passing silently.
+  is recorded as a warning event and raises **`NET-DNS-007`** (medium, "Something on your network
+  seems to be faking addresses to flood web blocking's lookup log") from the resolver's health
+  check; it stays open for a day after the last overflow. The DNS page shows the flood-guard
+  counters (answered but not logged, connections dropped, look-ups shed, slowed down) under
+  Technical details while the resolver runs in the same process.
 - **Reputation lookups cannot be starved by forged sources**: inventory devices have their own queue
   lane; one client may use at most 10% of the VirusTotal daily quota and all non-inventory sources
   together 50%; the reputation table keeps clean/unknown rows 30 days and at most 100,000 rows.
@@ -316,10 +354,15 @@ T0–T3 — a value from config cannot turn into a different flag.
   against it. An upstream that returns a wrong-case reply is asked without 0x20 for 60 s, doubling
   up to 1 h if it keeps happening; one correctly-cased reply restores it, so one spoofed reply cannot
   switch the protection off for good.
-- **DNS attribution is by source address.** On a flat LAN a host can forge another device's address
-  over UDP, so a cloud dependency or a `NET-DEP-003` finding credited to a device means "from its
-  address", not proof that the device made the lookup, and the finding says so. Names that are not
-  valid hostnames are dropped before they reach the map or a finding.
+- **DNS attribution is by source address, and every surface says so.** On a flat LAN a host can forge
+  another device's address over UDP. So the activity feed says "requested from Mum's iPhone's address
+  (192.168.1.31)", the Home page says "Web blocking stopped a look-up ... from X's address", the DNS
+  page's busiest-devices table notes that devices are matched by network address, the map legend and
+  device page say an "observed" look-up link was recorded from the device's address, which another
+  device can fake, and `NET-DEP-003` ("Lookups from {name}'s address ...") and `NET-DNS-004`
+  ("Malicious domain looked up from {client}") tell you to confirm which device made the lookup
+  before you reset anything. Names that are not valid hostnames are dropped before they reach the
+  map or a finding.
 - The UDP socket sets `SIO_UDP_CONNRESET` on Windows so a single ICMP port-unreachable cannot kill
   the listener.
 
@@ -330,8 +373,10 @@ are chosen by the devices that send them. Where they enter the inventory they ar
 printable line (control characters, line breaks, terminal escapes, every Unicode bidi control
 including U+061C, and invisible default-ignorable characters such as zero-width spaces, BOM and
 Hangul fillers removed) and capped in length; a UPnP "internal client" must be an IPv4 address. The
-same helper (`util.safe_one_line`) is applied again to every notification line and every map label,
-so rows stored before a fix and owner nicknames are covered too. Alert bodies are sized in the unit
+same helper (`util.safe_one_line`) is applied again to every notification line, every map label and
+every finding title (`catalog.one_line`, and `catalog.safe_detail` line by line for the detail), so
+rows stored before a fix, owner nicknames and text that reached a finding by another path are
+covered too. A lone surrogate in a finding's subject or key is replaced before it reaches SQLite. Alert bodies are sized in the unit
 each service counts (ntfy in UTF-8 bytes, at most 3900 of its 4096; Discord in UTF-16 units, at most
 4000 of 4096) and every finding line gets an equal share, so device-chosen emoji cannot push an alert
 past a service limit or push other findings out of it. The scheduled daily digest goes through the
@@ -348,10 +393,14 @@ addresses, and every fetch has a wall-clock deadline.
 ### The host scanners assume malware may be trying to hide
 
 - **Autostart entries are compared by command, not only by name.** A changed Run value, Startup
-  shortcut target, task action or service path is reported as a changed entry, with the old command
-  in the evidence, until you accept it (`persistence.accept_entry`, or `promote_to_baseline` for
-  all). Unreviewed entries stay open for as long as they exist; they no longer auto-resolve after 7
-  days.
+  shortcut target, task action or service path opens a fresh finding worded as a change ("Autostart
+  entry changed: OneDrive", with "Was: ... Now: ..." and a first step that says to check the new
+  command, not just the familiar name), and the host page marks the row **Changed** and shows what it
+  ran before. It stays open until you accept it with **Mark as known** / **Mark all as known** on the
+  host page. Those buttons send the command you were shown, and an entry whose command changed after
+  the page loaded is not accepted (`api.persistence_accept`); they are behind the token and the CSRF
+  header like every other write. Unreviewed entries stay open for as long as they exist; they no
+  longer auto-resolve after 7 days.
 - **Nothing is hidden on a self-declared field.** Scheduled tasks are filtered only by the
   `\Microsoft\` folder (which a standard user cannot write), never by their Author. A service counts
   as part of Windows only when its binary sits in the Windows folder, outside user-writable
@@ -398,6 +447,51 @@ the Security event log — are recorded as `needs_admin`, a distinct state from 
 explicitly on `/host` and in the report's "not checked (needs administrator)" notes.
 `SOC-SYS-002` (info) names the exact check IDs that were skipped. **A check the agent could not
 perform is never reported as a check that passed.**
+
+### Lens pairing and phones
+
+- **A pairing code works once, even under a race.** It is spent with a single `DELETE` whose row
+  count decides, and the phone-count ceiling (`lens.max_tokens`), spending the code and minting the
+  token happen under one lock (`db.lens_pair_with_code`), so simultaneous claims with one code give
+  one token, the ceiling holds, and a claim refused at the ceiling keeps your code.
+- **Claim attempts are counted exactly.** 10 an hour per source (an IPv6 claimant is counted per /64,
+  an IPv4-mapped address as its IPv4 address); the read, count and write run under one lock, so a
+  burst of simultaneous guesses cannot slip past the limit or overwrite a lockout, and the lockout
+  event is written once.
+- **Only the dashboard creates sticker codes.** A phone cannot teach Home SOC a code that starts with
+  `hs1:` (whatever kind it claims, in any letter case), and the sticker sheet always reprints the
+  first dashboard-made code for a device, so a phone cannot change the QR code the sheet prints.
+
+### Still open
+
+Known gaps, stated plainly. None of them lets a web page or a LAN device take over the dashboard.
+
+- **A token planted before this release is reported, not removed.** The startup WARNING names it and
+  prints the clean-up commands, but the dashboard still starts with it, because only you can tell
+  whether you set it. Someone who knows that token and signs in before you act can re-save it on
+  the Settings page, which records it as yours; after that the warning stops.
+- **With no password, this computer is trusted completely.** Any program or other account on this PC
+  can still use a password-less dashboard for everything outside `api.PASSWORD_ONLY_SETTINGS`:
+  change a finding's status (acknowledge, ignore), add allow overrides for blocked sites, change scan schedules and
+  API keys, and mark autostart entries as known. Set a `web.token` if you share the computer.
+- **Behind a reverse proxy everyone is `127.0.0.1`.** The proxied visitors share one address for the
+  sign-in and pairing limits, so one of them can use up the limit for all (including you at the
+  desk), and a password-less dashboard behind a proxy is open to everyone who can reach the proxy.
+  There is no overall cap on pairing attempts across all addresses.
+- **Sticker codes a phone taught Home SOC before this release** can still print for a device that has
+  no dashboard-made sticker yet. Forget that tag on the device page, or print a new sheet after
+  removing it.
+- **Address-based attribution is only worded carefully, not fixed.** Home SOC still cannot tell which
+  device really sent a UDP DNS query. `NET-DNS-007` reports a flood of forged sources, but a device
+  that forges a few queries as another device is not detected; lookups from devices not yet in the
+  inventory can still be pushed out of the query log and the reputation queue by a flood.
+- **Flood counters need the resolver in the same process.** `serve` on its own does not run the
+  resolver, so its DNS page has no protection counters; `run` shows them.
+- **The map and graph are rebuilt on every request** (no short cache yet), each under the shared
+  write lock. It is fast on a home-sized network but a busy dashboard costs the resolver some
+  database time.
+- **Autostart acceptance is per scan.** "Mark as known" updates the baseline at once, but the open
+  finding closes on the next host check, not immediately.
 
 ---
 
@@ -458,10 +552,11 @@ dashboard from your phone on the same Wi-Fi:
    remote access, use a VPN (WireGuard, Tailscale) or an SSH tunnel and leave the dashboard on
    loopback.
 4. **If you must terminate TLS, put a reverse proxy in front.** Keep Home SOC on `127.0.0.1` and let
-   the proxy listen on the LAN. Note that the Host-header allowlist is built from this machine's own
-   names and addresses — a proxy presenting a different `Host` will be refused with HTTP 400, so
-   configure it to pass through a hostname the agent already trusts (its own hostname, or the bind
-   address).
+   the proxy listen on the LAN. The Host-header allowlist on a loopback bind is `127.0.0.1`,
+   `localhost`, `::1` and `[::1]` only, so configure the proxy to send one of those as `Host` (for
+   Tailscale Serve, proxy to `http://127.0.0.1:<port>`). Keep a `web.token` behind a proxy: every
+   request then arrives from `127.0.0.1`, so the dashboard cannot tell proxied visitors from you at
+   the desk, and the per-address guess and pairing limits are shared by everyone behind it.
 5. **Treat the login link as a password.** `dashboard_url()` prints `/login?token=...`; the token is
    converted to a cookie and stripped from the URL on first use, but the link itself is a credential
    until then. Do not paste it into a chat.

@@ -143,9 +143,11 @@ The console prints one line:
 Dashboard: http://127.0.0.1:8787/login?token=<your-token>  (Ctrl-C to stop)
 ```
 
-Click it. The token is exchanged for a cookie, stripped from the address bar and remembered for 30
-days, so from then on plain <http://127.0.0.1:8787> is enough. The token lives in `config.toml` under
-`[web] token`.
+Click it. The token is exchanged for a cookie, stripped from the address bar and remembered for 7
+days (renewed while you use it), so from then on plain <http://127.0.0.1:8787> is enough. The token lives in `config.toml` under
+`[web] token`. If you later let other devices reach the dashboard, Home SOC insists on a real token:
+with `[web] token` empty it makes one, saves it and prints the sign-in link, and a token shorter than
+16 characters makes it refuse to start.
 
 ### The one thing to do on day one
 

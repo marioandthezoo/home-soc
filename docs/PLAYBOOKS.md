@@ -34,7 +34,7 @@ Nothing in a playbook is done for you. Home SOC observes and explains; you decid
 - [Known vulnerabilities (CVE / KEV / EPSS)](#known-vulnerabilities-cve--kev--epss) — `NET-VUL-001`, `NET-VUL-002`, `NET-VUL-003`, `NET-VUL-004`
 - [Internet-facing exposure](#internet-facing-exposure) — `NET-RTR-002`, `NET-WAN-001`, `NET-WAN-002`, `NET-WAN-003`
 - [Wi-Fi security](#wi-fi-security) — `NET-WIFI-001`, `NET-WIFI-002`, `NET-WIFI-003`, `NET-WIFI-004`
-- [DNS filter](#dns-filter) — `NET-DNS-001`, `NET-DNS-002`, `NET-DNS-003`, `NET-DNS-004`, `NET-DNS-005`, `NET-DNS-006`
+- [DNS filter](#dns-filter) — `NET-DNS-001`, `NET-DNS-002`, `NET-DNS-003`, `NET-DNS-004`, `NET-DNS-005`, `NET-DNS-006`, `NET-DNS-007`
 - [Home SOC's own health](#home-socs-own-health) — `SOC-FEED-001`, `SOC-FEED-002`, `SOC-SYS-001`, `SOC-SYS-002`, `SOC-SYS-003`, `SOC-SYS-004`
 
 ---
@@ -114,7 +114,7 @@ Severity answers "how bad is this if it is real", not "how likely is it". Home S
 | Severity | Meaning for a home network | Typical examples |
 |---|---|---|
 | **critical** | Actively dangerous right now. Something is either exploitable from outside your home, or your last line of defence is off. Fix today. | `WIN-DEF-001` antivirus disabled, `NET-VUL-001` a service matching a CISA KEV entry, `NET-WAN-001` a port open to the internet, `NET-SVC-001` Telnet on a LAN device |
-| **high** | A real hole that a competent attacker, or ordinary malware, would use. Fix this week. | `WIN-SYS-002` no disk encryption, `WIN-ACC-003` Guest account enabled, `NET-WAN-003` a UPnP port mapping, `NET-DNS-004` a device reached a known-malicious domain |
+| **high** | A real hole that a competent attacker, or ordinary malware, would use. Fix this week. | `WIN-SYS-002` no disk encryption, `WIN-ACC-003` Guest account enabled, `NET-WAN-003` a UPnP port mapping, `NET-DNS-004` a known-malicious domain was looked up from a device's address |
 | **medium** | Weakens your defences or increases the blast radius of some other mistake. Worth scheduling. | `WIN-DEF-004` tamper protection off, `WIN-PER-001` a new autostart entry, `NET-DEV-001` an unfamiliar device joined |
 | **low** | Hardening. Nothing is broken; the machine could be a bit harder to attack. | `WIN-SYS-005` PowerShell v2 still enabled, `WIN-UPD-003` an outdated app, `NET-SVC-008` an open printer port |
 | **info** | Context, not a problem. Recorded so the timeline is complete. | `SOC-SYS-002` not running as administrator, `NET-WIFI-002` WPA2 without WPA3, `NET-DEV-002` a randomized MAC address |
@@ -319,8 +319,9 @@ Home SOC's catalog contains **92 findings**. Titles containing `{something}` are
 | [`NET-WIFI-002`](#net-wifi-002) | info | Wi-Fi '{ssid}' uses WPA2 without WPA3 | Wi-Fi security | `scanners/wifi.py` | `wifi` |
 | [`NET-WIFI-004`](#net-wifi-004) | info | WPS appears to be enabled on '{ssid}' | Wi-Fi security | _reserved, never emitted_ | — |
 | [`NET-DNS-002`](#net-dns-002) | high | DNS resolver is not running ({reason}) | DNS filter | `dnsfilter/server.py` | `dns` |
-| [`NET-DNS-004`](#net-dns-004) | high | {client} tried to reach a malicious domain: {domain} | DNS filter | `dnsfilter/reputation.py` | `dns` |
+| [`NET-DNS-004`](#net-dns-004) | high | Malicious domain looked up from {client}: {domain} | DNS filter | `dnsfilter/reputation.py` | `dns` |
 | [`NET-DNS-005`](#net-dns-005) | high | DNS upstream resolvers are unreachable | DNS filter | `dnsfilter/server.py` | `dns` |
+| [`NET-DNS-007`](#net-dns-007) | medium | DNS query log flooded by lookups from too many source addresses ({not_logged} not logged, limit {sources_per_minute_limit} a minute) | DNS filter | `dnsfilter/server.py` | `dns` |
 | [`NET-DNS-003`](#net-dns-003) | medium | DNS blocklists are stale ({age_days} days) | DNS filter | `dnsfilter/server.py` | `dns` |
 | [`NET-DNS-001`](#net-dns-001) | info | Devices are not using the Home SOC DNS filter | DNS filter | `dnsfilter/server.py` | `dns` |
 | [`NET-DNS-006`](#net-dns-006) | info | Resolver is bound to the LAN but no firewall rule allows DNS in | DNS filter | `dnsfilter/server.py` | `dns` |
@@ -1178,6 +1179,8 @@ Severity `medium` · category `persistence` · raised once per affected subject
 
 Emitted by `scanners/persistence.py` (autostart baseline).  
 
+When a program Home SOC already knew now runs a different command, the same ID is worded **Autostart entry changed: {name}** instead, shows the old and new command, and asks you to check the new command rather than the name.  
+
 **Why it matters.** Programs that start with Windows are how malware survives a reboot; a new entry that appeared since the last check should be something you installed on purpose.
 
 **How to fix it**
@@ -1197,6 +1200,8 @@ Emitted by `scanners/persistence.py` (autostart baseline).
 Severity `medium` · category `persistence` · raised once per affected subject
 
 Emitted by `scanners/persistence.py` (autostart baseline).  
+
+When a program Home SOC already knew now runs a different command, the same ID is worded **Scheduled task changed: {name}** instead, shows the old and new command, and asks you to check the new command rather than the name.  
 
 **Why it matters.** Scheduled tasks are a favourite way for malware and unwanted updaters to run silently in the background; new non-Microsoft tasks deserve a quick look.
 
@@ -1218,6 +1223,8 @@ Emitted by `scanners/persistence.py` (autostart baseline).
 Severity `medium` · category `persistence` · raised once per affected subject
 
 Emitted by `scanners/persistence.py` (autostart baseline).  
+
+When a program Home SOC already knew now runs a different command, the same ID is worded **Auto-start service changed: {name}** instead, shows the old and new command, and asks you to check the new command rather than the name.  
 
 **Why it matters.** A Windows service runs with high privileges before anyone logs in; a new one that is not from Microsoft or a driver you installed is a classic malware foothold.
 
@@ -2011,19 +2018,20 @@ Emitted by `dnsfilter/server.py` (DNS resolver).
 
 ### NET-DNS-004
 
-**{client} tried to reach a malicious domain: {domain}**  
+**Malicious domain looked up from {client}: {domain}**  
 Severity `high` · category `dns` · raised once per affected subject
 
 Emitted by `dnsfilter/reputation.py` (DNS reputation worker).  
 
-**Why it matters.** A device on your network asked for a domain known for malware, phishing or botnet control. The request was blocked, but the device may already be infected or a user clicked a phishing link.
+**Why it matters.** A lookup from the address {client} asked for a domain known for malware, phishing or botnet control. The check runs after the answer is sent, so that first lookup went through; Home SOC blocks the domain from then on. Usually the device holding that address made the lookup, and then it may already be infected or someone clicked a phishing link. But another device on your network can fake an address, so confirm which device made the lookup before you wipe or reset anything.
 
 **How to fix it**
 
-1. Identify the device {client} on the Devices page.
-2. If it is a PC: run a full Defender scan and check recent downloads; if a phone/IoT device: update it, review installed apps, or factory-reset it.
-3. Look at the DNS query log for that client to see what else it contacted; check the domain at https://www.virustotal.com/gui/domain/{domain}
-4. If it is a false positive, add an 'allow' override on the DNS page.
+1. Find which device has the address {client} on the Devices page.
+2. Confirm that device made the lookup before you act: look in its own browser history, app list or security app, and check the DNS query log for other lookups from {client} that match what that device normally does. Another device on your network can fake its address.
+3. If it is a PC: run a full Defender scan and check recent downloads; if a phone/IoT device: update it and review installed apps, and factory-reset it only if you find other signs of trouble.
+4. Look at the DNS query log for that client to see what else it contacted; check the domain at https://www.virustotal.com/gui/domain/{domain}
+5. If it is a false positive, add an 'allow' override on the DNS page.
 
 **Read more**
 
@@ -2067,6 +2075,27 @@ Emitted by `dnsfilter/server.py` (DNS resolver).
 **Read more**
 
 - <https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/>
+
+### NET-DNS-007
+
+**DNS query log flooded by lookups from too many source addresses ({not_logged} not logged, limit {sources_per_minute_limit} a minute)**  
+Severity `medium` · category `dns` · raised at most once — it has a single subject
+
+Emitted by `dnsfilter/server.py` (DNS resolver health check).  
+
+**Why it matters.** Web blocking was sent lookups from more than {sources_per_minute_limit} different addresses within one minute. A home network does not have that many devices, so something on it is most likely faking the address its lookups come from. Lookups were still answered, and lookups from devices Home SOC already knows are still logged, but {not_logged} lookups from unknown addresses were left out of the log. A flood like this can bury a real device's lookups among fake ones, and the same trick can make a lookup look as if it came from one of your devices. Some of the addresses seen (probably fake): {sample_sources}.
+
+**How to fix it**
+
+1. Nothing needs restarting: web blocking keeps answering lookups during a flood.
+2. Do not block the addresses listed here on their own: they are most likely made up, and one of them may belong to a real device.
+3. Look for the device doing it: check the Devices page for anything that joined or changed recently, and the 'What happened' page for when the warnings started. Then disconnect suspect devices one at a time (smart plugs, cameras, a PC running unfamiliar software) until the warnings stop.
+4. If your router has an 'anti-spoofing', 'IP source guard' or 'DHCP snooping' option, turn it on. Many home routers do not have one.
+5. Until it is found, treat findings that name a device only because of a lookup from its address (NET-DNS-004, NET-DEP-003) as leads to check, not proof.
+
+**Read more**
+
+- <https://www.cisa.gov/news-events/news/home-network-security>
 
 ---
 

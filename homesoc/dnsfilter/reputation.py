@@ -554,8 +554,9 @@ class MaliciousFindingEmitter:
                 "source": result.source,
                 "checked_at": result.checked_at,
             },
-            detail=f"{client} queried {qname} ({result.domain}) — flagged malicious by {result.source} "
-                   f"({result.malicious} malicious votes).",
+            detail=f"A lookup from {client} asked for {qname} ({result.domain}), which {result.source} flags as "
+                   f"malicious ({result.malicious} malicious votes). The address can be faked by another "
+                   f"device on the network.",
         )
         self.drafts_emitted += 1
         apply_findings(self.conn, [draft], "dns_reputation")

@@ -21,6 +21,7 @@ throughput ever genuinely matters, give each thread its own connection instead.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -813,19 +814,29 @@ def lens_mint_token(
     # does for the other hostile string on this surface.
     clean_label = (_CONTROL_CHARS.sub("", str(label or "")).strip() or "phone")[:64].strip() or "phone"
     limit = max(1, int(max_tokens))
-    active = lens_active_tokens(conn)
-    if len(active) >= limit:
-        raise LensTokenLimit(
-            f"{len(active)} of {limit} Lens tokens are already paired; revoke one "
-            f"(python -m homesoc lens revoke <id>) or raise lens.max_tokens"
-        )
     token = secrets.token_urlsafe(LENS_TOKEN_BYTES)
     expires_at = _iso_in(int(ttl_days) * 86400) if int(ttl_days) > 0 else None
-    row_id = write(
-        conn,
-        "INSERT INTO lens_tokens(token_hash, label, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-        (_sha256_hex(token), clean_label, lens_normalise_scopes(scopes), utcnow_iso(), expires_at),
-    )
+    now = utcnow_iso()
+    # Count and insert in ONE statement, under the write lock. Counting first and inserting in a
+    # separate lock acquisition let simultaneous claims all see "9 of 10" and all insert (round
+    # three: 15 of 10 active). A single INSERT ... SELECT ... WHERE count < limit is atomic in
+    # SQLite even against another process's connection (the CLI), not just other threads.
+    with _WRITE_LOCK:
+        cur = conn.execute(
+            "INSERT INTO lens_tokens(token_hash, label, scopes, created_at, expires_at) "
+            "SELECT ?, ?, ?, ?, ? WHERE (SELECT count(*) FROM lens_tokens WHERE revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > ?)) < ?",
+            (_sha256_hex(token), clean_label, lens_normalise_scopes(scopes), now, expires_at, now, limit),
+        )
+        conn.commit()
+        inserted = int(cur.rowcount or 0) == 1
+        row_id = int(cur.lastrowid or 0) if inserted else 0
+    if not inserted:
+        active = len(lens_active_tokens(conn))
+        raise LensTokenLimit(
+            f"{active} of {limit} Lens tokens are already paired; revoke one "
+            f"(python -m homesoc lens revoke <id>) or raise lens.max_tokens"
+        )
     record_event(conn, "info", "lens", f"paired a new device: {clean_label}",
                  {"token_id": row_id, "scopes": lens_normalise_scopes(scopes), "expires_at": expires_at})
     stored = one(conn, "SELECT * FROM lens_tokens WHERE id = ?", (row_id,))
@@ -915,23 +926,61 @@ def lens_normalise_pairing_code(code: str | None) -> str:
 
 
 def lens_consume_pairing_code(conn: sqlite3.Connection, code: str | None) -> bool:
-    """Spend a pairing code. True exactly once per code, and never after it expires."""
+    """Spend a pairing code. True exactly once per code, and never after it expires.
+
+    Single use holds under concurrency: the code is spent by one DELETE whose row count
+    decides the answer, so of two claims that arrive together only the one whose DELETE
+    removed the row gets True. (Reading the rows, comparing, and deleting in separate lock
+    acquisitions let two simultaneous claims both succeed with one code.) Deciding on the
+    DELETE's row count also holds against a second process's connection, not only threads.
+    """
     presented = lens_normalise_pairing_code(code)
     if not presented:
         return False
-    digest = _sha256_hex(presented)
+    key = _LENS_PAIRING_PREFIX + _sha256_hex(presented)
     now = utcnow_iso()
-    matched = False
-    for key, raw in settings_with_prefix(conn, _LENS_PAIRING_PREFIX).items():
-        stored = key[len(_LENS_PAIRING_PREFIX):]
-        state = _loads_dict(raw)
-        if str(state.get("expires_at", "")) <= now:
-            delete_setting(conn, key)
-            continue
-        if secrets.compare_digest(stored, digest):
-            delete_setting(conn, key)
-            matched = True
-    return matched
+    with _WRITE_LOCK:
+        # Expired codes go first, whoever is asking, so a stale code never lingers or matches.
+        stale = [
+            k for k, raw in settings_with_prefix(conn, _LENS_PAIRING_PREFIX).items()
+            if str(_loads_dict(raw).get("expires_at", "")) <= now
+        ]
+        for k in stale:
+            conn.execute("DELETE FROM settings WHERE key = ?", (k,))
+        # The key is the SHA-256 of the code, so looking it up reveals nothing about a stored
+        # code through timing (the same pattern lens_verify_token uses).
+        cur = conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        conn.commit()
+        return int(cur.rowcount or 0) == 1
+
+
+def lens_pair_with_code(
+    conn: sqlite3.Connection,
+    code: str | None,
+    *,
+    label: str,
+    scopes: str | Iterable[str] = "read",
+    ttl_days: int = 90,
+    max_tokens: int = 10,
+) -> dict[str, Any]:
+    """Check the ceiling, spend the code and mint the token as one unit of work.
+
+    For the claim endpoint: holding the write lock across all three means simultaneous
+    claims cannot both pass the ceiling check, and a claim refused at the ceiling does not
+    burn the owner's code. Raises :class:`LensTokenLimit` at the ceiling (code kept) and
+    :class:`LensError` for a wrong, used or expired code.
+    """
+    limit = max(1, int(max_tokens))
+    with _WRITE_LOCK:
+        active = len(lens_active_tokens(conn))
+        if active >= limit:
+            raise LensTokenLimit(
+                f"{active} of {limit} Lens tokens are already paired; revoke one "
+                f"(python -m homesoc lens revoke <id>) or raise lens.max_tokens"
+            )
+        if not lens_consume_pairing_code(conn, code):
+            raise LensError("That pairing code is wrong, already used, or has expired.")
+        return lens_mint_token(conn, label=label, scopes=scopes, ttl_days=ttl_days, max_tokens=limit)
 
 
 def lens_clear_pairing_codes(conn: sqlite3.Connection) -> int:
@@ -943,6 +992,29 @@ def lens_clear_pairing_codes(conn: sqlite3.Connection) -> int:
 
 
 # ------------------------------------------------------------ claim rate limit
+
+
+def _lens_claim_source(ip: str | None) -> str:
+    """The rate-limit bucket for a claimant's address.
+
+    IPv6 hosts pick addresses freely from their /64 (privacy addresses, SLAAC), so an IPv6
+    claimant is counted per /64 rather than per address; an IPv4-mapped IPv6 address counts
+    as the IPv4 address it is. Anything unparseable is counted as given.
+    """
+    raw = str(ip or "unknown").strip()[:64]
+    try:
+        addr = ipaddress.ip_address(raw.split("%", 1)[0])
+    except ValueError:
+        return raw[:45] or "unknown"
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.IPv6Network((addr, 64), strict=False))
+    return str(addr)
+
+
+def _lens_claim_key(ip: str | None) -> str:
+    return _LENS_CLAIM_PREFIX + _sha256_hex(_lens_claim_source(ip))[:16]
 
 
 def lens_claim_attempt(
@@ -958,34 +1030,40 @@ def lens_claim_attempt(
     are allowed; the next one locks that address out for a further window and writes an
     ``events`` row (B4). The counter is keyed on a hash of the address so the settings
     table does not accumulate a list of who tried.
+
+    The whole read-count-write runs under the write lock. Without it, claims sent at the
+    same instant all read the same small count and overwrote each other's updates (hundreds
+    of guesses checked against a limit of ten), and a late writer could erase a lockout
+    another thread had just set.
     """
-    source = str(ip or "unknown")[:45]
-    key = _LENS_CLAIM_PREFIX + _sha256_hex(source)[:16]
-    now = datetime.now(timezone.utc)
-    now_iso = util_to_iso(now)
-    state = _loads_dict(get_setting(conn, key, "") or "")
-    blocked_until = str(state.get("blocked_until") or "")
-    if blocked_until > now_iso:
-        return False, _seconds_until(blocked_until, now)
-    window_start = str(state.get("window_start") or "")
-    count = int(state.get("count") or 0)
-    if not window_start or _seconds_until(window_start, now) < -window_seconds:
-        window_start, count = now_iso, 0
-    count += 1
-    if count > max(1, int(limit)):
-        until = util_to_iso(now + timedelta(seconds=window_seconds))
-        set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": until})
-        record_event(conn, "warning", "lens",
-                     "too many Lens pairing attempts; refusing this source for an hour",
-                     {"attempts": count, "limit": int(limit), "blocked_until": until, "source": source})
-        return False, int(window_seconds)
-    set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": ""})
-    return True, 0
+    source = _lens_claim_source(ip)
+    key = _lens_claim_key(ip)
+    with _WRITE_LOCK:
+        now = datetime.now(timezone.utc)
+        now_iso = util_to_iso(now)
+        state = _loads_dict(get_setting(conn, key, "") or "")
+        blocked_until = str(state.get("blocked_until") or "")
+        if blocked_until > now_iso:
+            return False, max(1, _seconds_until(blocked_until, now))
+        window_start = str(state.get("window_start") or "")
+        count = int(state.get("count") or 0)
+        if not window_start or _seconds_until(window_start, now) < -window_seconds:
+            window_start, count = now_iso, 0
+        count += 1
+        if count > max(1, int(limit)):
+            until = util_to_iso(now + timedelta(seconds=window_seconds))
+            set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": until})
+            record_event(conn, "warning", "lens",
+                         "too many Lens pairing attempts; refusing this source for an hour",
+                         {"attempts": count, "limit": int(limit), "blocked_until": until, "source": source})
+            return False, int(window_seconds)
+        set_setting(conn, key, {"window_start": window_start, "count": count, "blocked_until": ""})
+        return True, 0
 
 
 def lens_claim_reset(conn: sqlite3.Connection, ip: str | None) -> None:
     """Forget one address's attempt counter — called after a successful claim."""
-    delete_setting(conn, _LENS_CLAIM_PREFIX + _sha256_hex(str(ip or "unknown")[:45])[:16])
+    delete_setting(conn, _lens_claim_key(ip))
 
 
 def lens_purge_claim_counters(conn: sqlite3.Connection, *, older_than_seconds: int = 2 * LENS_CLAIM_WINDOW_SECONDS) -> int:
